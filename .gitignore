@@ -1,0 +1,17 @@
+# generated, rebuilt by the scripts
+build/
+*/build/
+examples/*/build/
+hw/build/
+__pycache__/
+*.log
+*.jou
+# other projects: tools/get_cores.sh
+ext/
+# the board vendor's files (ALINX VD100 factory SD card): not redistributed - platforms/vd100/sd/README.md
+platforms/vd100/sd/BOOT_ref.BIN
+platforms/vd100/sd/image.ub
+platforms/vd100/sd/boot.scr
+# what simulations leave in the directory they run in (core-v-verif's printer, CVA6's Verilator tracer)
+stdout.txt
+trace_hart_*.dasm

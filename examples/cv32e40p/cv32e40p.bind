@@ -1,0 +1,79 @@
+# cv32e40p.bind - CV32E40P (OpenHW, default configuration: RV32IMC, no PULP extensions, no FPU) under OCV
+# (gen/cpu_wrap.py). The core's RTL as it is (pvo_scr1/ext/cv32e40p, or ${CV32E40P}).
+name     cv32e40p
+core     cv32e40p_core
+files    ${CV32E40P}/cv32e40p_manifest.flist  base=/  DESIGN_RTL_DIR=${CV32E40P}/rtl  exclude=/bhv/
+rtl.sim  ${CV32E40P}/bhv/cv32e40p_sim_clock_gate.sv
+rtl.fpga ${BIND}/fpga/cv32e40p_clock_gate.sv
+incdir   ${CV32E40P}/rtl/include
+
+clock    clk_i
+reset    rst_ni low
+tie      pulp_clock_en_i = 1'b1
+tie      boot_addr_i     = 32'h80     # as core-v-verif (generated programs jump on to 0x200)
+tie      fetch_enable_i  = 1'b1
+input    irq_i irq                  # the interrupt lines, on the generator's schedule
+bus      obi A instr_
+bus      obi B data_ dev
+# core-v-verif's virtual peripherals (printer, timers/random, status flags): to the processor
+device   printer 0x10000000 0x10
+device   vp      0x15000000 0x2000
+device   status  0x20000000 0x10
+
+memory   256K uram                  # code and data (core-v-verif programs: up to ~100 KiB) - and generated ones
+memory   16K at 0x3FC000            # the stack (core-v-verif's link.ld: the top of its 4 MiB)
+latency                         # random memory delays (--model-opt lat=G,R)
+boot     0x80
+exit     none
+stop     0x20000004                 # the end: a write of core-v-verif's exit register (bsp/syscalls.c) - generated
+                                    # programs end the same way
+model    rv32imc_zicsr_zifencei:cv32e40p
+gen      cv32
+
+# What the core does, as its tracer (bhv/cv32e40p_tracer.sv) sees it: instructions leave decode in order,
+# results come on two register-file ports (ALU in EX, LSU in WB), stores on the data bus.
+logic
+    // the load in WB is the first part of a misaligned access: its register write is not the result (the
+    // core writes the register again with the second part) - as the core's EX/WB register
+    logic wb_first_q;
+    always_ff @(posedge clk)
+        if (!core_rst_n)        wb_first_q <= 1'b0;
+        else if (@ex_valid)     wb_first_q <= @data_misaligned;
+        else if (@lsu_ready_wb) wb_first_q <= 1'b0;
+    // the instruction in EX may write its register while it is held there (memory or CSR stalls) and no
+    // longer when it leaves: keep its last write until then (as the tracer's trace_ex)
+    logic        ex_w_q;
+    logic [4:0]  ex_rd_q;
+    logic [31:0] ex_d_q;
+    always_ff @(posedge clk)
+        if (!core_rst_n || @ex_valid) ex_w_q <= 1'b0;
+        else if (@regfile_alu_we_fw && @regfile_alu_waddr_fw[4:0] != 5'd0) begin
+            ex_w_q <= 1'b1; ex_rd_q <= @regfile_alu_waddr_fw[4:0]; ex_d_q <= @regfile_alu_wdata_fw;
+        end
+
+stream issue issue
+    valid = @id_stage_i.id_valid_o && @id_stage_i.is_decoding_o && !@id_stage_i.illegal_insn_dec
+    pc    = @id_stage_i.pc_id_i
+    insn  = @id_stage_i.instr
+    c     = @id_stage_i.is_compressed_i
+stream alu regw nonload
+    valid = @ex_valid && ((@regfile_alu_we_fw && @regfile_alu_waddr_fw[4:0] != 5'd0) || ex_w_q)
+    rd    = @regfile_alu_we_fw && @regfile_alu_waddr_fw[4:0] != 5'd0 ? @regfile_alu_waddr_fw[4:0] : ex_rd_q
+    data  = @regfile_alu_we_fw && @regfile_alu_waddr_fw[4:0] != 5'd0 ? @regfile_alu_wdata_fw : ex_d_q
+stream lsu regw load
+    valid = @regfile_we_wb && @wb_valid && !wb_first_q && @regfile_waddr_fw_wb_o[4:0] != 5'd0
+    rd    = @regfile_waddr_fw_wb_o[4:0]
+    data  = @regfile_wdata
+stream store store
+    valid = @data_req_o && @data_gnt_i && @data_we_o
+    addr  = {@data_addr_o[31:2], 2'b00}
+    be    = @data_be_o
+    data  = @data_wdata_o & {{8{@data_be_o[3]}}, {8{@data_be_o[2]}}, {8{@data_be_o[1]}}, {8{@data_be_o[0]}}}
+stream irq interrupt cycle
+    valid = @irq_ack_o
+    cause = @irq_id_o
+stream csrr csrr
+    valid = @ex_valid && @ex_stage_i.csr_access_i && ((@regfile_alu_we_fw && @regfile_alu_waddr_fw[4:0] != 5'd0) || ex_w_q)
+    data  = @regfile_alu_we_fw && @regfile_alu_waddr_fw[4:0] != 5'd0 ? @regfile_alu_wdata_fw : ex_d_q
+stream mie watch                    # the interrupt enables, on change (coverage, monitors)
+    value = @cs_registers_i.mie_q

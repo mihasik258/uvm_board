@@ -1,0 +1,31 @@
+diff --git a/include/verilated_random.cpp b/include/verilated_random.cpp
+index 38588b244..7be2af9de 100644
+--- a/include/verilated_random.cpp
++++ b/include/verilated_random.cpp
+@@ -781,6 +781,7 @@ bool VlRandomizer::next(VlRNGReseeds& rngr) { return nextRandomize(rngr, false);
+ bool VlRandomizer::nextRandomize(VlRNGReseeds& rngr, bool checkOnly) {
+     if (!checkOnly && m_vars.empty() && m_unique_arrays.empty()) return true;
+     if (checkOnly && m_vars.empty()) return true;  // No rand members: trivially SAT
++    if (!checkOnly && ocv_fast_randomize && ocv_fast_randomize(*this, rngr)) return true;  // OCV
+     VlSolverSession& sess = s_solverSession;
+     const VerilatedLockGuard lock{sess.m_mutex};
+     m_checkOnly = checkOnly;
+diff --git a/include/verilated_random.h b/include/verilated_random.h
+index 682ff2823..4d28b1066 100644
+--- a/include/verilated_random.h
++++ b/include/verilated_random.h
+@@ -252,7 +252,14 @@ class VlSolverSession;
+ 
+ //=============================================================================
+ // Object holding constraints and variable references.
++class VlRandomizer;
++// OCV: an in-process solver for common constraint forms, tried before the external SMT solver.
++// Weak: absent unless the program links one (ocv/uvm/vlt/ocv_fast_random.cpp); returns false to
++// leave the call to the SMT solver.
++extern bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng) __attribute__((weak));
++
+ class VlRandomizer VL_NOT_FINAL {
++    friend bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng);
+     // MEMBERS
+     std::vector<std::string> m_constraints;  // Solver-dependent hard constraints
+     std::vector<std::string>

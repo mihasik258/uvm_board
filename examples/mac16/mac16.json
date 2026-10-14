@@ -1,0 +1,34 @@
+{
+  "name": "mac16",
+  "module": "mac16",
+  "description": "Demo IP: streaming signed multiply-accumulate with a nondeterministic timestamp and an observation port.",
+  "clock": "clk",
+  "reset": { "port": "rst_n", "active": "low" },
+  "channels": [
+    {
+      "name": "operands", "kind": "source", "depth": 1024,
+      "valid": "s_valid", "ready": "s_ready",
+      "fields": [
+        { "name": "a",   "port": "s_a",   "width": 16, "signed": true },
+        { "name": "b",   "port": "s_b",   "width": 16, "signed": true },
+        { "name": "clr", "port": "s_clr", "width": 1 }
+      ]
+    },
+    {
+      "name": "results", "kind": "sink", "depth": 1024,
+      "valid": "m_valid", "ready": "m_ready",
+      "fields": [
+        { "name": "acc", "port": "m_acc", "width": 40, "signed": true },
+        { "name": "ts",  "port": "m_ts",  "width": 16, "compare": "ignore",
+          "description": "cycle stamp, depends on back-pressure" }
+      ]
+    },
+    {
+      "name": "products", "kind": "monitor", "depth": 1024,
+      "valid": "dbg_valid",
+      "fields": [
+        { "name": "prod", "port": "dbg_prod", "width": 32, "signed": true }
+      ]
+    }
+  ]
+}

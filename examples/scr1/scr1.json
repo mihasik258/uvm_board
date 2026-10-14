@@ -1,0 +1,31 @@
+{
+  "name": "scr1",
+  "module": "scr1_ocv_dut",
+  "description": "SCR1 RV32IMC core: the program image is the stimulus, every committed instruction is compared with the RV32IMC reference model.",
+  "clock": "clk",
+  "reset": { "port": "rst_n", "active": "low" },
+  "channels": [
+    {
+      "name": "program", "kind": "source", "depth": 16384,
+      "valid": "prog_valid", "ready": "prog_ready",
+      "description": "64 KiB program RAM image, one 32-bit word per record; 'last' starts the core",
+      "fields": [
+        { "name": "addr", "port": "prog_addr", "width": 14 },
+        { "name": "data", "port": "prog_data", "width": 32 },
+        { "name": "last", "port": "prog_last", "width": 1 }
+      ]
+    },
+    {
+      "name": "retire", "kind": "monitor", "depth": 4096, "lossless": true, "squash": true,
+      "valid": "rvfi_valid",
+      "description": "RVFI-lite: one record per committed instruction; the core is frozen while the buffer is drained",
+      "fields": [
+        { "name": "pc",       "port": "rvfi_pc",       "width": 32 },
+        { "name": "pc_next",  "port": "rvfi_pc_next",  "width": 32 },
+        { "name": "rd_addr",  "port": "rvfi_rd_addr",  "width": 5 },
+        { "name": "rd_wdata", "port": "rvfi_rd_wdata", "width": 32 },
+        { "name": "trap",     "port": "rvfi_trap",     "width": 1 }
+      ]
+    }
+  ]
+}

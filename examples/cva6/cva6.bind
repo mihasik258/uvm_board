@@ -1,0 +1,54 @@
+# cva6.bind - CVA6 (OpenHW; cv32a60x: RV32 application-class, 6 stages, out-of-order completion, caches
+# and AXI) under OCV (gen/cpu_wrap.py). The core's RTL as it is (pvo_scr1/ext/cva6, or ${CVA6});
+# cva6_ocv_core.sv only instantiates it with plain ports (the configuration changes are listed there).
+name     cva6
+core     cva6_ocv_core
+files    ${CVA6}/core/Flist.cva6  base=/  CVA6_REPO_DIR=${CVA6}  HPDCACHE_DIR=${CVA6}/core/cache_subsystem/hpdcache  TARGET_CFG=cv32a60x  exclude=/tc_sram.sv  exclude=/tc_sram_wrapper.sv  exclude=macros/behav/hpdcache_sram_1rw.sv  exclude=macros/behav/hpdcache_sram_wbyteenable_1rw.sv
+rtl      ${CVA6}/core/cva6_rvfi.sv  ${BIND}/cva6_ocv_core.sv
+# the memories: simulation models in simulation, for the FPGA what CVA6's own FPGA build takes in their place
+# (its Makefile, fpga_src / fpga_filter): tc_sram_fpga_wrapper on fpga-support's block RAMs
+rtl.sim  ${CVA6}/vendor/pulp-platform/tech_cells_generic/src/rtl/tc_sram.sv  ${CVA6}/common/local/util/tc_sram_wrapper.sv  ${CVA6}/core/cache_subsystem/hpdcache/rtl/src/common/macros/behav/hpdcache_sram_1rw.sv  ${CVA6}/core/cache_subsystem/hpdcache/rtl/src/common/macros/behav/hpdcache_sram_wbyteenable_1rw.sv
+rtl.fpga ${CVA6}/common/local/util/tc_sram_fpga_wrapper.sv  ${CVA6}/common/local/util/hpdcache_sram_1rw.sv  ${CVA6}/common/local/util/hpdcache_sram_wbyteenable_1rw.sv  ${CVA6}/vendor/pulp-platform/fpga-support/rtl/SyncSpRamBeNx64.sv  ${CVA6}/vendor/pulp-platform/fpga-support/rtl/SyncSpRamBeNx32.sv  ${CVA6}/vendor/pulp-platform/fpga-support/rtl/SyncSpRam.sv
+
+clock    clk_i
+reset    rst_ni low
+tie      boot_addr_i = 32'h80       # as the generated programs (and core-v-verif's layout)
+input    irq_i irq latency 32       # the interrupt lines (mip: 3, 7, 11): taken at commit (measured: up to 10 clocks late)
+bus      axi A axi_ dev
+# devices as core-v-verif's virtual peripherals (printer, timers/random, status flags): to the processor
+device   printer 0x10000000 0x10
+device   vp      0x15000000 0x2000
+device   status  0x20000000 0x10
+
+memory   1M uram                    # code and data
+memory   16K at 0x3FC000            # the stack (core-v-verif's link.ld: the top of its 4 MiB)
+latency                         # random memory delays (--model-opt lat=G,R)
+boot     0x80
+exit     none
+stop     0x20000004 retire          # the end: a write of the exit register (at its retirement: CVA6 buffers writes)
+model    rv32imc_zicsr_zifencei:cva6
+gen      cv32
+
+# What the core does, from RVFI (cva6_rvfi, one commit port): retired instructions in order. An exception
+# other than ecall retires nothing (the handler's first instruction follows); an interrupt is seen where it
+# is taken (irq_take: no instruction retires in that clock).
+stream issue issue ecall raw
+    valid = @rvfi_valid
+    pc    = @rvfi_pc_rdata
+    insn  = @rvfi_insn
+    c     = @rvfi_insn[1:0] != 2'b11
+stream regw regw
+    valid = @rvfi_valid && @rvfi_rd_addr != 5'd0
+    rd    = @rvfi_rd_addr
+    data  = @rvfi_rd_wdata
+stream store store
+    valid = @rvfi_valid && @rvfi_mem_wmask != 4'b0
+    addr  = {@rvfi_mem_addr[31:2], 2'b00}
+    be    = @rvfi_mem_wmask
+    data  = (@rvfi_mem_wdata << {@rvfi_mem_addr[1:0], 3'b000}) & {{8{@rvfi_mem_wmask[3]}}, {8{@rvfi_mem_wmask[2]}}, {8{@rvfi_mem_wmask[1]}}, {8{@rvfi_mem_wmask[0]}}}   # RVFI: unshifted
+stream irq interrupt cycle
+    valid = @irq_take
+    cause = @irq_cause[4:0]
+stream csrr csrr
+    valid = @rvfi_valid && @rvfi_insn[6:0] == 7'h73 && @rvfi_insn[13:12] != 2'b00 && @rvfi_rd_addr != 5'd0
+    data  = @rvfi_rd_wdata

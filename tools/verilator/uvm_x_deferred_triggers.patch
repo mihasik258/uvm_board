@@ -1,0 +1,72 @@
+--- uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-03 00:18:10.629898199 +0300
++++ uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-03 00:18:10.662896520 +0300
+@@ -16789,7 +16789,10 @@
+   extern function time   get_end_time       ();
+   extern function void set_transaction_id(uvm_transaction_id_t id);
+   extern function uvm_transaction_id_t get_transaction_id();
+-  uvm_event_pool events;  // OCV: created on first use (get_event_pool, begin_tr, end_tr), not per object
++  uvm_event_pool events;  // OCV: created on first use (get_event_pool), not per object
++  // OCV: accept/begin/end happened while nobody had the event pool: the events are triggered when it
++  // is first asked for (an "on" event satisfies a later wait_on, as if triggered at the time)
++  bit m_ocv_trig_accept, m_ocv_trig_begin, m_ocv_trig_end;
+   extern virtual function void do_print  (uvm_printer printer);
+   extern virtual function void do_record (uvm_recorder recorder);
+   extern virtual function void do_copy   (uvm_object rhs);
+@@ -16824,7 +16827,12 @@
+   return initiator;
+ endfunction
+ function uvm_event_pool uvm_transaction::get_event_pool();
+-  if (events == null) events = new("events");
++  if (events == null) begin
++    events = new("events");
++    if (m_ocv_trig_accept) events.get("accept").trigger();
++    if (m_ocv_trig_begin) begin begin_event = events.get("begin"); begin_event.trigger(); end
++    if (m_ocv_trig_end) begin end_event = events.get("end"); end_event.trigger(); end
++  end
+   return events;
+ endfunction
+ function bit uvm_transaction::is_active();
+@@ -16934,11 +16942,14 @@
+       this.accept_time = $realtime;
+     end
+   do_accept_tr();
+-  e = get_event_pool().get("accept");
+-  if(e!=null)
+-    begin
+-      e.trigger();
+-    end
++  if (events == null) m_ocv_trig_accept = 1;          // OCV: nobody can be waiting yet
++  else begin
++    e = events.get("accept");
++    if(e!=null)
++      begin
++        e.trigger();
++      end
++  end
+ endfunction
+ function uvm_tr_handle_t uvm_transaction::begin_tr (
+      time begin_time = 0
+@@ -17003,8 +17014,9 @@
+        m_begin_tr = 0;
+      end
+    do_begin_tr();
+-   begin
+-     begin_event = get_event_pool().get("begin");
++   if (events == null) m_ocv_trig_begin = 1;          // OCV: deferred, see get_event_pool
++   else begin
++     begin_event = events.get("begin");
+      begin_event.trigger();
+    end
+ endfunction
+@@ -17021,8 +17033,9 @@
+        end
+      end
+    tr_recorder = null;
+-   begin
+-     end_event = get_event_pool().get("end") ;
++   if (events == null) m_ocv_trig_end = 1;            // OCV: deferred, see get_event_pool
++   else begin
++     end_event = events.get("end") ;
+      end_event.trigger();
+    end
+ endfunction

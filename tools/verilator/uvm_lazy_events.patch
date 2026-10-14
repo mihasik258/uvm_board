@@ -1,0 +1,55 @@
+--- uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-02 10:23:07.493362755 +0300
++++ uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-02 18:50:38.399343010 +0300
+@@ -16776,7 +16776,7 @@
+   extern function time   get_end_time       ();
+   extern function void set_transaction_id(uvm_transaction_id_t id);
+   extern function uvm_transaction_id_t get_transaction_id();
+-  const uvm_event_pool events = new("events");
++  uvm_event_pool events;  // OCV: created on first use (get_event_pool, begin_tr, end_tr), not per object
+   extern virtual function void do_print  (uvm_printer printer);
+   extern virtual function void do_record (uvm_recorder recorder);
+   extern virtual function void do_copy   (uvm_object rhs);
+@@ -16797,8 +16797,6 @@
+   super.new(name);
+   this.initiator = initiator;
+   m_transaction_id = -1;
+-  begin_event = events.get("begin");
+-  end_event = events.get("end");
+ endfunction
+ function void uvm_transaction::set_transaction_id(uvm_transaction_id_t id);
+     m_transaction_id = id;
+@@ -16813,6 +16811,7 @@
+   return initiator;
+ endfunction
+ function uvm_event_pool uvm_transaction::get_event_pool();
++  if (events == null) events = new("events");
+   return events;
+ endfunction
+ function bit uvm_transaction::is_active();
+@@ -16922,7 +16921,7 @@
+       this.accept_time = $realtime;
+     end
+   do_accept_tr();
+-  e = events.get("accept");
++  e = get_event_pool().get("accept");
+   if(e!=null)
+     begin
+       e.trigger();
+@@ -16992,7 +16991,7 @@
+      end
+    do_begin_tr();
+    begin
+-     begin_event = events.get("begin");
++     begin_event = get_event_pool().get("begin");
+      begin_event.trigger();
+    end
+ endfunction
+@@ -17010,7 +17009,7 @@
+      end
+    tr_recorder = null;
+    begin
+-     end_event = events.get("end") ;
++     end_event = get_event_pool().get("end") ;
+      end_event.trigger();
+    end
+ endfunction

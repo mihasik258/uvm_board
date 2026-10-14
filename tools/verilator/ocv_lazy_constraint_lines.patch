@@ -1,0 +1,60 @@
+diff -ru a/include/verilated_random.cpp b/include/verilated_random.cpp
+--- a/include/verilated_random.cpp	2026-10-13 14:33:11.463635812 +0300
++++ b/include/verilated_random.cpp	2026-10-13 14:33:11.501592759 +0300
+@@ -1378,7 +1378,14 @@
+     if (Verilated::threadContextp()->warnUnsatConstr()) {
+         for (const int n : numbers) {
+             if (static_cast<size_t>(n) < m_constraints_line.size()) {
+-                const std::string& constraint_info = m_constraints_line[n];
++                const ConstraintLoc& loc = m_constraints_line[n];
++                std::string constraint_info;
++                if (loc.file[0] != '\0') {
++                    constraint_info = std::string(loc.file) + ":" + std::to_string(loc.line);
++                    if (loc.src[0] != '\0') constraint_info += "   " + std::string(loc.src);
++                } else {
++                    constraint_info = loc.src;
++                }
+                 // Parse "filename:linenum   source" format, parts optional
+                 std::string filename;
+                 int linenum = 0;
+@@ -1547,17 +1554,9 @@
+ void VlRandomizer::hard(std::string&& constraint, const char* filename, uint32_t linenum,
+                         const char* source) {
+     m_constraints.emplace_back(std::move(constraint));
+-    // Format constraint location: "filename:linenum   source"
+-    if (filename[0] != '\0' || source[0] != '\0') {
+-        std::string line;
+-        if (filename[0] != '\0') {
+-            line = std::string(filename) + ":" + std::to_string(linenum);
+-            if (source[0] != '\0') line += "   " + std::string(source);
+-        } else {
+-            line = source;
+-        }
+-        m_constraints_line.emplace_back(std::move(line));
+-    }
++    // The constraint location ("filename:linenum   source" when reported): only the pointers here
++    if (filename[0] != '\0' || source[0] != '\0')
++        m_constraints_line.push_back(ConstraintLoc{filename, linenum, source});
+ }
+ 
+ void VlRandomizer::soft(std::string&& constraint, const char* /*filename*/, uint32_t /*linenum*/,
+diff -ru a/include/verilated_random.h b/include/verilated_random.h
+--- a/include/verilated_random.h	2026-10-13 14:33:11.463520386 +0300
++++ b/include/verilated_random.h	2026-10-13 14:33:11.501483062 +0300
+@@ -262,8 +262,14 @@
+     friend bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng);
+     // MEMBERS
+     std::vector<std::string> m_constraints;  // Solver-dependent hard constraints
+-    std::vector<std::string>
+-        m_constraints_line;  // fileline content of the constraint for unsat constraints
++    // OCV: where each constraint is written, kept as the generated code's string literals (they live as long
++    // as the program); formatted only for an unsatisfiable-constraint message, not on every hard() call
++    struct ConstraintLoc {
++        const char* file;
++        uint32_t line;
++        const char* src;
++    };
++    std::vector<ConstraintLoc> m_constraints_line;  // fileline content of the constraint for unsat constraints
+     std::vector<std::string> m_softConstraints;  // Soft constraints
+     std::map<std::string, std::shared_ptr<const VlRandomVar>> m_vars;  // Solver-dependent
+     std::set<std::string> m_disabledVars;  // Variables with rand_mode off (skip write-back)

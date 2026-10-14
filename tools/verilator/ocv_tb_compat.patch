@@ -1,0 +1,320 @@
+diff --git a/include/verilated.cpp b/include/verilated.cpp
+index f1565a506..c9fb97607 100644
+--- a/include/verilated.cpp
++++ b/include/verilated.cpp
+@@ -1915,7 +1915,11 @@ IData VL_FERROR_IW(IData fpi, int obits, WDataOutP outwp) VL_MT_SAFE {
+ }
+ 
+ IData VL_FOPEN_NN(const std::string& filename, const std::string& mode) {
+-    return Verilated::threadContextp()->impp()->fdNew(filename.c_str(), mode.c_str());
++    const IData fd = Verilated::threadContextp()->impp()->fdNew(filename.c_str(), mode.c_str());
++    // $ferror reports errno ("most recent error"): an open that succeeded leaves no error behind
++    // (IEEE 1800-2023 21.3.7), not one some earlier call of the program left in errno
++    if (fd) errno = 0;
++    return fd;
+ }
+ IData VL_FOPEN_MCD_N(const std::string& filename) VL_MT_SAFE {
+     return Verilated::threadContextp()->impp()->fdNewMcd(filename.c_str());
+diff --git a/src/V3Covergroup.cpp b/src/V3Covergroup.cpp
+index 77bb9d1fb..dc9e05697 100644
+--- a/src/V3Covergroup.cpp
++++ b/src/V3Covergroup.cpp
+@@ -1634,6 +1634,29 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         VL_DO_DANGLING(pushDeletep(refp), refp);
+     }
+ 
++    // A coverpoint's call of a method of the enclosing class (or of a class it extends): 'f(x)'
++    // -> 'h.f(x)' on the enclosing object (IEEE 1800-2023 19.4)
++    bool isEnclosingMethodCall(const AstFuncRef* refp) const {
++        const AstNodeFTask* const taskp = refp->taskp();
++        if (!m_enclosingClassp || !taskp || !taskp->classMethod() || taskp->isStatic()) return false;
++        const AstClass* calleep = nullptr;
++        for (const AstNode* np = taskp; np && !calleep; np = np->aboveLoopp())
++            calleep = VN_CAST(np, Class);
++        return calleep && calleep != m_covergroupp
++               && AstClass::isClassExtendedFrom(m_enclosingClassp, calleep);
++    }
++
++    void rewriteFuncRef(AstFuncRef* refp, AstVar* handleVarp) {
++        FileLine* const fl = refp->fileline();
++        AstArg* const argsp = refp->argsp() ? refp->argsp()->unlinkFrBackWithNext() : nullptr;
++        AstMethodCall* const callp = new AstMethodCall{
++            fl, new AstVarRef{fl, handleVarp, VAccess::READ}, refp->name(), argsp};
++        callp->taskp(refp->taskp());
++        callp->dtypeFrom(refp);
++        refp->replaceWith(callp);
++        VL_DO_DANGLING(pushDeletep(refp), refp);
++    }
++
+     bool isEmbeddedCovergroupVar(const AstVar* varp) const {
+         if (!varp || !varp->isClassMember()) return false;
+         const AstClassRefDType* const refp = VN_CAST(varp->dtypep()->skipRefp(), ClassRefDType);
+@@ -1965,6 +1988,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         const std::set<const AstVar*> enclosingVars = enclosingInstanceVars();
+         std::vector<AstVarRef*> refsToRewrite;
+         std::vector<AstThisRef*> thisRefsToRewrite;
++        std::vector<AstFuncRef*> callsToRewrite;
+         const auto scan = [&](AstNode* rootp) {
+             rootp->foreach([&](AstVarRef* refp) {
+                 if (invalidp) return;
+@@ -1978,6 +2002,11 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                 if (!offenderp) offenderp = refp;
+             });
+             if (invalidp) return;
++            rootp->foreach([&](AstFuncRef* refp) {
++                if (!isEnclosingMethodCall(refp)) return;
++                callsToRewrite.push_back(refp);
++                if (!offenderp) offenderp = refp;
++            });
+             rootp->foreach([&](AstThisRef* refp) {
+                 const AstClassRefDType* const refDTypep
+                     = VN_CAST(refp->dtypep()->skipRefp(), ClassRefDType);
+@@ -2005,6 +2034,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         // Route each enclosing-member reference through the back-pointer: 'm' -> 'h.m'.
+         for (AstVarRef* const refp : refsToRewrite) { rewriteVarRef(refp, handleVarp); }
+         for (AstThisRef* const refp : thisRefsToRewrite) { rewriteThisRef(refp, handleVarp); }
++        for (AstFuncRef* const refp : callsToRewrite) { rewriteFuncRef(refp, handleVarp); }
+ 
+         // Initialize the raw back-pointer after each construction.  With no construction site,
+         // the embedded covergroup handle remains null, so no back-pointer is observed.
+diff --git a/src/V3LanguageWords.h b/src/V3LanguageWords.h
+index f1a8fb527..792920525 100644
+--- a/src/V3LanguageWords.h
++++ b/src/V3LanguageWords.h
+@@ -99,6 +99,7 @@ inline void V3LanguageWords::Singleton::init() {
+     addKwd("export",                "C++ keyword");
+     addKwd("extern",                "C++ keyword");
+     addKwd("false",                 "C++ keyword");
++    addKwd("errno",                 "C library macro");
+     addKwd("far",                   "C++ common word");
+     addKwd("float",                 "C++ keyword");
+     addKwd("for",                   "C++ keyword");
+@@ -141,6 +142,9 @@ inline void V3LanguageWords::Singleton::init() {
+     addKwd("signed",                "C++ keyword");
+     addKwd("sizeof",                "C++ keyword");
+     addKwd("stack",                 "C++ common word");
++    addKwd("stderr",                "C library macro");
++    addKwd("stdin",                 "C library macro");
++    addKwd("stdout",                "C library macro");
+     addKwd("static",                "C++ keyword");
+     addKwd("static_assert",         "C++11 keyword");
+     addKwd("static_cast",           "C++ keyword");
+diff --git a/src/V3Randomize.cpp b/src/V3Randomize.cpp
+index 6ab50c073..15ddf52e9 100644
+--- a/src/V3Randomize.cpp
++++ b/src/V3Randomize.cpp
+@@ -1564,11 +1564,43 @@ class ConstraintExprVisitor final : public VNVisitor {
+                         UASSERT_OBJ(initTaskp, classp, "No new() in class");
+                     }
+                 }
++                // A member of a rand sub-object reached through class handles: registered only when
++                // every handle on the way is non-null (IEEE 1800-2023 18.5.9: a null rand object
++                // handle is not randomized - e.g. a handle that build_phase creates later)
++                AstIf* guardp = nullptr;
++                if (memberselp) {
++                    std::vector<AstNodeExpr*> levels;
++                    for (AstNodeExpr* ep = memberselp->fromp(); ep;) {
++                        if (VN_IS(ep->dtypep()->skipRefp(), ClassRefDType)) levels.push_back(ep);
++                        AstMemberSel* const msp = VN_CAST(ep, MemberSel);
++                        ep = msp ? msp->fromp() : nullptr;
++                    }
++                    AstNodeExpr* condp = nullptr;
++                    for (auto it = levels.rbegin(); it != levels.rend(); ++it) {
++                        AstNodeExpr* const handlep = (*it)->cloneTree(false);
++                        handlep->foreach([](AstNodeVarRef* refp) { refp->access(VAccess::READ); });
++                        AstNodeExpr* const neqp = new AstNeq{
++                            varp->fileline(), handlep,
++                            new AstConst{varp->fileline(), AstConst::Null{}}};
++                        condp = condp ? new AstLogAnd{varp->fileline(), condp, neqp} : neqp;
++                    }
++                    if (condp) {
++                        guardp = new AstIf{varp->fileline(), condp, nullptr};
++                        initTaskp->addStmtsp(guardp);
++                    }
++                }
++                const auto addInit = [&](AstNode* stmtp) {
++                    if (guardp) {
++                        guardp->addThensp(stmtp);
++                    } else {
++                        initTaskp->addStmtsp(stmtp);
++                    }
++                };
+                 // For globalConstrained sub-object members with rand_mode:
+                 // Always call write_var (keeps variable in solver for constraint
+                 // evaluation), but toggle disabled state so the solver skips
+                 // write-back when rand_mode is off.
+-                initTaskp->addStmtsp(methodp->makeStmt());
++                addInit(methodp->makeStmt());
+                 if (varp->lifetime().isStatic() && randMode.usesMode) {
+                     AstCMethodHard* const markp = new AstCMethodHard{
+                         varp->fileline(),
+@@ -1580,7 +1612,7 @@ class ConstraintExprVisitor final : public VNVisitor {
+                     namep->dtypep(varp->dtypep());
+                     markp->addPinsp(namep);
+                     markp->dtypeSetVoid();
+-                    initTaskp->addStmtsp(markp->makeStmt());
++                    addInit(markp->makeStmt());
+                 }
+                 if (isGlobalConstrained && memberselp && randMode.usesMode) {
+                     AstNodeModule* const varClassp = VN_AS(varp->user2p(), NodeModule);
+@@ -1620,7 +1652,7 @@ class ConstraintExprVisitor final : public VNVisitor {
+                         disablep->addPinsp(disnp);
+                         AstIf* const ifp = new AstIf{varp->fileline(), atp, enablep->makeStmt(),
+                                                      disablep->makeStmt()};
+-                        initTaskp->addStmtsp(ifp);
++                        addInit(ifp);
+                     }
+                 }
+                 // If randc, also emit markRandc() for cyclic tracking
+@@ -1635,7 +1667,7 @@ class ConstraintExprVisitor final : public VNVisitor {
+                         varp->fileline(), AstCExpr::Pure{}, "\"" + smtName + "\"", varp->width()};
+                     nameExprp->dtypep(varp->dtypep());
+                     markp->addPinsp(nameExprp);
+-                    initTaskp->addStmtsp(markp->makeStmt());
++                    addInit(markp->makeStmt());
+                 }
+             }
+         } else {
+@@ -4333,6 +4365,49 @@ class RandomizeVisitor final : public VNVisitor {
+             callbackTaskp->addStmtsp(wrapIfRandMode(classp, memberVarp, nullCheckp));
+         });
+     }
++    // For a constraint cloned from a rand sub-object (named root__DT__member...__DT__name): every
++    // handle on the path from the class to that object is non-null; nullptr for the class's own
++    AstNodeExpr* nestedNonNull(AstClass* classp, const AstConstraint* constrp, FileLine* fl) {
++        std::vector<std::string> parts;
++        const std::string& name = constrp->name();
++        const std::string sep = GLOBAL_CONSTRAINT_SEPARATOR;
++        size_t from = 0;
++        for (size_t pos; (pos = name.find(sep, from)) != std::string::npos; from = pos + sep.size())
++            parts.push_back(name.substr(from, pos - from));
++        return nonNullPath(classp, parts, fl);
++    }
++    // every class handle along the member path 'parts' (from classp) is non-null; nullptr if the
++    // path does not start with a class handle
++    AstNodeExpr* nonNullPath(AstClass* classp, const std::vector<std::string>& parts, FileLine* fl) {
++        if (parts.empty()) return nullptr;
++        // a member declared in the class or in a class it extends
++        const auto findVar = [&](AstClass* cp, const std::string& member) -> AstVar* {
++            for (; cp; cp = cp->extendsp() ? cp->extendsp()->classp() : nullptr) {
++                if (AstVar* const varp = VN_CAST(m_memberMap.findMember(cp, member), Var)) {
++                    return varp;
++                }
++            }
++            return nullptr;
++        };
++        AstVar* const rootp = findVar(classp, parts[0]);
++        if (!rootp || !VN_IS(rootp->dtypep()->skipRefp(), ClassRefDType)) return nullptr;
++        AstNodeExpr* chainp
++            = new AstVarRef{fl, VN_AS(rootp->user2p(), NodeModule), rootp, VAccess::READ};
++        AstNodeExpr* condp
++            = new AstNeq{fl, chainp->cloneTree(false), new AstConst{fl, AstConst::Null{}}};
++        for (size_t i = 1; i < parts.size(); ++i) {
++            const AstClassRefDType* const dtp
++                = VN_CAST(chainp->dtypep()->skipRefp(), ClassRefDType);
++            AstVar* const memberp = dtp ? findVar(dtp->classp(), parts[i]) : nullptr;
++            if (!memberp || !VN_IS(memberp->dtypep()->skipRefp(), ClassRefDType)) break;
++            chainp = new AstMemberSel{fl, chainp, memberp};
++            condp = new AstLogAnd{
++                fl, condp,
++                new AstNeq{fl, chainp->cloneTree(false), new AstConst{fl, AstConst::Null{}}}};
++        }
++        VL_DO_DANGLING(chainp->deleteTree(), chainp);
++        return condp;
++    }
+     AstTask* newSetupConstraintTask(AstClass* const nodep, const std::string& name) {
+         AstTask* const taskp = new AstTask{nodep->fileline(), name + "_setup_constraint", nullptr};
+         taskp->classMethod(true);
+@@ -5466,7 +5541,16 @@ class RandomizeVisitor final : public VNVisitor {
+                             AstTaskRef* const setupTaskRefp
+                                 = new AstTaskRef{constrp->fileline(), taskp};
+                             setupTaskRefp->classOrPackagep(classp);
+-                            setupAllTaskp->addStmtsp(setupTaskRefp->makeStmt());
++                            // a sub-object's constraint applies only while every handle on its
++                            // path is non-null (IEEE 1800-2023 18.5.9)
++                            AstNodeExpr* const condp
++                                = nestedNonNull(nodep, constrp, constrp->fileline());
++                            if (condp) {
++                                setupAllTaskp->addStmtsp(new AstIf{constrp->fileline(), condp,
++                                                                   setupTaskRefp->makeStmt()});
++                            } else {
++                                setupAllTaskp->addStmtsp(setupTaskRefp->makeStmt());
++                            }
+                         });
+                 }
+             }
+@@ -5504,7 +5588,8 @@ class RandomizeVisitor final : public VNVisitor {
+                 AstNodeModule* const genModp = VN_AS(genp->user2p(), NodeModule);
+                 // Emit enum range hard constraint for a single variable
+                 const auto emitEnumConstraint = [&](const std::string& smtName,
+-                                                    AstEnumDType* const enumDtp) {
++                                                    AstEnumDType* const enumDtp,
++                                                    AstNodeExpr* const guardp = nullptr) {
+                     const int width = enumDtp->width();
+                     std::string constraint = "(__Vbv (or";
+                     for (AstEnumItem* itemp = enumDtp->itemsp(); itemp;
+@@ -5519,7 +5604,11 @@ class RandomizeVisitor final : public VNVisitor {
+                         VCMethod::RANDOMIZER_HARD,
+                         new AstCExpr{fl, AstCExpr::Pure{}, "\"" + constraint + "\""}};
+                     callp->dtypeSetVoid();
+-                    randomizep->addStmtsp(callp->makeStmt());
++                    if (guardp) {  // a sub-object's member: only while its handles are non-null
++                        randomizep->addStmtsp(new AstIf{fl, guardp, callp->makeStmt()});
++                    } else {
++                        randomizep->addStmtsp(callp->makeStmt());
++                    }
+                 };
+                 // Recursively emit enum constraints for sub-object members
+                 std::function<void(AstClass*, const std::string&)> addSubObjEnumConstraints
+@@ -5532,7 +5621,13 @@ class RandomizeVisitor final : public VNVisitor {
+                               if (enumDtp) {
+                                   // Do not emit when enum isn't constrained
+                                   if (!subVarp->user3()) return;
+-                                  emitEnumConstraint(smtName, enumDtp);
++                                  std::vector<std::string> path;
++                                  for (size_t from = 0, pos;; from = pos + 1) {
++                                      pos = pathPrefix.find('.', from);
++                                      path.push_back(pathPrefix.substr(from, pos - from));
++                                      if (pos == std::string::npos) break;
++                                  }
++                                  emitEnumConstraint(smtName, enumDtp, nonNullPath(nodep, path, fl));
+                                   return;
+                               }
+                               if (!subVarp->globalConstrained()) return;
+diff --git a/src/V3Width.cpp b/src/V3Width.cpp
+index 3eb756bfd..2d5ba513c 100644
+--- a/src/V3Width.cpp
++++ b/src/V3Width.cpp
+@@ -7780,6 +7780,16 @@ class WidthVisitor final : public VNVisitor {
+                     allow = AstClass::isClassExtendedFrom(callerClassp, calleeClassp);
+                 }
+             }
++            const AstClass* const cgp = allow ? nullptr : containingClass(nodep);
++            if (cgp && cgp->isCovergroup() && cgp->aboveLoopp()) {
++                // A coverpoint of a covergroup embedded in a class calls a method of that class
++                // (IEEE 1800-2023 19.4): V3Covergroup routes it through the enclosing object.
++                // (Found from the call itself: functions are sized on demand, from any context.)
++                const AstClass* const enclosingp = containingClass(cgp->aboveLoopp());
++                const AstClass* calleeClassp = VN_CAST(nodep->classOrPackagep(), Class);
++                if (!calleeClassp) calleeClassp = containingClass(nodep->taskp());
++                allow = enclosingp && AstClass::isClassExtendedFrom(enclosingp, calleeClassp);
++            }
+             if (!allow) {
+                 nodep->v3error("Cannot call non-static member function "
+                                << nodep->prettyNameQ() << " without object (IEEE 1800-2023 8.10)");
+@@ -8727,6 +8737,15 @@ class WidthVisitor final : public VNVisitor {
+                 case 'b':  // FALLTHRU
+                 case 'o':  // FALLTHRU
+                 case 'x':
++                    if (subargp && dtypep && dtypep->isString()) {
++                        // A string given %b/%o/%x (other simulators print its bytes as bits):
++                        // printed as text, with a warning, rather than stopping the build
++                        subargp->v3warn(WIDTH, "$display-like format of '%"s + ch
++                                                   + "' with a string argument: printed as '%s'");
++                        ch = 's';
++                        argp = nextp;
++                        break;
++                    }
+                     if (subargp) {
+                         // V3Randomize may make a %x on a string, or may
+                         // have a runtime format which gets past this error

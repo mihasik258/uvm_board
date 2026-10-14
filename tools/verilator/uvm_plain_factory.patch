@@ -1,0 +1,83 @@
+--- uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-02 19:22:38.694261027 +0300
++++ uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-02 19:24:35.638122337 +0300
+@@ -4746,6 +4746,7 @@
+         return factory;
+     endfunction
+     virtual function void set_factory(uvm_factory f);
++        uvm_factory::m_ocv_plain = 0;
+         factory = f;
+     endfunction
+     local uvm_tr_database tr_database;
+@@ -5801,6 +5802,9 @@
+   uvm_factory_override queue[$];
+ endclass
+ virtual class uvm_factory extends uvm_void;
++  // OCV: 1 while the default factory has no overrides or aliases: create_by_type can then
++  // build the requested type directly (what the override search would return anyway)
++  static bit m_ocv_plain = 1;
+   static function uvm_factory get();
+           uvm_coreservice_t s;
+           s = uvm_coreservice_t::get();
+@@ -6074,6 +6078,7 @@
+                                                       uvm_object_wrapper override_type,
+                                                       bit replace=1);
+   bit replaced;
++  uvm_factory::m_ocv_plain = 0;   // OCV
+   if (original_type == override_type) begin
+     if (original_type.get_type_name() == "" || original_type.get_type_name() == "<unknown>") begin
+       uvm_report_warning("TYPDUP", {"Original and override type ",
+@@ -6134,6 +6139,7 @@
+   bit replaced;
+   uvm_object_wrapper original_type;
+   uvm_object_wrapper override_type;
++  uvm_factory::m_ocv_plain = 0;   // OCV
+   if(m_type_names.exists(original_type_name)) begin
+     original_type = m_type_names[original_type_name];
+   end
+@@ -6207,6 +6213,7 @@
+                                                       uvm_object_wrapper override_type,
+                                                       string full_inst_path);
+   uvm_factory_override override;
++  uvm_factory::m_ocv_plain = 0;   // OCV
+   if (!m_types.exists(original_type)) begin
+     register(original_type);
+   end
+@@ -6233,6 +6240,7 @@
+   uvm_factory_override override;
+   uvm_object_wrapper original_type;
+   uvm_object_wrapper override_type;
++  uvm_factory::m_ocv_plain = 0;   // OCV
+   if(m_type_names.exists(original_type_name)) begin
+     original_type = m_type_names[original_type_name];
+   end
+@@ -6258,6 +6266,7 @@
+ endfunction
+ function void uvm_default_factory::set_type_alias(string alias_type_name,
+                           uvm_object_wrapper original_type);
++  uvm_factory::m_ocv_plain = 0;   // OCV
+     if (!is_type_registered(original_type)) begin
+       uvm_report_warning("BDTYP",{"Cannot define alias of type '",
+        original_type.get_type_name(),"' because it is not registered with the factory."}, UVM_NONE);
+@@ -6286,6 +6295,7 @@
+                           uvm_object_wrapper original_type, string full_inst_path);
+     string original_type_name;
+     m_inst_typename_alias_t  orig_type_alias_per_inst;
++  uvm_factory::m_ocv_plain = 0;   // OCV
+     original_type_name = original_type.get_type_name();
+     if (!is_type_registered(original_type)) begin
+       uvm_report_warning("BDTYP",{"Cannot define alias of type '",
+@@ -7186,9 +7196,12 @@
+     string name,
+     uvm_object unused
+   );
+-    uvm_coreservice_t cs = uvm_coreservice_t::get();
+-    uvm_factory factory = cs.get_factory();
++    uvm_coreservice_t cs;
++    uvm_factory factory;
+     unused = unused;
++    if (uvm_factory::m_ocv_plain) return obj_wrpr.create_object(name);   // OCV: no overrides
++    cs = uvm_coreservice_t::get();
++    factory = cs.get_factory();
+     return factory.create_object_by_type( obj_wrpr, contxt, name );
+   endfunction
+   static function string base_type_name();  return "object"; endfunction

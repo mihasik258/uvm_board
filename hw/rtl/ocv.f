@@ -1,0 +1,11 @@
+ocv_pkg.sv
+ocv_axil_slave.sv
+ocv_ram.sv
+ocv_throttle.sv
+ocv_capture.sv
+ocv_dma_wr.sv
+ocv_axi_wr_arb.sv
+ocv_sink.sv
+ocv_source.sv
+ocv_clock_gate.sv
+ocv_hub.sv
