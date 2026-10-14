@@ -95,11 +95,15 @@ static void images_clear(void) { rams_alloc(); for (int r = 0; r < CPU_N_RAMS; r
 static uint8_t *extra_mem[CPU_N_REGIONS_EXTRA + 1];
 static int      have_image;
 static uint64_t max_steps = 100000000;
-/* "fast" everywhere by default: measured on the board (13.10.2026), under this runner fast beats jit on every
- * core and program kind (CVA6 generated 1.32 against 1.45 s, CV32E40P 1.03 against 1.23 s, long programs too) -
- * the per-instruction work around the model (records of every stream, coverage, operands) dominates, and jit
- * pays for syncing its state at each retirement. --model-opt cpu=jit keeps it selectable. */
+/* jit on the board by default: OCV is for the long tests (hundreds of millions of instructions, tens of minutes
+ * on the PC) - there it beats fast (board 14.10.2026, CVA6 Embench x100: nettle-aes 196 -> 164 s, picojpeg
+ * 131 -> 112 s, huffbench 90 -> 82 s). On short generated programs (code run once) fast is quicker, but those
+ * take seconds either way. fast on the PC (jit emits AArch64). --model-opt cpu=fast keeps it selectable. */
+#if defined(__aarch64__)
+static char     cpu_name[16] = "jit";
+#else
 static char     cpu_name[16] = "fast";
+#endif
 static int      gen_mode;                     /* 0 = program file, 1 = random, 2 = directed */
 static unsigned gen_ops = 4000, gen_loops = 10, gen_aim = 400;
 static uint64_t gen_seed = 1, executed;
