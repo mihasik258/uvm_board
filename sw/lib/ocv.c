@@ -519,6 +519,7 @@ uint64_t ocv_rand(uint64_t *state)
  * crc32cw / crc32w instructions; a table fallback elsewhere */
 #if defined(__ARM_FEATURE_CRC32)
 #include <arm_acle.h>
+#include <arm_neon.h>
 static inline uint32_t crc_c(uint32_t c, uint32_t w) { return __crc32cw(c, w); }
 static inline uint32_t crc_z(uint32_t c, uint32_t w) { return __crc32w(c, w); }
 #else
@@ -572,6 +573,53 @@ void ocv_squash_add(uint32_t *crc32c, uint32_t *crc32, const uint32_t *rec, cons
     *crc32c = a;
     *crc32 = b;
 }
+
+/* a * b modulo the (bit-reflected) polynomial p, reflected: 1 is 0x80000000 (zlib's multmodp) */
+static uint32_t gf_mul(uint32_t a, uint32_t b, uint32_t p)
+{
+    uint32_t m = 1u << 31, r = 0;
+    for (; m; m >>= 1) {
+        if (a & m) r ^= b;
+        b = (b >> 1) ^ (p & (0u - (b & 1)));
+    }
+    return r;
+}
+static uint32_t gf_xpow(uint64_t e, uint32_t p)             /* x^e modulo p */
+{
+    uint32_t r = 1u << 31, x = 1u << 30;
+    for (; e; e >>= 1, x = gf_mul(x, x, p)) if (e & 1) r = gf_mul(r, x, p);
+    return r;
+}
+
+int ocv_fold_make(ocv_fold_t *f, const uint32_t *recs, uint32_t n, uint32_t stride, const uint32_t *mask, uint32_t words)
+{
+    const uint64_t bytes = (uint64_t)n * words * 4u;
+    if (words > 16 || n * words < 2) return 0;
+    f->n = n; f->words = words; f->c = 0; f->z = 0;
+    for (uint32_t i = 0; i < n; i++) ocv_squash_add(&f->c, &f->z, recs + (size_t)i * stride, mask, words);
+    for (uint32_t j = 0; j < words; j++) f->last[j] = recs[(size_t)(n - 1) * stride + j];
+    /* crc(s, zeros of `bytes`) = s * x^(8 bytes); with the 64-bit carry-less product reduced by the CRC
+     * instruction (one more x^32, and the product's reflected bit order: one less) the constant is x^(8 bytes - 33) */
+    f->kc = gf_xpow(8 * bytes - 33, 0x82F63B78u);
+    f->kz = gf_xpow(8 * bytes - 33, 0xEDB88320u);
+    return 1;
+}
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+__attribute__((target("+crypto")))                          /* (PMULL: the A72 has it, -mcpu=cortex-a72 not) */
+static inline uint64_t clmul32(uint32_t a, uint32_t b) { return (uint64_t)vmull_p64(a, b); }
+void ocv_fold_apply(uint32_t *crc32c, uint32_t *crc32, const ocv_fold_t *f)
+{
+    *crc32c = __crc32cd(0, clmul32(*crc32c, f->kc)) ^ f->c;
+    *crc32  = __crc32d(0, clmul32(*crc32, f->kz)) ^ f->z;
+}
+#else
+void ocv_fold_apply(uint32_t *crc32c, uint32_t *crc32, const ocv_fold_t *f)   /* (the PC: slowly) */
+{
+    *crc32c = gf_mul(gf_mul(f->kc, gf_xpow(33, 0x82F63B78u), 0x82F63B78u), *crc32c, 0x82F63B78u) ^ f->c;
+    *crc32  = gf_mul(gf_mul(f->kz, gf_xpow(33, 0xEDB88320u), 0xEDB88320u), *crc32, 0xEDB88320u) ^ f->z;
+}
+#endif
 
 void ocv_squash_window(ocv_env_t *env, int ch, uint32_t n) { ocv_ep_wr(env, ch, OCV_EP_REG_SQUASH, n); }
 

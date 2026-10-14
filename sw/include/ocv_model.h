@@ -32,6 +32,7 @@
 #include "ocv_meta.h"
 
 typedef struct ocv_model_io ocv_model_io_t;
+struct ocv_fold;                                /* (ocv.h) */
 struct ocv_model_io {
     /* Expect this record next on output channel ch. */
     void (*emit)(ocv_model_io_t *io, int ch, const uint32_t *rec);
@@ -47,6 +48,12 @@ struct ocv_model_io {
      * recs + k * stride words - in order, as n emit() calls; a model with many records per step saves the call
      * and the reload of the channel's state per record. */
     void (*emit_n)(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride);
+    /* Optional (NULL: not offered): records that recur together (a processor model's translated block) emitted
+     * as one piece. fold_make: fold n records of output channel ch (as emit_n would take them) into *f once,
+     * 0 if the channel cannot take pieces. emit_fold: = emit_n of those records, 0 if not taken now (a window
+     * ends inside the piece...): then emit them as records. */
+    int  (*fold_make)(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride, struct ocv_fold *f);
+    int  (*emit_fold)(ocv_model_io_t *io, int ch, const struct ocv_fold *f);
 };
 
 typedef struct {

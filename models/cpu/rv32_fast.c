@@ -562,5 +562,5 @@ static uint32_t fast_pc(cpu_model_t *m) { return ((fast_t *)m)->pc; }
 
 const cpu_impl_t cpu_fast_impl = {
     "fast", "\"iss\" as a predecoding interpreter (same semantics, faster on the board)", 0,
-    fast_create, fast_step, fast_xreg, fast_pc, fast_destroy, NULL, fast_interrupt, NULL, 1
+    fast_create, fast_step, fast_xreg, fast_pc, fast_destroy, NULL, fast_interrupt, NULL, 1, NULL
 };

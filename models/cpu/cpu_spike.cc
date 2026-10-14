@@ -198,5 +198,5 @@ void spike_destroy(cpu_model_t *mm)
 
 extern "C" const cpu_impl_t cpu_spike_impl = {
     "spike", "Spike, the RISC-V reference ISA simulator (riscv-isa-sim): full ISA, traps, CSRs", 1,
-    spike_create, spike_step, spike_xreg, spike_pc, spike_destroy, NULL, NULL, NULL, 0
+    spike_create, spike_step, spike_xreg, spike_pc, spike_destroy, NULL, NULL, NULL, 0, NULL
 };

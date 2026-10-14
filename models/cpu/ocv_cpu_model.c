@@ -555,6 +555,32 @@ static void ebuf_flush(ocv_model_io_t *io, int s)
 }
 static void ebuf_flush_all(ocv_model_io_t *io) { for (int s = 0; s < CPU_N_STREAMS; s++) ebuf_flush(io, s); }
 
+/* a translated block's issue records: the same each time it runs (pc, instruction) - folded once per block
+ * (ocv_fold_t, cached by the model's block key) and handed to the window as one piece (io->emit_fold);
+ * a long program runs the same few hundred blocks hundreds of millions of times */
+#define FOLD_CACHE 4096
+static struct { uint64_t key; uint32_t run; int ok; ocv_fold_t f; } fold_cache[FOLD_CACHE];
+static uint32_t fold_run;                      /* programs run: a new model's block keys start again */
+static int fold_s = -1;                        /* the issue stream (only one: else no pieces) */
+static int fold_block(ocv_model_io_t *io, uint64_t key, const cpu_retire_t *rb, int n)
+{
+    for (int i = 0; i < n; i++) if (rb[i].pc_next == CPU_EXIT) return 0;   /* (the end: record by record) */
+    const uint32_t h = (uint32_t)(key ^ key >> 29) * 0x9E3779B1u >> 20;
+    __typeof__(fold_cache[0]) *e = &fold_cache[h & (FOLD_CACHE - 1)];
+    if (e->key != key || e->run != fold_run) {
+        uint32_t recs[64 + 1][CPU_REC_WORDS];
+        e->key = key; e->run = fold_run; e->ok = 0;
+        for (int i = 0; i < n; i++) {
+            const uint32_t raw = rb[i].raw & 0xFFFFu;
+            if (cpu_stream_out(&cpu_streams[fold_s], &rb[i], (raw & 3) != 3, raw, fields[fold_s], &recs[i]) != 1) return 0;
+        }
+        e->ok = io->fold_make(io, cpu_streams[fold_s].channel, &recs[0][0], (uint32_t)n, CPU_REC_WORDS, &e->f);
+    }
+    if (!e->ok || e->f.n != (uint32_t)n) return 0;
+    ebuf_flush(io, fold_s);                    /* (the records before it come first) */
+    return io->emit_fold(io, cpu_streams[fold_s].channel, &e->f);
+}
+
 static void run_program(ocv_model_io_t *io)
 {
     static int init;
@@ -569,6 +595,8 @@ static void run_program(ocv_model_io_t *io)
             }
         }
         if (CPU_N_DEVICES) dev_fields();
+        for (int s = 0, k = 0; s < CPU_N_STREAMS; s++)
+            if (cpu_streams[s].kind == CPU_S_ISSUE) fold_s = k++ ? -1 : s;
         for (int s = 0; s < CPU_N_STREAMS; s++)
             if (cpu_streams[s].kind == CPU_S_CSRR) { w_ch = cpu_streams[s].channel; w_f = fields[s][0]; }
         for (int s = 0; s < CPU_N_STREAMS && w_ch < 0; s++)
@@ -616,7 +644,10 @@ static void run_program(ocv_model_io_t *io)
     static FILE *trace;
     static int trace_init;
     if (!trace_init++ && getenv("OCV_CPU_TRACE")) trace = fopen(getenv("OCV_CPU_TRACE"), "w");
-    cpu_retire_t r;
+    cpu_retire_t rb[64];                       /* handed out together: a translated block (step_n), or one */
+    int bi = 0, bn = 0, folded = 0;            /* folded: rb's issue records went as one piece */
+    uint32_t s_raw = 0, s_insn = 0, s_a = 0, s_b = 0;   /* (a model without gives_src: read before its step) */
+    uint64_t next_ask = 0xFFFF;
     uint64_t order = 0;
     const cpu_region_t *last_rg = NULL;
     const int gives_src = cpu->impl->gives_src;
@@ -625,10 +656,19 @@ static void run_program(ocv_model_io_t *io)
     for (int s = 0; s < CPU_N_STREAMS; s++)
         if (cpu_streams[s].kind != CPU_S_INTR && cpu_streams[s].kind != CPU_S_WATCH && cpu_streams[s].kind != CPU_S_ERROR)
             active[n_active++] = s;
+    /* by blocks: a model that says which whole block it handed out (jit); device accesses and anything the
+     * interpreter runs come one by one there, so the end (stopped) and device reads stay per instruction */
+    int by_blocks = 0;
+#if defined(CPU_FOR_STREAMS)
+    by_blocks = gives_src && cpu->impl->step_n && cpu->impl->block_key && !trace;
+#endif
+    const int fold = by_blocks && fold_s >= 0 && io->fold_make && io->emit_fold;
+    fold_run++;
     for (uint64_t n = 0; n < max_steps; n++) {
+      if (bi == bn) {                          /* the next instruction(s) */
         /* no interrupt known yet: ask again now and then - a testbench running the core alongside the model
          * (tb_pc) answers only as far as the core has run (not yet = none) */
-        if (irq_f && irq_seq == ~0ull && (n & 0xFFFFu) == 0xFFFFu) NEXT_IRQ();
+        if (n >= next_ask) { next_ask = n + 0x10000; if (irq_f && irq_seq == ~0ull) NEXT_IRQ(); }
         if (irq_seq != ~0ull && irq_seq - issued < 256) cpu_sync(cpu, irq_seq - issued + 64);   /* (traps: not issued) */
         while (irq_f && irq_seq == issued) {   /* the core took an interrupt here: so does the model */
             if (trace) fprintf(trace, "interrupt %u before issue %llu at pc %08x\n", irq_cause,
@@ -655,31 +695,45 @@ static void run_program(ocv_model_io_t *io)
             irq_j++;
             NEXT_IRQ();
         }
-        cur_order = order++;
-        uint32_t raw, insn, op_a, op_b;
-        int c;
-        if (gives_src) {                       /* the model says what it fetched and read: nothing again here */
-            cpu_step(cpu, &r);
-            raw = r.raw & 0xFFFFu; c = (raw & 3) != 3; insn = r.insn; op_a = r.src1; op_b = r.src2;
+        bi = 0; folded = 0; cur_order = order;
+        if (by_blocks && (irq_seq == ~0ull || irq_seq - issued >= 256 + 64)) {   /* (no interrupt inside) */
+            bn = cpu_step_n(cpu, rb, max_steps - n < 64 ? (int)(max_steps - n) : 64);
+            const uint64_t key = bn > 1 && fold ? cpu->impl->block_key(cpu) : 0;
+            if (key && (folded = fold_block(io, key, rb, bn))) {
+                emitted[cpu_streams[fold_s].channel] += (uint64_t)bn;
+                issued += (uint64_t)bn;
+            }
+        } else if (gives_src) {
+            bn = 1; cpu_step(cpu, &rb[0]);
         } else {
             int whole;
             const uint32_t pc = cpu_pc(cpu), w32 = fetch32(&env, &last_rg, pc, &whole);
-            raw = w32 & 0xFFFFu;
-            c = (raw & 3) != 3;
-            insn = c ? rv32_rvc_expand((uint16_t)raw) : whole ? w32 : cpu_env_load(&env, pc, 4);
-            op_a = cpu_xreg(cpu, (insn >> 15) & 31); op_b = cpu_xreg(cpu, (insn >> 20) & 31);
-            cpu_step(cpu, &r);
+            s_raw = w32 & 0xFFFFu;
+            s_insn = (s_raw & 3) != 3 ? rv32_rvc_expand((uint16_t)s_raw) : whole ? w32 : cpu_env_load(&env, pc, 4);
+            s_a = cpu_xreg(cpu, (s_insn >> 15) & 31); s_b = cpu_xreg(cpu, (s_insn >> 20) & 31);
+            bn = 1; cpu_step(cpu, &rb[0]);
         }
-        COV(raw, c, insn, op_a, op_b, (int)r.trap);
-        if (trace) fprintf(trace, "%llu %08x %08x x%u=%08x%s%s\n", (unsigned long long)issued, r.pc, r.insn, r.rd_addr,
-                           r.rd_wdata, r.trap ? " trap" : "", r.mem_we ? " store" : "");
+      }
+        const cpu_retire_t *const rp = &rb[bi++];
+        order++;
+        uint32_t raw, insn, op_a, op_b;
+        if (gives_src) {                       /* the model says what it fetched and read: nothing again here */
+            raw = rp->raw & 0xFFFFu; insn = rp->insn; op_a = rp->src1; op_b = rp->src2;
+        } else {
+            raw = s_raw; insn = s_insn; op_a = s_a; op_b = s_b;
+        }
+        const int c = (raw & 3) != 3;
+        COV(raw, c, insn, op_a, op_b, (int)rp->trap);
+        if (trace) fprintf(trace, "%llu %08x %08x x%u=%08x%s%s\n", (unsigned long long)issued, rp->pc, rp->insn, rp->rd_addr,
+                           rp->rd_wdata, rp->trap ? " trap" : "", rp->mem_we ? " store" : "");
         executed++;
 #if defined(CPU_FOR_STREAMS)
         /* stream by stream with s a constant: kind, filter and field positions known when compiling */
 #define CPU_FLD(s, j) (cpu_stream_field[s][j] < 0 ? NULL : &CPU_DUT.channels[cpu_streams[s].channel].fields[cpu_stream_field[s][j]])
 #define CPU_STREAM_DO(s) do { \
+            if (cpu_streams[s].kind == CPU_S_ISSUE && folded) break;   /* (went with the block) */ \
             const ocv_field_t *const F_[6] = { CPU_FLD(s, 0), CPU_FLD(s, 1), CPU_FLD(s, 2), CPU_FLD(s, 3), CPU_FLD(s, 4), CPU_FLD(s, 5) }; \
-            const int nr_ = cpu_stream_out(&cpu_streams[s], &r, c, raw, F_, &ebuf[s][en[s]]); \
+            const int nr_ = cpu_stream_out(&cpu_streams[s], rp, c, raw, F_, &ebuf[s][en[s]]); \
             if (nr_) { \
                 en[s] += nr_; \
                 emitted[cpu_streams[s].channel] += (uint64_t)nr_; \
@@ -695,7 +749,7 @@ static void run_program(ocv_model_io_t *io)
         for (int a = 0; a < n_active; a++) {
             const int s = active[a];
             uint32_t rec[2][CPU_REC_WORDS];
-            const int nr = cpu_stream_out(&cpu_streams[s], &r, c, raw, fields[s], rec);
+            const int nr = cpu_stream_out(&cpu_streams[s], rp, c, raw, fields[s], rec);
             for (int k = 0; k < nr; k++) {
                 io->emit(io, cpu_streams[s].channel, rec[k]);
                 emitted[cpu_streams[s].channel]++;
@@ -704,9 +758,9 @@ static void run_program(ocv_model_io_t *io)
         }
 #endif
         if (stopped) break;                    /* the program wrote its end */
-        const uint32_t op = r.insn & 0x7f;
-        if (r.pc_next == CPU_EXIT &&           /* the end; seen in the issue stream: a jump there, not running */
-            (!CPU_END_ISSUE || op == 0x6f || op == 0x67 || op == 0x63 || r.pc_next != r.pc + (c ? 2u : 4u))) {   /* into it */
+        const uint32_t op = rp->insn & 0x7f;
+        if (rp->pc_next == CPU_EXIT &&           /* the end; seen in the issue stream: a jump there, not running */
+            (!CPU_END_ISSUE || op == 0x6f || op == 0x67 || op == 0x63 || rp->pc_next != rp->pc + (c ? 2u : 4u))) {   /* into it */
             ebuf_flush_all(io);                /* (the buffered records come first) */
             if (CPU_END_ISSUE)                 /* the core issues the instruction there, then stops */
                 for (int s = 0; s < CPU_N_STREAMS; s++)
@@ -718,7 +772,7 @@ static void run_program(ocv_model_io_t *io)
                     }
             break;
         }
-        if (r.trap && !cpu->impl->traps && !strchr(CPU_ISA, ':')) break;   /* a model without traps stops */
+        if (rp->trap && !cpu->impl->traps && !strchr(CPU_ISA, ':')) break;   /* a model without traps stops */
     }
     ebuf_flush_all(io);
     /* watched values: not predicted - what the core gave goes into the comparison as it is */

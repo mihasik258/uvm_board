@@ -230,6 +230,27 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
     q->sq_c = a; q->sq_z = z; q->sq_n = k;
 }
 
+/* a piece of records (ocv_fold_t): squashed channels (not --overlap), inside one window - folded with
+ * ocv_fold_apply, the window state as emit_n leaves it */
+static int fold_make(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride, ocv_fold_t *f)
+{
+    run_t *r = io->priv;
+    const ocv_channel_t *c = &r->env.dut->channels[ch];
+    if (!c->squash || r->overlap || c->kind == OCV_CH_SOURCE) return 0;
+    return ocv_fold_make(f, recs, n, stride, r->mask[ch], c->rec_words);
+}
+static int emit_fold(ocv_model_io_t *io, int ch, const ocv_fold_t *f)
+{
+    run_t *r = io->priv;
+    queue_t *q = &r->q[ch];
+    if (q->sq_n + f->n >= r->window) return 0;  /* (the window would end inside: record by record) */
+    if (q->sq_n == 0) q->sq_c = q->sq_z = 0xFFFFFFFFu;
+    ocv_fold_apply(&q->sq_c, &q->sq_z, f);
+    q->sq_n += f->n;
+    for (uint32_t j = 0; j < f->words; j++) q->sq_last[j] = f->last[j];
+    return 1;
+}
+
 static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec)
 {
     run_t *r = io->priv;
@@ -746,7 +767,8 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
     }
 
     /* (OCV_NO_EMITN=1: records one by one, emit() - to tell the batched path apart when something differs) */
-    ocv_model_io_t io = { emit, observed, &r, send_rec, 0, getenv("OCV_NO_EMITN") ? NULL : emit_n };
+    ocv_model_io_t io = { emit, observed, &r, send_rec, 0, getenv("OCV_NO_EMITN") ? NULL : emit_n,
+                          getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold };
     r.io = &io;
     uint64_t rng = seed ? seed : 1, stim_total = 0, cycles = 0, polls_total = 0, done_batches = 0;
     double t0 = now_s();

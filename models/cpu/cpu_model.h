@@ -81,6 +81,10 @@ typedef struct {
     /* optional: the next n instructions one by one, nothing executed ahead (cpu_sync) */
     void         (*sync)(cpu_model_t *m, uint64_t n);
     int          gives_src;     /* cpu_retire_t.raw / src1 / src2 are set */
+    /* optional: nonzero if the last step_n handed out one whole translated block from its start - a key that
+     * is the same each time that block runs and never another block's (its instructions, pc and insn: the
+     * same each time; the values they compute: not) */
+    uint64_t     (*block_key)(cpu_model_t *m);
 } cpu_impl_t;
 
 struct cpu_model { const cpu_impl_t *impl; };          /* first member of every implementation */

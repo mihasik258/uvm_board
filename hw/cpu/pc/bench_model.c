@@ -18,7 +18,8 @@
 static uint64_t n_rec[256], n_win[256];
 static uint32_t sq_c[256], sq_z[256], sq_n[256], window = 4096, ones[64];
 static uint32_t last[256][64];
-static uint64_t sig;                          /* every closed window's two CRCs: the same for two models that agree */
+static uint64_t sig[256];                     /* per channel, every closed window's two CRCs: the same for two models
+                                               * that agree (channels apart: their windows close in any order) */
 static int crc_off;                           /* --crc-off: the PC has no CRC32 instruction (the A72 has) */
 
 static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
@@ -30,7 +31,7 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
         if (sq_n[ch] == 0) sq_c[ch] = sq_z[ch] = 0xFFFFFFFFu;
         if (!crc_off) ocv_squash_add(&sq_c[ch], &sq_z[ch], rec, ones, c->rec_words);
         for (uint32_t j = 0; j < c->rec_words; j++) last[ch][j] = rec[j];
-        if (++sq_n[ch] >= window) { sq_n[ch] = 0; n_win[ch]++; sig = sig * 1000003u + ((uint64_t)sq_c[ch] << 32 | sq_z[ch]); }
+        if (++sq_n[ch] >= window) { sq_n[ch] = 0; n_win[ch]++; sig[ch] = sig[ch] * 1000003u + ((uint64_t)sq_c[ch] << 32 | sq_z[ch]); }
     }
 }
 static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride)
@@ -45,9 +46,25 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
         if (k == 0) a = z = 0xFFFFFFFFu;
         if (!crc_off) ocv_squash_add(&a, &z, rec, ones, W);
         if (++k >= window) { for (uint32_t j = 0; j < W; j++) last[ch][j] = rec[j]; k = 0; n_win[ch]++;
-                             sig = sig * 1000003u + ((uint64_t)a << 32 | z); }
+                             sig[ch] = sig[ch] * 1000003u + ((uint64_t)a << 32 | z); }
     }
     sq_c[ch] = a; sq_z[ch] = z; sq_n[ch] = k;
+}
+static int fold_make(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride, ocv_fold_t *f)
+{   /* as the runner's */
+    (void)io;
+    const ocv_channel_t *c = &ocv_model_dut->channels[ch];
+    return c->squash && ocv_fold_make(f, recs, n, stride, ones, c->rec_words);
+}
+static int emit_fold(ocv_model_io_t *io, int ch, const ocv_fold_t *f)
+{
+    (void)io;
+    if (sq_n[ch] + f->n >= window) return 0;
+    if (sq_n[ch] == 0) sq_c[ch] = sq_z[ch] = 0xFFFFFFFFu;
+    if (!crc_off) ocv_fold_apply(&sq_c[ch], &sq_z[ch], f);
+    sq_n[ch] += f->n; n_rec[ch] += f->n;
+    for (uint32_t j = 0; j < f->words; j++) last[ch][j] = f->last[j];
+    return 1;
 }
 static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec) { (void)io; (void)ch; (void)index; (void)rec; return 0; }
 static void send(ocv_model_io_t *io, int ch, const uint32_t *rec) { (void)io; (void)ch; (void)rec; }
@@ -78,7 +95,7 @@ int main(int argc, char **argv)
         } else { fprintf(stderr, "usage: %s [--batches N] [--window W] [--model-opt k=v ...]\n", argv[0]); return 1; }
     }
     const ocv_dut_t *d = ocv_model_dut;
-    ocv_model_io_t io = { emit, observed, NULL, send, 0, emit_n };
+    ocv_model_io_t io = { emit, observed, NULL, send, 0, emit_n, getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold };
     uint64_t rng = 1, idx[256] = { 0 };
     double t_stim = 0, t_model = 0;
     uint32_t rec[64];
@@ -100,13 +117,14 @@ int main(int argc, char **argv)
             if (ocv_get_raw(rec, last_f)) break;
         }
     }
-    uint64_t instr = 0, recs = 0;
+    uint64_t instr = 0, recs = 0, sg = 0;
+    for (int ch = 0; ch < d->n_channels; ch++) sg = sg * 31u + sig[ch];
     for (int ch = 0; ch < d->n_channels; ch++) recs += n_rec[ch];
     for (int ch = 0; ch < d->n_channels; ch++)
         if (!strcmp(d->channels[ch].name, "issue") || !strcmp(d->channels[ch].name, "retire")) instr = n_rec[ch];
     printf("bench_model: %s, %d program(s): %llu instructions, %llu records; model %.3f s = %.0f ns per instruction"
            " (generator %.3f s), signature %016llx\n", d->name, batches, (unsigned long long)instr, (unsigned long long)recs, t_model,
            instr ? t_model / (double)instr * 1e9 : 0.0, t_stim,
-           (unsigned long long)sig);
+           (unsigned long long)sg);
     return 0;
 }

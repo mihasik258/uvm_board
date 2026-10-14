@@ -117,6 +117,15 @@ static inline uint32_t ocv_store_words(const ocv_channel_t *c) { return c->rec_w
 /* the window signatures, as ocv_sink computes them: start both at 0xFFFFFFFF for a window, feed
  * every record (masked by the compared bits, ocv_channel_word_masks) */
 void     ocv_squash_add(uint32_t *crc32c, uint32_t *crc32, const uint32_t *rec, const uint32_t *mask, uint32_t words);
+/* n records folded as one piece, once (a processor model's translated block: its issue records are the same
+ * each time it runs): both signatures over them from state 0 and the constants that carry a state past them.
+ * The CRCs are linear: crc(s, piece) = crc(0, piece) ^ crc(s, zeros of its length), and the latter is s times
+ * x^(8 * bytes) modulo the polynomial - so a window takes the piece in two carry-less multiplies
+ * (ocv_fold_apply), not n record folds. 0 if the piece does not fit (more than 16 words, fewer than 2). */
+typedef struct ocv_fold { uint32_t n, words, c, z, kc, kz; uint32_t last[16]; } ocv_fold_t;
+int      ocv_fold_make(ocv_fold_t *f, const uint32_t *recs, uint32_t n, uint32_t stride, const uint32_t *mask, uint32_t words);
+/* = ocv_squash_add of the piece's n records, one by one */
+void     ocv_fold_apply(uint32_t *crc32c, uint32_t *crc32, const ocv_fold_t *f);
 /* set the window (records per fused record; 1 = every record) / emit the open window */
 void     ocv_squash_window(ocv_env_t *env, int ch, uint32_t n);
 /* the compared-bits mask the squash signatures cover (rec_words words): 1 if the endpoint has
