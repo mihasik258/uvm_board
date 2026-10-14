@@ -18,6 +18,7 @@
 static uint64_t n_rec[256], n_win[256];
 static uint32_t sq_c[256], sq_z[256], sq_n[256], window = 4096, ones[64];
 static uint32_t last[256][64];
+static uint64_t sig;                          /* every closed window's two CRCs: the same for two models that agree */
 static int crc_off;                           /* --crc-off: the PC has no CRC32 instruction (the A72 has) */
 
 static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
@@ -29,7 +30,7 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
         if (sq_n[ch] == 0) sq_c[ch] = sq_z[ch] = 0xFFFFFFFFu;
         if (!crc_off) ocv_squash_add(&sq_c[ch], &sq_z[ch], rec, ones, c->rec_words);
         for (uint32_t j = 0; j < c->rec_words; j++) last[ch][j] = rec[j];
-        if (++sq_n[ch] >= window) { sq_n[ch] = 0; n_win[ch]++; }
+        if (++sq_n[ch] >= window) { sq_n[ch] = 0; n_win[ch]++; sig = sig * 1000003u + ((uint64_t)sq_c[ch] << 32 | sq_z[ch]); }
     }
 }
 static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride)
@@ -43,7 +44,8 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
         const uint32_t *rec = recs + (size_t)i * stride;
         if (k == 0) a = z = 0xFFFFFFFFu;
         if (!crc_off) ocv_squash_add(&a, &z, rec, ones, W);
-        if (++k >= window) { for (uint32_t j = 0; j < W; j++) last[ch][j] = rec[j]; k = 0; n_win[ch]++; }
+        if (++k >= window) { for (uint32_t j = 0; j < W; j++) last[ch][j] = rec[j]; k = 0; n_win[ch]++;
+                             sig = sig * 1000003u + ((uint64_t)a << 32 | z); }
     }
     sq_c[ch] = a; sq_z[ch] = z; sq_n[ch] = k;
 }
@@ -103,7 +105,8 @@ int main(int argc, char **argv)
     for (int ch = 0; ch < d->n_channels; ch++)
         if (!strcmp(d->channels[ch].name, "issue") || !strcmp(d->channels[ch].name, "retire")) instr = n_rec[ch];
     printf("bench_model: %s, %d program(s): %llu instructions, %llu records; model %.3f s = %.0f ns per instruction"
-           " (generator %.3f s)\n", d->name, batches, (unsigned long long)instr, (unsigned long long)recs, t_model,
-           instr ? t_model / (double)instr * 1e9 : 0.0, t_stim);
+           " (generator %.3f s), signature %016llx\n", d->name, batches, (unsigned long long)instr, (unsigned long long)recs, t_model,
+           instr ? t_model / (double)instr * 1e9 : 0.0, t_stim,
+           (unsigned long long)sig);
     return 0;
 }

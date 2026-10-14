@@ -62,6 +62,8 @@ int main(int argc, char **argv)
     static cpu_retire_t bat[64];
     int bi = 0, bn = 0;
     for (; n < max; n++) {
+        uint32_t xr[32];                       /* (the registers it reads: src1 / src2 checked against them) */
+        for (int i = 0; i < 32; i++) xr[i] = cpu_xreg(m[0], i);
         memset(&a, 0, sizeof a);
         cpu_step(m[0], &a);
         if (bi == bn) {
@@ -77,6 +79,11 @@ int main(int argc, char **argv)
             const uint32_t i = b.insn, r = b.raw;
             if (((r & 3) == 3 ? r != i : rv32_rvc_expand((uint16_t)r) != i) && !b.trap) {
                 printf("t_fast: %s: raw 0x%x does not give insn 0x%x at retirement %ld\n", argv[1], r, i, n);
+                return 1;
+            }
+            if (!b.trap && (b.src1 != xr[(i >> 15) & 31] || b.src2 != xr[(i >> 20) & 31])) {
+                printf("t_fast: %s: src1 0x%x src2 0x%x, the registers hold 0x%x 0x%x at retirement %ld\n", argv[1],
+                       b.src1, b.src2, xr[(i >> 15) & 31], xr[(i >> 20) & 31], n);
                 return 1;
             }
         }

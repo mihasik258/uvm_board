@@ -30,7 +30,8 @@ typedef struct {
     uint32_t pc, insn, next;               /* next: pc of the next instruction unless dyn_next */
     uint32_t m_next, m_rd, m_store;        /* all ones: take that value from the block's output */
     uint8_t  rd, len, store, dyn_next;     /* rd 0: no register written; store: bytes (0: none) */
-} jins_t;
+    uint8_t  rs1, rs2; uint16_t raw;       /* (cpu_retire_t.src1/src2/raw: raw is a compressed one's 16 bits) */
+} jins_t;                                  /* 32 bytes */
 
 typedef struct jblock {
     int (*fn)(void *state, jout_t *out);
@@ -56,7 +57,8 @@ typedef struct {
     jins_t     keep[JIT_MAX];              /* the running block's table when the translations go */
     const jins_t *cur; uint32_t cur_n, cur_i;
     uint64_t   cur_order;
-    uint32_t   x0[32];                     /* registers before the running block (cpu_xreg inside it) */
+    uint32_t   x0[32];                     /* registers up to the last handed out of the running block (cpu_xreg
+                                            * and src1/src2 inside it; the block itself already wrote f.x) */
     uint64_t   single;                     /* cpu_sync: instructions still to run one by one */
     int        smc;                        /* a store hit translated code */
     uint64_t   n_blocks, n_trans, n_flush, n_interp, n_cold;   /* OCV_JIT_STATS: printed at the end */
@@ -215,6 +217,8 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
         if (!translatable(d) || region_of(&j->f, p, d->len) != creg) break;   /* (code within one region) */
         jins_t *I = &b->ins[k];
         I->pc = p; I->insn = d->insn; I->len = d->len; I->store = 0; I->dyn_next = 0;
+        I->rs1 = d->rs1; I->rs2 = d->rs2;
+        I->raw = d->len == 2 ? (uint16_t)(creg->host[p - creg->base] | creg->host[p - creg->base + 1] << 8) : 0;
         I->next = d->op == OP_JAL ? p + (uint32_t)d->imm : p + d->len;
         I->rd = (d->rd && d->op != OP_SB && d->op != OP_SH && d->op != OP_SW && d->op != OP_SNONE &&
                  !(d->op >= OP_BEQ && d->op <= OP_BGEU) && d->op != OP_FENCE) ? d->rd : 0;
@@ -396,6 +400,9 @@ static inline void hand_out(jit_t *j, cpu_retire_t *r)
     r->pc_next = (o->next & I->m_next) | (I->next & ~I->m_next);
     r->rd_addr = I->rd; r->rd_wdata = o->wdata & I->m_rd;
     r->trap = 0; r->insn = I->insn; r->timing_csr = 0;
+    r->raw = I->len == 2 ? I->raw : I->insn;
+    r->src1 = j->x0[I->rs1]; r->src2 = j->x0[I->rs2];
+    j->x0[I->rd] = r->rd_wdata;                             /* (rd 0: writes 0 to x0[0]) */
     r->mem_we = I->m_store & 1; r->mem_wmask = ((1u << I->store) - 1) & I->m_store;
     r->mem_addr = o->maddr & I->m_store; r->mem_wdata = o->mdata & I->m_store;
     r->csr_we = 0; r->csr_wcmd = 0; r->csr_waddr = 0; r->csr_wdata = 0;
@@ -530,9 +537,7 @@ static uint32_t jit_xreg(cpu_model_t *m, int i)
     jit_t *j = (jit_t *)m;                                       /* the state after the last handed out */
     if (!(i & 31)) return 0;
     if (j->cur_i < j->cur_n) {
-        /* the registers already hold the whole block: the newest value of x[i] up to cur_i */
-        for (uint32_t k = j->cur_i; k-- > 0;) if (j->cur[k].rd == (i & 31)) return j->out[k].wdata;
-        return j->x0[i & 31];
+        return j->x0[i & 31];                                 /* (f.x already holds the whole block) */
     }
     return j->f.x[i & 31];
 }
@@ -545,6 +550,6 @@ static uint32_t jit_pc(cpu_model_t *m)
 
 static const cpu_impl_t cpu_jit_impl = {
     "jit", "\"fast\" translated block by block into AArch64 code (the board's A72)", 0,
-    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 0
+    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1
 };
 #endif
