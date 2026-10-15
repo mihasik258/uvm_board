@@ -297,3 +297,92 @@ Lyra, DiffTest-H. **Ни одна из этих работ не интегрир
 - Zynq DMA benchmark: https://blog.reds.ch/?p=2054 ; UG585: https://class.ece.iastate.edu/cpre488/resources/ug585-Zynq-7000-TRM.pdf
 - KV260: https://www.amd.com/content/dam/amd/en/documents/products/som/kria/k26/kv260-product-brief.pdf
 - Low-latency на US+ MPSoC: https://drops.dagstuhl.de/storage/01oasics/oasics-vol128-ng-res2025/OASIcs.NG-RES.2025.2/OASIcs.NG-RES.2025.2.pdf
+
+---
+
+## 12. Второй проход СЛИВА (октябрь 2026) — прирост сверх раздела 11
+
+### Ключевые новые находки
+
+1. **Verilator 5.052 (2026-09-05): поддержка UVM 2020-3.2.**
+   Источники: https://github.com/verilator/verilator-announce/issues/85 , https://verilator.org/guide/latest/changes.html
+   Обновление к идее I9: Verilator уже догнал UVM 2020 (ограничения отслеживаются в verilator/verilator#1538).
+   Также: Thread PGO (балансировка макротасков по потокам), автоматическая NUMA-стратегия (VERILATOR_NUMA_STRATEGY),
+   --dpi-thread-safe, покрытие .info с описанием веток. «UVM целиком на ARM через Verilator» в 2026 значительно реалистичнее.
+
+2. **Veripool «Papers on Verilator» (актуален на 2026)**: https://veripool.org/verilator/documentation/
+   - Antmicro: UVM 2017 (окт.2025), Enhancing RTL Coverage Reporting (авг.2025), Hierarchical Mode perf (май.2025);
+   - «Open-Source UVM Verification of AXI Systems in Verilator» (сент.2024): https://antmicro.com/blog/2024/09/open-source-uvm-verification-axi-in-verilator
+   - «Porting a Complete UVC to Verilator + UVM» (AsFigo, ноя.2023): https://asfigo.blogspot.com/2023/11/porting-complete-uvc-to-verilator-uvm.html
+   - PRO-V — агент RTL-верификации на Verilator (дек.2025): https://arxiv.org/abs/2506.12200
+   - Renode Bazel Rules для ко-симуляций (ноя.2025): https://renode.io/news/bazel-rules-for-renode/
+   - Renode+Verilator для Coral NPU SoC (июль 2026): https://antmicro.com/blog/2026/07/renode-and-verilator-for-coral-npu
+
+3. **DVCon U.S. 2026** ( https://dvcon-proceedings.org/event_year/y2026/ ):
+   - «Broadening the Adoption of HW-Assisted Verification with Next Generation Emulation Appliance» (Ganpati, Tamura, Young): https://dvcon-proceedings.org/document/broadening-the-adoption-of-hardware-assisted-verification-with-next-generation-emulation-appliance/
+   - «Practical Tips for Adopting PSS» (Tom Fitzpatrick): https://dvcon-proceedings.org/document/practical-tips-for-adopting-pss/
+   - «IP-XACT Based PSS Modeling for Shift-Left SoC Verification»: https://dvcon-proceedings.org/document/ip-xact-based-pss-modeling-for-shift-left-soc-verification-3/
+   - «AI-Driven Adaptive Emulation for Accelerated Pre-Silicon Debug: High-Fidelity Silicon Replay»: https://dvcon-proceedings.org/document/ai-driven-adaptive-emulation-for-accelerated-pre-silicon-debug-high-fidelity-silicon-replay-2/
+   - «Properly Introducing Python to your UVM Testbench» (M. Ballance): https://dvcon-proceedings.org/document/properly-introducing-python-to-your-uvm-testbench-2/
+   - «Accelerating Bare Metal Driver Development with Linux Drivers and SV DPI-C»: https://dvcon-proceedings.org/document/accelerating-bare-metal-driver-development-with-linux-drivers-and-system-verilog-dpi-c-2/
+   Вывод: в 2026 DVCon почти не публикует чистые TBA/SCE-MI-бенчмарки — методология зрелая; публикации сместились
+   к AI/ML-агентам, multi-die, PSS+IP-XACT, Python, cloud.
+
+4. **DVCon India 2025:**
+   - «Novel Approach for Verification of Multi Die Booting Using Disruptive Distributed Simulation Methodology» (AMD): https://dvcon-proceedings.org/document/novel-approach-for-verification-of-multi-die-booting-using-disruptive-distributed-simulation-methodology/
+   - «Accelerated Coverage Closure with Emulation»: https://dvcon-proceedings.org/document/accelerated-coverage-closure-with-emulation-covering-real-time-use-case-corners/
+   - «Bridging RISC-V Core Verification and PSS» (постер): https://dvcon-proceedings.org/document/bridging-risc-v-core-verification-and-pss-a-portable-stimulus-stress-testing-approach/
+
+5. **PSS 3.0** утверждён Accellera 29.08.2024:
+   пресс-релиз: https://accellera.org/news/press-releases/402-accellera-unveils-portable-test-and-stimulus-standard-3-0-ushering-in-a-new-era-of-verification-efficiency
+   стандарт: https://accellera.org/images/downloads/standards/pss/Portable_Test_Stimulus_Standard_v3.0.pdf
+   «Что нового»: https://community.cadence.com/cadence_blogs_8/b/fv/posts/what-s-new-in-pss-3-0-key-additions-to-the-portable-stimulus-standard
+   Siemens-обзор: https://blogs.sw.siemens.com/verificationhorizons/2024/10/09/celebrating-the-approval-of-portable-test-and-stimulus-standard-pss-3-0/
+   Тренд 2025-26: PSS+IP-XACT (DVCon'26) и «практические советы» (Fitzpatrick) — adoption растёт медленно, open-source PSS-инструментов нет.
+
+6. **SCE-MI: текущая версия 2.4** («minor release», только формулировки): https://accellera.org/downloads/standards/sce-mi
+   Major-движения нет с ~2014; инфраструктура живёт в вендорских TBA-стеках:
+   Aldec HES-DVM: https://www.aldec.com/en/solutions/hardware_emulation_solutions/acceleration ,
+   co-emulation: https://www.aldec.com/en/solutions/hardware_emulation_solutions/co-emulation (SCE-MI API в TLM-прокси/SystemC VP).
+   Aldec UVM co-emulation (Grove, DVCon): https://dvcon-proceedings.org/wp-content/uploads/uvm-hardware-assisted-acceleration-with-fpga-co-emulation.pdf
+
+7. **riscv-dv eUVM детали**: порт — «line-by-line translation», реализовано всё кроме functional coverage:
+   https://github.com/chipsalliance/riscv-dv/blob/master/euvm/README.md
+   Tessolve/Goel «HPC-Powered UVM Testbenching — 500,000 instr/sec»: https://www.tessolve.com/wp-content/uploads/2023/07/Puneet-Goel-euvm-trans-1.pdf ,
+   страница: https://www.tessolve.com/hpc-powered-uvm-testbenching/
+
+8. **pyuvm/cocotb 2024–2025:**
+   - «Evaluating the Usability of pyuvm with cocotb for UART Verification» (DVCon Europe 2025, paper 116): https://dvcon-proceedings.org/wp-content/uploads/DVConEU_2025_paper_116.pdf
+   - «Enable Reuse of SV Verification IPs in cocotb/pyuvm»: https://dvcon-proceedings.org/wp-content/uploads/156-Enable-Reuse-of-SystemVerilog-Verification-IPs-in-cocotbpyuvm.pdf
+   - Syosil whitepaper: https://www.syosil.com/images/resources/osv_whitepaper-1.0.3.0.pdf
+   - arXiv 2407.10317 (CRV c PyUVM/PyVSC): https://arxiv.org/pdf/2407.10317
+   - Tessolve VF2025 (Python vs SV-UVM): https://www.tessolve.com/verification-futures/vf2025-uk/python-based-verification-vs-systemverilog-uvm/
+
+9. **LLM+UVM (академия, 2025):**
+   - «From Concept to Practice: LLM-aided UVM Machine» (arXiv 2504.19959): https://arxiv.org/abs/2504.19959 — сетап TB в 38.82× быстрее, покрытие 87.4%/89.6%.
+   - VerifLLMBench (DVCon'25, UMN): https://people.ece.umn.edu/users/jsartori/papers/dvcon25.pdf
+
+10. **Coverage-guided RISC-V генерация (2025–2026):**
+    - Lyra: https://arxiv.org/pdf/2512.13686
+    - HWFuzz (RISC-V Summit Europe 2025, синтезируемый HW-fuzzer IP): https://riscv-europe.org/summit/2025/media/proceedings/2025-05-14-RISC-V-Summit-Europe-P2.2.04-ZHONG-abstract.pdf
+    - DiffTest+XFUZZ: https://riscv-europe.org/summit/2025/media/proceedings/2025-05-14-RISC-V-Summit-Europe-P2.2.01-XU-poster.pdf
+    - CovR (arXiv 2609.19189, сент.2026, reasoning-guided стимулы): https://arxiv.org/pdf/2609.19189
+    - RL-выбор тестов: DVCon Europe 2025 paper 130: https://dvcon-proceedings.org/wp-content/uploads/DVConEU_2025_paper_130.pdf
+
+11. **core-v-verif**: активен как openhwfoundation/core-v-verif; mature CV32E40P + core testbench, работает с OSS-инструментами:
+    https://github.com/openhwfoundation/core-v-verif , https://docs.openhwgroup.org/projects/cv32e40p-user-manual/en/latest/verification.html
+
+12. **Additional finds (final round):**
+    - ZeBu-200 (Synopsys): «fastest emulation platform, 2X performance, 6X capacity»: https://www.synopsys.com/verification/emulation-prototyping/emulation/zebu-200.html
+    - Palladium Z3 + Protium X3 «Dynamic Duo III» (Cadence, 2025): >2X capacity, 1.5X perf: https://community.cadence.com/cadence_blogs_8/b/fv/posts/advancing-digital-verification-with-dynamic-duo-iii-s-accelerated-computing
+    - Palladium Z2 4-State Emulation apps (Jan 2024): https://newsroom.cadence.com/press-releases/press-release-details/2024/Cadence-Unveils-New-Palladium-Z2-Apps-with-Industrys-First-4-State-Emulation-and-Mixed-Signal-Modeling-to-Accelerate-SoC-Verification-01-18-2024/default.aspx
+    - IEEE 10205723: Xcelium+Palladium Z1 acceleration of ARM Cortex-M-33 testcase: 107.84× (3h10m → 1m46s): https://ieeexplore.ieee.org/document/10205723
+    - eUVM / «Embedded UVM» (D language, multicore, uvm.io): https://uvm.io/ — актуальный сайт Tessolve/Puneet Goel eUVM.
+    - GravityXR case: MHz-level emulation on Palladium: https://community.cadence.com/cadence_blogs_8/b/fv/posts/smarter-chips-faster-checks-gravityxr-leading-the-xr-verification-shift
+
+### Черновик синтеза для финального отчёта
+- Бейслайны, которых потребует ревьюер: (a) коммерческий TBA (Palladium/ZeBu/Veloce, ~0.5–5 МГц, 100×+ только при «быстром» тестбенче);
+  (b) открытый софт: Verilator+UVM (Antmicro 2025 → UVM 2020 в 5.052) + riscv-dv SV ~10k instr/s vs eUVM ~0.5–1M instr/s;
+  (c) HW-ко-симуляции без UVM: DiffTest-H, FERIVer, Lyra, TurboFuzz.
+- Подтверждённый пробел: полный UVM на ARM SoC рядом с DUT в FPGA никто не гоняет; ближайшие — ZynqParrot (C++), FERIVer (QEMU), Hercules (C++ HLS) — все без UVM.
+- Тренды 2025–2026: AI/ML-агенты в регрессиях, PSS 3.0 + IP-XACT, multi-die distributed simulation, Python (pyuvm), LLM-генерация UVM.
