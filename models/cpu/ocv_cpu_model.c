@@ -594,18 +594,17 @@ typedef struct {
     uint8_t  smask[64];                        /* per instruction: bit s - stream s makes a record (no traps, CSRs,
                                                 * devices in a block: what it writes decides, not the values) */
     uint32_t cnt[CPU_N_STREAMS + 1];           /* records per stream, one run of the block */
+    int8_t   lastrec[8];                       /* per stream: the last instruction with a record (-1: none) */
 #if defined(CPU_GEN_CV32)
     cov_plan_t p[64];
 #endif
 } binfo_t;
 static binfo_t binfo_cache[FOLD_CACHE];
-static const binfo_t *block_info(const cpu_block_t *v, int n)
+static void binfo_fill(binfo_t *e, const cpu_block_t *v, int n)
 {
-    const uint32_t h = (uint32_t)(v->key ^ v->key >> 29) * 0x9E3779B1u >> 20;
-    binfo_t *e = &binfo_cache[h & (FOLD_CACHE - 1)];
-    if (e->key != v->key || e->run != fold_run || e->n != (uint32_t)n) {
         e->key = v->key; e->run = fold_run; e->n = (uint32_t)n; e->ends = 0; e->dyn = 0;
         memset(e->cnt, 0, sizeof e->cnt);
+        memset(e->lastrec, -1, sizeof e->lastrec);
         for (int i = 0; i < n; i++) {
             const cpu_bins_t *I = &v->ins[i];
             if (I->m_next) e->dyn |= 1ull << i;
@@ -618,13 +617,18 @@ static const binfo_t *block_info(const cpu_block_t *v, int n)
                 uint32_t rec[2][CPU_REC_WORDS];
                 const int nr = cpu_stream_out(&cpu_streams[s], &r, I->len == 2, I->len == 2 ? I->raw : I->insn & 0xFFFFu,
                                               fields[s], rec);
-                if (nr) { e->smask[i] |= (uint8_t)(1u << s); e->cnt[s] += (uint32_t)nr; }
+                if (nr) { e->smask[i] |= (uint8_t)(1u << s); e->cnt[s] += (uint32_t)nr; e->lastrec[s] = (int8_t)i; }
             }
 #if defined(CPU_GEN_CV32)
             cov_plan(I->len == 2 ? I->raw : I->insn & 0xFFFFu, I->len == 2, I->insn, &e->p[i]);
 #endif
         }
-    }
+}
+static const binfo_t *block_info(const cpu_block_t *v, int n)
+{
+    const uint32_t h = (uint32_t)(v->key ^ v->key >> 29) * 0x9E3779B1u >> 20;
+    binfo_t *e = &binfo_cache[h & (FOLD_CACHE - 1)];
+    if (e->key != v->key || e->run != fold_run || e->n != (uint32_t)n) binfo_fill(e, v, n);
     return e;
 }
 
@@ -642,6 +646,38 @@ static inline __attribute__((always_inline)) void block_fill(int kind, cpu_retir
         r->mem_addr = o->maddr & I->m_store; r->mem_wdata = o->mdata & I->m_store;
     }
 }
+
+/* a fused block (cpu_block_t.fused): the records its code folded into the windows of the streams in fzm -
+ * counted there now, and the last one kept (the window's last record) */
+static void fused_done(const cpu_block_t *v, const binfo_t *bf, unsigned fzm, struct ocv_squash **sq)
+{
+    for (int s = 0; s < CPU_N_STREAMS && s < 8; s++) {
+        if (!(fzm >> s & 1) || !bf->cnt[s]) continue;
+        sq[s]->n += bf->cnt[s];
+        const int i = bf->lastrec[s];
+        const cpu_bins_t *I = &v->ins[i];
+        const cpu_bout_t *o = &v->out[i];
+        cpu_retire_t r = { 0 };                /* (once per block: the kind is not a constant here) */
+        block_fill(cpu_streams[s].kind, &r, I, o, o->wdata & I->m_rd);
+        uint32_t rec[2][CPU_REC_WORDS];
+        const int nr = cpu_stream_out(&cpu_streams[s], &r, I->len == 2, I->len == 2 ? I->raw : I->insn & 0xFFFFu, fields[s], rec);
+        if (nr) memcpy(sq[s]->last, rec[nr - 1], CPU_DUT.channels[cpu_streams[s].channel].rec_words * 4u);
+    }
+}
+
+#if defined(CPU_GEN_CV32) && defined(CPU_FOR_STREAMS)
+/* cov_plan as the translated code takes it (cpu_covp_t: the misaligned bins per offset) */
+static void fz_cov_plan(uint32_t raw, int c, uint32_t insn, cpu_covp_t *p)
+{
+    cov_plan_t q;
+    cov_plan(raw, c, insn, &q);
+    p->v = q.v; p->s0 = q.s0; p->s1 = q.s1; p->kind = q.kind; p->nc2 = q.nc2;
+    for (uint32_t o = 0; o < 4; o++) {
+        const int m = q.mop ? cov_mis_bin(q.mop, q.mf3, o) : -1;
+        p->mis[o] = m >= 0 ? (uint16_t)(COV_G_MIS * COV_MAXB + m) : 0xFFFF;
+    }
+}
+#endif
 
 /* one instruction of a block as a retirement (cpu_block_t's rules); xr: the registers before it, updated */
 static inline __attribute__((always_inline)) void block_retire(const cpu_block_t *v, int i, uint32_t *xr, cpu_retire_t *r)
@@ -755,6 +791,7 @@ static void run_program(ocv_model_io_t *io)
 #define CPU_FLD(s, j) (cpu_stream_field[s][j] < 0 ? NULL : &CPU_DUT.channels[cpu_streams[s].channel].fields[cpu_stream_field[s][j]])
 #define CPU_STREAM_DO(s) do { \
             if (cpu_streams[s].kind == CPU_S_ISSUE && folded) break;   /* (went with the block) */ \
+            if (fz_skip >> (s) & 1) break;     /* (the block's code did it) */ \
             const ocv_field_t *const F_[6] = { CPU_FLD(s, 0), CPU_FLD(s, 1), CPU_FLD(s, 2), CPU_FLD(s, 3), CPU_FLD(s, 4), CPU_FLD(s, 5) }; \
             if (sq_[s]) {                      /* folded here, into the runner's window */ \
                 uint32_t rec_[2][CPU_REC_WORDS]; \
@@ -797,6 +834,43 @@ static void run_program(ocv_model_io_t *io)
     struct ocv_squash *sq_[CPU_N_STREAMS + 1];
     for (int s = 0; s < CPU_N_STREAMS + 1; s++)
         sq_[s] = s < CPU_N_STREAMS && io->squash && io->squash_close ? io->squash(io, cpu_streams[s].channel) : NULL;
+    /* fused (cpu_impl_t.fuse): the translated code counts the coverage and folds the register-write and store
+     * records into their windows itself - when every stream a block makes records on is one it can take (the
+     * issue records: folded per block here), and the coverage is cv32_cov's; OCV_NO_FUSE=1: off */
+    static cpu_fuse_t fz;
+    unsigned fzmask = 0;                       /* the streams the code does */
+#if defined(CPU_GEN_CV32) && defined(CPU_FOR_STREAMS)
+    static int no_fuse = -1;
+    if (no_fuse < 0) no_fuse = getenv("OCV_NO_FUSE") != NULL;
+    if (by_blocks && cpu->impl->fuse && !no_fuse && CPU_N_STREAMS <= 8) {
+        memset(&fz, 0, sizeof fz);
+        int ok = 1;
+        for (int s = 0; s < CPU_N_STREAMS && ok; s++) {
+            const int kd = cpu_streams[s].kind;
+            if (kd == CPU_S_ISSUE || kd == CPU_S_CSRR || kd == CPU_S_INTR || kd == CPU_S_WATCH || kd == CPU_S_ERROR) continue;
+            const ocv_channel_t *chn = &CPU_DUT.channels[cpu_streams[s].channel];
+            if ((kd != CPU_S_REGW && kd != CPU_S_STORE) || !sq_[s] || chn->rec_words > 4 || fz.nstreams == 2) { ok = 0; break; }
+            cpu_fstream_t *f = &fz.s[fz.nstreams++];
+            f->state = &sq_[s]->n;             /* (n, c, z, window: ocv_squash_t's first words) */
+            f->store = kd == CPU_S_STORE; f->filter = kd == CPU_S_REGW ? cpu_streams[s].filter : 0;
+            f->words = chn->rec_words;
+            for (uint32_t w = 0; w < f->words; w++) f->mask[w] = sq_[s]->mask[w];
+            for (int k = 0; k < 3; k++) {
+                const ocv_field_t *F = fields[s][k];
+                if (F && F->width > 32) ok = 0;
+                f->f[k].lsb = F ? (uint8_t)F->lsb : 0; f->f[k].width = F ? (uint8_t)F->width : 0;
+            }
+            fzmask |= 1u << s;
+        }
+        fz.cov = cov_hits; fz.cov_plan = fz_cov_plan;
+        const uint8_t cls[7] = { COV_V_ZERO, COV_V_ONE, COV_V_M1, COV_V_MIN, COV_V_MAX, COV_V_POS, COV_V_NEG };
+        memcpy(fz.cls, cls, sizeof cls);
+        fz.exit_pc = CPU_EXIT;
+        if (!ok || !cpu->impl->fuse(cpu, &fz)) fzmask = 0;
+    }
+#endif
+    unsigned fz_skip = 0;                      /* a fused block taken instruction by instruction: what its code did */
+    int cov_skip = 0;
     fold_run++;
     for (uint64_t n = 0; n < max_steps; n++) {
       if (bi == bn) {                          /* the next instruction(s) */
@@ -838,7 +912,7 @@ static void run_program(ocv_model_io_t *io)
             irq_j++;
             NEXT_IRQ();
         }
-        bi = 0; folded = 0; cur_order = order;
+        bi = 0; folded = 0; cur_order = order; fz_skip = 0; cov_skip = 0;
         int k = -1;                            /* a block of k instructions; 0: one instruction in rb[0] */
         if (by_blocks && (irq_seq == ~0ull || irq_seq - issued >= 256 + 64) && max_steps - n >= 64)   /* (no interrupt inside) */
             k = cpu->impl->block(cpu, &bv, &rb[0]);
@@ -855,9 +929,43 @@ static void run_program(ocv_model_io_t *io)
             }
             uint32_t xr[32];
             memcpy(xr, bv.x, sizeof xr);
+            static binfo_t bf_tmp;             /* (a block that left early: its info, not cached) */
+            const binfo_t *const bf = !bv.fused ? NULL : bi_ ? bi_ : (binfo_fill(&bf_tmp, &bv, k), &bf_tmp);
+            if (bf) {                          /* fused: what the code did, counted */
+                fused_done(&bv, bf, fzmask, sq_);
+                for (int s = 0; s < CPU_N_STREAMS; s++) if (fzmask >> s & 1) emitted[cpu_streams[s].channel] += bf->cnt[s];
+            }
             if (ends) {                        /* the program's end inside: instruction by instruction below */
                 for (int i = 0; i < k; i++) block_retire(&bv, i, xr, &rb[i]);
                 bn = k;
+                if (bf) { fz_skip = fzmask; cov_skip = 1; }
+            } else if (bf) {                   /* fused: the rest - the issue records */
+                if (fold && bv.key && k > 1 && (folded = fold_block(io, &bv, k))) {
+                    emitted[cpu_streams[fold_s].channel] += (uint64_t)k;
+                    issued += (uint64_t)k;
+                }
+                const unsigned keep = ~fzmask & (folded && fold_s < 8 ? ~(1u << fold_s) : ~0u);
+                unsigned any = 0;
+                for (int s = 0; s < CPU_N_STREAMS; s++) if (bf->cnt[s]) any |= 1u << s;
+                if (keep & any)
+                    for (int i = 0; i < k; i++) {
+                        const cpu_bins_t *const I = &bv.ins[i];
+                        const cpu_bout_t *const o = &bv.out[i];
+                        const uint32_t wd = o->wdata & I->m_rd;
+                        const int c = I->len == 2;
+                        const uint32_t raw = c ? I->raw : I->insn & 0xFFFFu;
+                        const unsigned m_ = bf->smask[i] & keep;
+                        if (m_) { CPU_FOR_STREAMS(CPU_BLOCK_DO) }
+                    }
+                for (int s = 0; s < CPU_N_STREAMS; s++) {
+                    if (!(keep >> s & 1) || !bf->cnt[s]) continue;
+                    emitted[cpu_streams[s].channel] += bf->cnt[s];
+                    if (cpu_streams[s].kind == CPU_S_ISSUE || cpu_streams[s].kind == CPU_S_RETIRE) issued += bf->cnt[s];
+                }
+                order += (uint64_t)k; executed += (uint64_t)k;
+                n += (uint64_t)k - 1;
+                bn = 0;
+                continue;
             } else {                           /* the whole block here */
                 if (fold && bv.key && k > 1 && (folded = fold_block(io, &bv, k))) {
                     emitted[cpu_streams[fold_s].channel] += (uint64_t)k;
@@ -931,7 +1039,7 @@ static void run_program(ocv_model_io_t *io)
             raw = s_raw; insn = s_insn; op_a = s_a; op_b = s_b;
         }
         const int c = (raw & 3) != 3;
-        COV(raw, c, insn, op_a, op_b, (int)rp->trap);
+        if (!cov_skip) COV(raw, c, insn, op_a, op_b, (int)rp->trap);
         if (trace) fprintf(trace, "%llu %08x %08x x%u=%08x%s%s\n", (unsigned long long)issued, rp->pc, rp->insn, rp->rd_addr,
                            rp->rd_wdata, rp->trap ? " trap" : "", rp->mem_we ? " store" : "");
         executed++;

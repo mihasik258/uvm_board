@@ -98,7 +98,7 @@ static void iss_destroy(cpu_model_t *m) { free(m); }
 
 static const cpu_impl_t iss_impl = {
     "iss", "built-in light RV32IMC model (no traps, no M-mode CSR state)", 0,
-    iss_create, iss_step, iss_xreg, iss_pc, iss_destroy, NULL, NULL, NULL, 0, NULL
+    iss_create, iss_step, iss_xreg, iss_pc, iss_destroy, NULL, NULL, NULL, 0, NULL, NULL
 };
 
 /* ---------------- "fast": the same model as a predecoding interpreter ---------------- */

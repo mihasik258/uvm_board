@@ -29,7 +29,9 @@ typedef cpu_bins_t jins_t;                 /* the translation's table, per instr
 
 typedef struct jblock {
     int (*fn)(void *state, jout_t *out);
+    int (*fnf)(void *state, jout_t *out);  /* the same doing cpu_fuse_t's work too (NULL: not translated so) */
     uint32_t n;                            /* instructions translated (0: the first one is not) */
+    uint16_t cntf[2];                      /* records per fused stream, one whole run */
     jins_t  *ins;                          /* in the pool */
 } jblock_t;
 
@@ -51,14 +53,17 @@ typedef struct {
     jins_t     keep[JIT_MAX];              /* the running block's table when the translations go */
     const jins_t *cur; uint32_t cur_n, cur_i;
     uint64_t   cur_key;                    /* the running block: (flushes << 32) | its index + 1; 0: a copy (smc) */
+    int        cur_fused;                  /* it ran its fnf */
+    const cpu_fuse_t *fz;                  /* cpu_jit_fuse (NULL: none) */
     uint64_t   cur_order;
     uint32_t   x0[32];                     /* registers up to the last handed out of the running block (cpu_xreg
                                             * and src1/src2 inside it; the block itself already wrote f.x) */
     uint64_t   single;                     /* cpu_sync: instructions still to run one by one */
     int        smc;                        /* a store hit translated code */
-    uint64_t   n_blocks, n_trans, n_flush, n_interp, n_cold;   /* OCV_JIT_STATS: printed at the end */
+    uint64_t   n_blocks, n_trans, n_flush, n_interp, n_cold, n_fused;   /* OCV_JIT_STATS: printed at the end */
     /* for the generated code: [x19 + JIT_OFF_*] */
     uint8_t   *host[2]; uint64_t base[2], size[2]; uint8_t *cmap[2];
+    uint8_t   *cov; uint32_t *fst[2];     /* fused code: the coverage bins, the windows' state */
 } jit_t;
 
 /* ---------------------------------------------------------------- AArch64 encoder */
@@ -83,6 +88,8 @@ static void ldr_x(em_t *e, int rt, int rn, uint32_t off) { emit(e, 0xF9400000u |
 #define OFF_BASE  offsetof(jit_t, base)
 #define OFF_SIZE  offsetof(jit_t, size)
 #define OFF_CMAP  offsetof(jit_t, cmap)
+#define OFF_COV   offsetof(jit_t, cov)
+#define OFF_FST   offsetof(jit_t, fst)
 
 /* guest register into a host register (x0 reads 0) */
 static int greg(em_t *e, int host, int g)
@@ -108,6 +115,127 @@ static void dp3(em_t *e, uint32_t op, int rd, int rn, int rm) { emit(e, op | (rm
 
 static void cset(em_t *e, int rd, int cond) { emit(e, 0x1A9F07E0u | ((cond ^ 1) << 12) | rd); }  /* csinc wd, wzr, wzr, !cond */
 enum { EQ = 0, NE = 1, HS = 2, LO = 3, HI = 8, LS = 9, GE = 10, LT = 11 };
+
+/* ---------------------------------------------------------------- fused work (cpu_fuse_t) */
+/* After an instruction's own code, the fused version of a block counts its coverage bin and folds its records
+ * into their windows from the registers that hold the values: x12 the bins (loaded on entry), w10 w11 w13 w16
+ * w17 scratch, then w0 w5 the window's CRCs (x17 its state). x9 keeps the next pc of a jump: untouched. */
+enum { W12 = 12, W13 = 13, W16 = 16, W17 = 17 };
+static void bcond_at(uint32_t *at, const uint32_t *to, int cond) { *at = 0x54000000u | ((uint32_t)((to - at) & 0x7FFFF) << 5) | (uint32_t)cond; }
+static void b_at(uint32_t *at, const uint32_t *to) { *at = 0x14000000u | (uint32_t)((to - at) & 0x3FFFFFF); }
+static void cbz_at(uint32_t *at, const uint32_t *to, int rt) { *at = 0x34000000u | ((uint32_t)((to - at) & 0x7FFFF) << 5) | (uint32_t)rt; }
+static void strb_reg(em_t *e, int rt, int rn, int rm) { emit(e, 0x38206800u | ((uint32_t)rm << 16) | ((uint32_t)rn << 5) | (uint32_t)rt); }
+static void add_imm(em_t *e, int rd, int rn, uint32_t v, int tmp)          /* wd = wn + v */
+{
+    if (v < 4096) emit(e, 0x11000000u | (v << 10) | ((uint32_t)rn << 5) | (uint32_t)rd);
+    else { movw(e, tmp, v); dp3(e, ADDW, rd, rn, tmp); }
+}
+
+/* wd = the coverage class of ws (cpu_fuse_t.cls; ws XZR: 0); w16 scratch. Most values take no branch. */
+static void fz_class(em_t *e, const cpu_fuse_t *f, int wd, int ws)
+{
+    if (ws == XZR) { movw(e, wd, f->cls[0]); return; }
+    emit(e, 0x11000400u | ((uint32_t)ws << 5) | W16);          /* add w16, ws, #1 */
+    emit(e, 0x7100081Fu | (W16 << 5));                         /* cmp w16, #2 */
+    uint32_t *b1 = e->p; emit(e, 0);                           /* b.ls: -1 0 1 */
+    emit(e, 0x52010000u | ((uint32_t)ws << 5) | W16);          /* eor w16, ws, #0x80000000 */
+    emit(e, 0x11000400u | (W16 << 5) | W16);                   /* add w16, w16, #1 */
+    emit(e, 0x7100041Fu | (W16 << 5));                         /* cmp w16, #1 */
+    uint32_t *b2 = e->p; emit(e, 0);                           /* b.ls: MIN MAX */
+    emit(e, 0x531F7C00u | ((uint32_t)ws << 5) | (uint32_t)wd); /* lsr wd, ws, #31 */
+    emit(e, 0x11000000u | ((uint32_t)f->cls[5] << 10) | ((uint32_t)wd << 5) | (uint32_t)wd);   /* add wd, wd, #pos */
+    uint32_t *j1 = e->p; emit(e, 0);
+    if (e->p >= e->end) { e->ok = 0; return; }
+    bcond_at(b1, e->p, LS);                                    /* w16 = v + 1: 0 is -1, 1 is 0, 2 is 1 */
+    movw(e, wd, f->cls[2]); uint32_t *c0 = e->p; emit(e, 0);
+    emit(e, 0x7100041Fu | (W16 << 5));                         /* cmp w16, #1 */
+    movw(e, wd, f->cls[0]); uint32_t *c1 = e->p; emit(e, 0);
+    movw(e, wd, f->cls[1]); uint32_t *j2 = e->p; emit(e, 0);
+    if (e->p >= e->end) { e->ok = 0; return; }
+    bcond_at(b2, e->p, LS);                                    /* w16 = (v ^ MIN) + 1: 1 is MIN, 0 is MAX */
+    movw(e, wd, f->cls[4]); uint32_t *c2 = e->p; emit(e, 0);
+    movw(e, wd, f->cls[3]);
+    if (!e->ok) return;
+    b_at(j1, e->p); b_at(j2, e->p); cbz_at(c0, e->p, W16); bcond_at(c1, e->p, EQ); cbz_at(c2, e->p, W16);
+}
+
+/* the instruction's coverage: va, vb the registers with its operands (-1: none here), w3 a load's / store's
+ * address; 0 if it needs an operand it does not have */
+static int fz_cov(em_t *e, const cpu_fuse_t *f, const cpu_covp_t *p, int va, int vb, int has_addr)
+{
+    int mis = 0;
+    for (int o = 0; o < 4; o++) mis |= p->mis[o] != 0xFFFF;
+    if ((p->kind && va < 0) || (p->kind == 1 && vb < 0) || (mis && !has_addr)) return 0;
+    if (p->kind) {
+        fz_class(e, f, W13, va);
+        if (p->kind == 1) fz_class(e, f, W10, vb);
+        movw(e, W16, p->nc2);
+        emit(e, 0x1B000000u | (W16 << 16) | ((uint32_t)(p->kind == 1 ? W10 : XZR) << 10) | (W13 << 5) | W16);  /* madd w16, w13, w16, w10|wzr */
+        add_imm(e, W16, W16, p->v, W11);
+        movw(e, W17, 1); strb_reg(e, W17, W12, W16);
+    }
+    for (int k = 0; k < 2; k++) {
+        const uint16_t b = k ? p->s1 : p->s0;
+        if (b == 0xFFFF) continue;
+        movw(e, W16, b); movw(e, W17, 1); strb_reg(e, W17, W12, W16);
+    }
+    if (mis) {
+        emit(e, 0x12000400u | (W3 << 5) | W16);                /* and w16, w3, #3 */
+        movw(e, W17, 1);
+        for (uint32_t o = 0; o < 4; o++) {
+            if (p->mis[o] == 0xFFFF) continue;
+            emit(e, 0x7100001Fu | (o << 10) | (W16 << 5));     /* cmp w16, #o */
+            uint32_t *bn = e->p; emit(e, 0);
+            movw(e, W13, p->mis[o]); strb_reg(e, W17, W12, W13);
+            if (!e->ok) return 1;
+            bcond_at(bn, e->p, NE);
+        }
+    }
+    return 1;
+}
+
+/* a record of fused stream s from its fields (each a register, reg >= 0, or a constant), folded into the
+ * window: words in w10 w11 w13 w16 (w17 scratch), the CRCs through w0 w5 */
+typedef struct { int reg; uint32_t val; } fzv_t;
+static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v)
+{
+    static const int wr[4] = { W10, W11, W13, W16 };
+    uint32_t cst[4] = { 0, 0, 0, 0 };
+    for (int k = 0; k < 3; k++) {                              /* the constant fields */
+        const cpu_ffield_t *fl = &fs->f[k];
+        if (!fl->width || v[k].reg >= 0) continue;
+        const uint32_t o = fl->lsb & 31u, w = fl->lsb >> 5;
+        const uint32_t x = fl->width < 32 ? v[k].val & ((1u << fl->width) - 1u) : v[k].val;
+        cst[w] |= x << o;
+        if (o && o + fl->width > 32u) cst[w + 1] |= x >> (32u - o);
+    }
+    for (uint32_t w = 0; w < fs->words; w++) movw(e, wr[w], cst[w]);
+    for (int k = 0; k < 3; k++) {                              /* the register fields */
+        const cpu_ffield_t *fl = &fs->f[k];
+        if (!fl->width || v[k].reg < 0) continue;
+        const uint32_t o = fl->lsb & 31u, w = fl->lsb >> 5;
+        int src = v[k].reg;
+        if (fl->width < 32) { emit(e, 0x53000000u | ((uint32_t)(fl->width - 1) << 10) | ((uint32_t)src << 5) | W17); src = W17; }   /* ubfx w17, src, #0, #width */
+        emit(e, 0x2A000000u | ((uint32_t)src << 16) | (o << 10) | ((uint32_t)wr[w] << 5) | (uint32_t)wr[w]);   /* orr ww, ww, src, lsl #o */
+        if (o && o + fl->width > 32u)
+            emit(e, 0x2A400000u | ((uint32_t)src << 16) | ((32u - o) << 10) | ((uint32_t)wr[w + 1] << 5) | (uint32_t)wr[w + 1]);   /* orr, lsr #32-o */
+    }
+    for (uint32_t w = 0; w < fs->words; w++)
+        if (fs->mask[w] != ~0u) { movw(e, W17, fs->mask[w]); dp3(e, ANDW, wr[w], wr[w], W17); }
+    ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));   /* (not x9: a jump's next pc is there) */
+    ldr_w(e, W0, W17, 4); ldr_w(e, W5, W17, 8);
+    uint32_t w = 0;
+    for (; w + 1 < fs->words; w += 2) {
+        emit(e, 0xAA000000u | ((uint32_t)wr[w + 1] << 16) | (32u << 10) | ((uint32_t)wr[w] << 5) | (uint32_t)wr[w]);   /* orr xa, xa, xb, lsl #32 */
+        emit(e, 0x9AC05C00u | ((uint32_t)wr[w] << 16) | (W0 << 5) | W0);   /* crc32cx w0, w0, xa */
+        emit(e, 0x9AC04C00u | ((uint32_t)wr[w] << 16) | (W5 << 5) | W5);   /* crc32x w5, w5, xa */
+    }
+    if (w < fs->words) {
+        emit(e, 0x1AC05800u | ((uint32_t)wr[w] << 16) | (W0 << 5) | W0);   /* crc32cw */
+        emit(e, 0x1AC04800u | ((uint32_t)wr[w] << 16) | (W5 << 5) | W5);   /* crc32w */
+    }
+    str_w(e, W0, W17, 4); str_w(e, W5, W17, 8);
+}
 
 /* ---------------------------------------------------------------- translation */
 
@@ -190,17 +318,17 @@ static int is_code(jit_t *j, uint32_t a, uint32_t n)
     return j->code_map[ri][o >> JIT_PAGE] | j->code_map[ri][(o + n - 1) >> JIT_PAGE];
 }
 
-static jblock_t *translate(jit_t *j, uint32_t pc)
+/* the code of block b from pc (its table too), fz: the fused version (cpu_fuse_t) - b->fn, or b->fnf with
+ * b->cntf; 0 if it cannot be translated so */
+static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
 {
-    if (j->nblocks == JIT_BLOCKS || j->npool + JIT_MAX > JIT_POOL || j->code_end - j->code_cur < 64 * 1024)
-        return NULL;                                              /* full: the caller flushes */
-    jblock_t *b = &j->blocks[j->nblocks++];
-    b->ins = &j->pool[j->npool];
-    b->n = 0; b->fn = NULL;
     em_t e = { (uint32_t *)j->code_cur, (uint32_t *)j->code_end, 1 };
     uint32_t *start = e.p;
+    const uint32_t n0 = b->n;
+    if (fz) { b->cntf[0] = b->cntf[1] = 0; }
     emit(&e, 0xAA0003EFu);              /* mov x15, x0: jit_t */
     emit(&e, 0xAA0103EEu);              /* mov x14, x1: out */
+    if (fz && fz->cov) ldr_x(&e, W12, XS, OFF_COV);   /* x12: the coverage bins */
     uint32_t *miss_patches[2 * JIT_MAX], miss_target[2 * JIT_MAX];   /* region miss; cva6: misaligned */
     int nmiss = 0;
     uint32_t p = pc;
@@ -210,6 +338,7 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
         const dec_t *d = fetch(&j->f, p, &tmp);
         mark_code(j, p, d->len);
         if (!translatable(d) || region_of(&j->f, p, d->len) != creg) break;   /* (code within one region) */
+        if (fz && p == fz->exit_pc) return 0;                     /* (the end: the caller takes it alone) */
         jins_t *I = &b->ins[k];
         I->pc = p; I->insn = d->insn; I->len = d->len; I->store = 0; I->dyn_next = 0;
         I->rs1 = d->rs1; I->rs2 = d->rs2;
@@ -219,6 +348,7 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
                  !(d->op >= OP_BEQ && d->op <= OP_BGEU) && d->op != OP_FENCE) ? d->rd : 0;
         const uint32_t ob = 16u * k;                              /* this instruction's jout_t */
         int ra, rb, wr = 1;                                       /* wr: w2 holds the result for rd */
+        int va = -1, vb = -1, addr = 0;                           /* (fused: where the operands are) */
         switch (d->op) {
         case OP_LUI:   movw(&e, W2, (uint32_t)d->imm); break;
         case OP_AUIPC: movw(&e, W2, p + (uint32_t)d->imm); break;
@@ -232,7 +362,7 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
             break;
         case OP_BEQ: case OP_BNE: case OP_BLT: case OP_BGE: case OP_BLTU: case OP_BGEU: {
             static const int cc[] = { EQ, NE, LT, GE, LO, HS };
-            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2);
+            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); va = ra; vb = rb;
             dp3(&e, SUBSW, XZR, ra, rb);
             movw(&e, W10, p + (uint32_t)d->imm); movw(&e, W11, p + d->len);
             emit(&e, 0x1A800000u | (W11 << 16) | ((uint32_t)cc[d->op - OP_BEQ] << 12) | (W10 << 5) | W9);  /* csel w9, w10, w11, cc */
@@ -242,7 +372,7 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
         case OP_LB: case OP_LH: case OP_LW: case OP_LBU: case OP_LHU: {
             static const int sz[] = { 1, 2, 4, 1, 2 };
             static const uint32_t ld[] = { 0x39C00082u, 0x79C00082u, 0xB9400082u, 0x39400082u, 0x79400082u };  /* ldrsb/ldrsh/ldr/ldrb/ldrh w2, [x4] */
-            ra = greg(&e, W0, d->rs1);
+            ra = greg(&e, W0, d->rs1); va = ra; addr = 1;
             movw(&e, W1, (uint32_t)d->imm); dp3(&e, ADDW, W3, ra, W1);
             misaligned_exit(&e, j, sz[d->op - OP_LB], k, miss_patches, miss_target, &nmiss);
             uint32_t *slot; mem_check(&e, sz[d->op - OP_LB], &slot);
@@ -255,13 +385,25 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
             static const int sz[] = { 1, 2, 4 };
             static const uint32_t st[] = { 0x39000081u, 0x79000081u, 0xB9000081u };   /* strb/strh/str w1, [x4] */
             const int n = sz[d->op - OP_SB];
-            ra = greg(&e, W0, d->rs1);
+            ra = greg(&e, W0, d->rs1); va = ra; addr = 1;
             movw(&e, W2, (uint32_t)d->imm); dp3(&e, ADDW, W3, ra, W2);
             misaligned_exit(&e, j, n, k, miss_patches, miss_target, &nmiss);
+            if (fz && !j->f.cva6 && n > 1) {                          /* (fused: a store across words splits its record) */
+                emit(&e, 0x12000400u | (W3 << 5) | W16);              /* and w16, w3, #3 */
+                emit(&e, 0x7100001Fu | ((uint32_t)(4 - n) << 10) | (W16 << 5));
+                miss_patches[nmiss] = e.p; miss_target[nmiss++] = k;
+                emit(&e, 0x54000008u);                                /* b.hi miss */
+            }
             uint32_t *slot; mem_check(&e, n, &slot);
             miss_patches[nmiss] = slot; miss_target[nmiss++] = k;
             rb = greg(&e, W1, d->rs2);
             if (rb == XZR) { emit(&e, 0x2A1F03E1u); rb = W1; }      /* mov w1, wzr */
+            if (fz) {                                             /* fused: into code - out before it, not after */
+                emit(&e, 0xD340FCA6u | ((uint32_t)JIT_PAGE << 16));    /* lsr x6, x5, #JIT_PAGE */
+                emit(&e, 0x38666906u);                                  /* ldrb w6, [x8, x6] */
+                miss_patches[nmiss] = e.p; miss_target[nmiss++] = k;
+                emit(&e, 0x35000006u);                                  /* cbnz w6, miss (the interpreter) */
+            }
             emit(&e, st[d->op - OP_SB]);
             /* out: address, data masked to the width */
             str_w(&e, W3, XO, ob + 8);
@@ -269,50 +411,53 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
             else if (n == 2) emit(&e, 0x12003C21u);                 /* and w1, w1, #0xffff */
             str_w(&e, W1, XO, ob + 12);
             /* translated code in this page: done with this store, leave and drop translations */
-            emit(&e, 0xD340FCA6u | ((uint32_t)JIT_PAGE << 16));    /* lsr x6, x5, #JIT_PAGE */
-            emit(&e, 0x38666906u);                                  /* ldrb w6, [x8, x6] */
-            uint32_t *cb = e.p; emit(&e, 0x34000006u);               /* cbz w6, cont (patched) */
-            movw(&e, W9, 1); str_w(&e, W9, XS, OFF_SMC);
-            exit_before(&e, p + d->len, k + 1);
-            *cb = 0x34000006u | ((uint32_t)((e.p - cb) & 0x7FFFF) << 5);
+            if (!fz) {
+                emit(&e, 0xD340FCA6u | ((uint32_t)JIT_PAGE << 16));    /* lsr x6, x5, #JIT_PAGE */
+                emit(&e, 0x38666906u);                                  /* ldrb w6, [x8, x6] */
+                uint32_t *cb = e.p; emit(&e, 0x34000006u);               /* cbz w6, cont (patched) */
+                movw(&e, W9, 1); str_w(&e, W9, XS, OFF_SMC);
+                exit_before(&e, p + d->len, k + 1);
+                *cb = 0x34000006u | ((uint32_t)((e.p - cb) & 0x7FFFF) << 5);
+            }
             I->store = (uint8_t)n; wr = 0;
             break;
         }
         case OP_SNONE: case OP_FENCE: wr = 0; break;
         case OP_ADDI: case OP_XORI: case OP_ORI: case OP_ANDI: {
             static const uint32_t op[] = { ADDW, 0, 0, EORW, ORRW, ANDW };
-            ra = greg(&e, W0, d->rs1); movw(&e, W1, (uint32_t)d->imm);
+            ra = greg(&e, W0, d->rs1); va = ra; movw(&e, W1, (uint32_t)d->imm);
             dp3(&e, op[d->op - OP_ADDI], W2, ra, W1);
             break;
         }
         case OP_SLTI: case OP_SLTIU:
-            ra = greg(&e, W0, d->rs1); movw(&e, W1, (uint32_t)d->imm);
+            ra = greg(&e, W0, d->rs1); va = ra; movw(&e, W1, (uint32_t)d->imm);
             dp3(&e, SUBSW, XZR, ra, W1); cset(&e, W2, d->op == OP_SLTI ? LT : LO);
             break;
         case OP_SLLI: case OP_SRLI: case OP_SRAI: {
             static const uint32_t op[] = { LSLV, LSRV, ASRV };
-            ra = greg(&e, W0, d->rs1); movw(&e, W1, (uint32_t)d->imm);
+            ra = greg(&e, W0, d->rs1); va = ra; movw(&e, W1, (uint32_t)d->imm);
             dp3(&e, op[d->op - OP_SLLI], W2, ra, W1);
             break;
         }
         case OP_ADD: case OP_SUB: case OP_SLL: case OP_XOR: case OP_SRL: case OP_SRA: case OP_OR: case OP_AND: {
             uint32_t op = d->op == OP_ADD ? ADDW : d->op == OP_SUB ? SUBW : d->op == OP_SLL ? LSLV : d->op == OP_XOR ? EORW :
                           d->op == OP_SRL ? LSRV : d->op == OP_SRA ? ASRV : d->op == OP_OR ? ORRW : ANDW;
-            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2);
+            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); va = ra; vb = rb;
             dp3(&e, op, W2, ra, rb);
             break;
         }
         case OP_SLT: case OP_SLTU:
-            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2);
+            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); va = ra; vb = rb;
             dp3(&e, SUBSW, XZR, ra, rb); cset(&e, W2, d->op == OP_SLT ? LT : LO);
             break;
         case OP_MUL:
-            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); dp3(&e, MULW, W2, ra, rb);
+            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); va = ra; vb = rb; dp3(&e, MULW, W2, ra, rb);
             break;
         case OP_MULH: case OP_MULHU: case OP_MULHSU:
             ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2);
             if (ra == XZR) { emit(&e, 0x2A1F03E0u); ra = W0; }
             if (rb == XZR) { emit(&e, 0x2A1F03E1u); rb = W1; }
+            va = ra; vb = rb;
             if (d->op == OP_MULH) emit(&e, 0x9B207C02u | (rb << 16) | (ra << 5));      /* smull x2, w0, w1 */
             else if (d->op == OP_MULHU) emit(&e, 0x9BA07C02u | (rb << 16) | (ra << 5)); /* umull x2, w0, w1 */
             else {
@@ -323,13 +468,13 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
             emit(&e, 0xD360FC42u);                                  /* lsr x2, x2, #32 */
             break;
         case OP_DIV: case OP_DIVU:
-            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2);
+            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); va = ra; vb = rb;
             dp3(&e, d->op == OP_DIV ? SDIVW : UDIVW, W2, ra, rb);
             dp3(&e, SUBSW, XZR, rb, XZR);                           /* cmp b, #0 */
             emit(&e, 0x5A9F1042u);                                  /* csinv w2, w2, wzr, ne */
             break;
         case OP_REM: case OP_REMU:
-            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2);
+            ra = greg(&e, W0, d->rs1); rb = greg(&e, W1, d->rs2); va = ra; vb = rb;
             dp3(&e, d->op == OP_REM ? SDIVW : UDIVW, W3, ra, rb);
             emit(&e, 0x1B008062u | (rb << 16) | (ra << 10));       /* msub w2, w3, wb, wa */
             break;
@@ -343,6 +488,34 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
         }
         if (I->dyn_next) str_w(&e, W9, XO, ob + 4);
         I->m_next = I->dyn_next ? ~0u : 0; I->m_rd = I->rd ? ~0u : 0; I->m_store = I->store ? ~0u : 0;
+        if (fz) {                                                 /* coverage, then the records */
+            if (fz->cov) {
+                cpu_covp_t cp;
+                fz->cov_plan(I->len == 2 ? I->raw : I->insn & 0xFFFFu, I->len == 2, I->insn, &cp);
+                if (!fz_cov(&e, fz, &cp, va, vb, addr)) return 0;
+            }
+            for (int s = 0; s < fz->nstreams; s++) {
+                const cpu_fstream_t *fs = &fz->s[s];
+                if (!fs->store) {
+                    const int load = (I->insn & 0x7f) == 0x03;
+                    if (!I->rd || !(fs->filter == 0 || (fs->filter == 1) == load)) continue;
+                    if (!wr) return 0;
+                    const fzv_t v[3] = { { -1, I->rd }, { W2, 0 }, { -1, 0 } };
+                    fz_record(&e, fs, s, v);
+                } else {
+                    if (!I->store) continue;
+                    emit(&e, 0x121E7400u | (W3 << 5) | W6);           /* and w6, w3, #~3: the word */
+                    emit(&e, 0x12000400u | (W3 << 5) | W7);           /* and w7, w3, #3 */
+                    movw(&e, W8, I->store == 1 ? 1u : I->store == 2 ? 3u : 0xFu);
+                    dp3(&e, LSLV, W8, W8, W7);                        /* be */
+                    emit(&e, 0x531D7000u | (W7 << 5) | W7);           /* lsl w7, w7, #3 */
+                    dp3(&e, LSLV, W4, W1, W7);                        /* the data at its bytes */
+                    const fzv_t v[3] = { { W6, 0 }, { W8, 0 }, { W4, 0 } };
+                    fz_record(&e, fs, s, v);
+                }
+                b->cntf[s]++;
+            }
+        }
         b->n = k + 1;
         p += d->len;
         if (ends_block(d)) {
@@ -359,10 +532,25 @@ done:
         patch_bcond(miss_patches[i], e.p);
         exit_before(&e, b->ins[miss_target[i]].pc, miss_target[i]);
     }
-    if (!e.ok || b->n == 0) { b->n = 0; return b; }               /* the interpreter runs it */
+    if (!e.ok || b->n == 0 || (fz && b->n != n0)) return 0;
     __builtin___clear_cache((char *)start, (char *)e.p);
-    b->fn = (int (*)(void *, jout_t *))(void *)start;
+    int (*fn)(void *, jout_t *) = (int (*)(void *, jout_t *))(void *)start;
+    if (fz) b->fnf = fn; else b->fn = fn;
     j->code_cur = (uint8_t *)e.p;
+    return 1;
+}
+
+static jblock_t *translate(jit_t *j, uint32_t pc)
+{
+    if (j->nblocks == JIT_BLOCKS || j->npool + JIT_MAX > JIT_POOL || j->code_end - j->code_cur < 128 * 1024)
+        return NULL;                                              /* full: the caller flushes */
+    jblock_t *b = &j->blocks[j->nblocks++];
+    b->ins = &j->pool[j->npool];
+    b->n = 0; b->fn = NULL; b->fnf = NULL;
+    if (!gen(j, pc, b, NULL)) { b->n = 0; return b; }             /* the interpreter runs it */
+    const uint32_t n = b->n;
+    if (j->fz && !gen(j, pc, b, j->fz)) b->fnf = NULL;            /* (the plain one only) */
+    b->n = n;
     j->npool += b->n;
     j->n_trans++;
     return b;
@@ -423,7 +611,19 @@ static int run_next(jit_t *j, cpu_retire_t *r)
         if (b && b->n) {
             j->smc = 0;
             memcpy(j->x0, j->f.x, sizeof j->x0);
-            const uint32_t n = (uint32_t)b->fn(j, j->out);
+            /* the fused version when no window fills inside it (a full one is closed by the caller) */
+            int fused = b->fnf != NULL;
+            for (int s = 0; fused && s < j->fz->nstreams; s++) {
+                uint32_t *st = j->fz->s[s].state;
+                if (st[0] + b->cntf[s] >= st[3]) fused = 0;
+            }
+            if (fused)
+                for (int s = 0; s < j->fz->nstreams; s++) {
+                    uint32_t *st = j->fz->s[s].state;
+                    if (st[0] == 0) st[1] = st[2] = 0xFFFFFFFFu;  /* (a window starts) */
+                }
+            const uint32_t n = (uint32_t)(fused ? b->fnf : b->fn)(j, j->out);
+            j->cur_fused = fused; j->n_fused += (uint64_t)fused;
             if (n) {
                 j->n_blocks++;
                 j->cur = b->ins; j->cur_n = n; j->cur_i = 0; j->cur_order = j->f.order;
@@ -485,10 +685,10 @@ static void jit_destroy(cpu_model_t *mm)
     jit_t *j = (jit_t *)mm;
     if (getenv("OCV_JIT_STATS"))
         fprintf(stderr, "jit: %llu blocks run (%.1f instructions each), %llu translated, %llu flushes, %llu interpreted"
-                " (%llu of them not hot yet)\n",
+                " (%llu of them not hot yet), %llu blocks run fused\n",
                 (unsigned long long)j->n_blocks, j->n_blocks ? (double)(j->f.order - j->n_interp) / (double)j->n_blocks : 0.0,
                 (unsigned long long)j->n_trans, (unsigned long long)j->n_flush, (unsigned long long)j->n_interp,
-                (unsigned long long)j->n_cold);
+                (unsigned long long)j->n_cold, (unsigned long long)j->n_fused);
     for (int i = 0; i < j->f.nreg; i++) { dec_put(&j->f.reg[i]); free(j->map[i]); free(j->code_map[i]); free(j->hits[i]); }
     if (j->code) munmap(j->code, JIT_CODE);
     free(j->blocks); free(j->pool);
@@ -550,13 +750,27 @@ static int jit_block(cpu_model_t *mm, cpu_block_t *b, cpu_retire_t *r)
     jit_t *j = (jit_t *)mm;
     if (j->cur_i < j->cur_n) { hand_out(j, r); return 0; }
     if (!run_next(j, r)) return 0;                              /* (the interpreter filled *r) */
-    b->ins = j->cur; b->out = j->out; b->x = j->x0; b->key = j->cur_key;
+    b->ins = j->cur; b->out = j->out; b->x = j->x0; b->key = j->cur_key; b->fused = j->cur_fused;
     j->cur_i = j->cur_n;
     return (int)j->cur_n;
 }
 
+/* cpu_fuse_t: the translations made from now on have their fused version (the ones there: dropped) */
+static int jit_fuse(cpu_model_t *mm, const cpu_fuse_t *f)
+{
+    jit_t *j = (jit_t *)mm;
+    if (f && (f->nstreams > 2 || (f->cov && (!f->cov_plan || f->cls[6] != f->cls[5] + 1)))) return 0;
+    for (int s = 0; f && s < f->nstreams; s++)
+        if (f->s[s].words < 1 || f->s[s].words > 4 || f->s[s].filter < 0 || f->s[s].filter > 2) return 0;
+    jit_flush(j);
+    j->fz = f;
+    j->cov = f ? f->cov : NULL;
+    for (int s = 0; s < 2; s++) j->fst[s] = f && s < f->nstreams ? f->s[s].state : NULL;
+    return 1;
+}
+
 static const cpu_impl_t cpu_jit_impl = {
     "jit", "\"fast\" translated block by block into AArch64 code (the board's A72)", 0,
-    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1, jit_block
+    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1, jit_block, jit_fuse
 };
 #endif

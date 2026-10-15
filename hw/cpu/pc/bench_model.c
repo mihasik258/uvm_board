@@ -29,7 +29,7 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
     n_rec[ch]++;
     if (c->squash) {                          /* as the runner's emit(): fold, keep the last, close the window */
         if (sqs[ch].n == 0) sqs[ch].c = sqs[ch].z = 0xFFFFFFFFu;
-        if (!crc_off) ocv_squash_add(&sqs[ch].c, &sqs[ch].z, rec, ones, c->rec_words);
+        if (!crc_off) ocv_squash_add(&sqs[ch].c, &sqs[ch].z, rec, sqs[ch].mask, c->rec_words);
         for (uint32_t j = 0; j < c->rec_words; j++) sqs[ch].last[j] = rec[j];
         if (++sqs[ch].n >= window) { sqs[ch].n = 0; n_win[ch]++; sig[ch] = sig[ch] * 1000003u + ((uint64_t)sqs[ch].c << 32 | sqs[ch].z); }
     }
@@ -44,7 +44,7 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t *rec = recs + (size_t)i * stride;
         if (k == 0) a = z = 0xFFFFFFFFu;
-        if (!crc_off) ocv_squash_add(&a, &z, rec, ones, W);
+        if (!crc_off) ocv_squash_add(&a, &z, rec, sqs[ch].mask, W);
         if (++k >= window) { for (uint32_t j = 0; j < W; j++) sqs[ch].last[j] = rec[j]; k = 0; n_win[ch]++;
                              sig[ch] = sig[ch] * 1000003u + ((uint64_t)a << 32 | z); }
     }
@@ -54,7 +54,7 @@ static int fold_make(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t 
 {   /* as the runner's */
     (void)io;
     const ocv_channel_t *c = &ocv_model_dut->channels[ch];
-    return c->squash && ocv_fold_make(f, recs, n, stride, ones, c->rec_words);
+    return c->squash && ocv_fold_make(f, recs, n, stride, sqs[ch].mask, c->rec_words);
 }
 static int emit_fold(ocv_model_io_t *io, int ch, const ocv_fold_t *f)
 {
@@ -106,8 +106,13 @@ int main(int argc, char **argv)
         } else { fprintf(stderr, "usage: %s [--batches N] [--window W] [--model-opt k=v ...]\n", argv[0]); return 1; }
     }
     const ocv_dut_t *d = ocv_model_dut;
+    static uint32_t masks[256][64];           /* OCV_BENCH_MASKS=1: the compared bits, as the runner signs them */
     for (int ch = 0; ch < ocv_model_dut->n_channels; ch++) {
         sqs[ch].window = window; sqs[ch].words = ocv_model_dut->channels[ch].rec_words; sqs[ch].mask = ones;
+        if (getenv("OCV_BENCH_MASKS") && sqs[ch].words <= 64) {
+            ocv_channel_word_masks(&ocv_model_dut->channels[ch], masks[ch]);
+            sqs[ch].mask = masks[ch];
+        }
     }
     ocv_model_io_t io = { emit, observed, NULL, send, 0, emit_n, getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold,
                           getenv("OCV_NO_SQPUSH") ? NULL : squash, squash_close, NULL, NULL, NULL };

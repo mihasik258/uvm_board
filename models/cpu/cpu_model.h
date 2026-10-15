@@ -82,7 +82,37 @@ typedef struct {
     const uint32_t *x;                     /* the registers before the block */
     uint64_t key;                          /* nonzero: the block ran whole - the same key each time it runs, never
                                             * another block's (its cpu_bins_t: the same each time) */
+    int      fused;                        /* its code also did what cpu_impl_t.fuse asked (coverage, records) */
 } cpu_block_t;
+
+/* What a translating model's code can do for its caller as it runs (cpu_impl_t.fuse), instead of the caller
+ * doing it per instruction afterwards: count coverage bins and fold records of up to two streams into their
+ * windows, straight from the values it has in registers. */
+typedef struct {                           /* an instruction's coverage, decided once (as cv32_cov's cov_plan) */
+    uint16_t v, s0, s1;                    /* bins (flat): v plus the operand classes; s0, s1 fixed (0xFFFF none) */
+    uint8_t  kind, nc2;                    /* 0: no v; 1: v + class(a) * nc2 + class(b); 2: v + class(a) * nc2 */
+    uint16_t mis[4];                       /* a load / store: the bin at each offset (a + imm) & 3, 0xFFFF none */
+} cpu_covp_t;
+typedef struct { uint8_t lsb, width; } cpu_ffield_t;   /* a field of a record (width 0: not reported) */
+typedef struct {
+    uint32_t    *state;                    /* the window: [0] records in it, [1] CRC32C, [2] CRC32, [3] records
+                                            * per window - the code folds into [1], [2]; the caller counts [0] */
+    int          store;                    /* 0: register writes (rd != 0), filter 0 all / 1 loads / 2 all but
+                                            * loads (cpu_streams.h CPU_W_*); 1: stores */
+    int          filter;
+    uint32_t     words;                    /* 1..4 */
+    uint32_t     mask[4];                  /* the bits that are compared (and signed) */
+    cpu_ffield_t f[3];                     /* REGW: rd, data; STORE: addr, be, data */
+} cpu_fstream_t;
+typedef struct {
+    uint8_t     *cov;                      /* the bins (a flag each), NULL: no coverage here */
+    void       (*cov_plan)(uint32_t raw, int compressed, uint32_t insn, cpu_covp_t *p);
+    uint8_t      cls[7];                   /* the class numbers of 0, 1, -1, INT_MIN, INT_MAX, other >0, other <0
+                                            * (the last two: cls[6] == cls[5] + 1) */
+    int          nstreams;
+    cpu_fstream_t s[2];
+    uint32_t     exit_pc;                  /* the program's end: no block with an instruction there does it */
+} cpu_fuse_t;
 
 typedef struct cpu_model cpu_model_t;
 
@@ -106,6 +136,10 @@ typedef struct {
      * them taken), or one instruction into *r (returns 0). Not with instructions of a block still to hand out
      * (step_n took part of it): then one of them into *r. */
     int          (*block)(cpu_model_t *m, cpu_block_t *b, cpu_retire_t *r);
+    /* optional: from now on the translated code also does *f where it can (cpu_block_t.fused tells, per block
+     * run: a window that would fill inside a block is left to the caller). Returns 0 if it will not. f stays the
+     * caller's (read at translation and per block). */
+    int          (*fuse)(cpu_model_t *m, const cpu_fuse_t *f);
 } cpu_impl_t;
 
 struct cpu_model { const cpu_impl_t *impl; };          /* first member of every implementation */
