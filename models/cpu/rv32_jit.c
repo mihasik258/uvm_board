@@ -24,14 +24,8 @@
 #define JIT_PAGE    4               /* code-map granule: 16 bytes (256 put the generator's trap save area at
                                      * 0xA0 in one granule with the code at 0x80: a flush on every trap) */
 
-typedef struct { uint32_t wdata, next, maddr, mdata; } jout_t;
-
-typedef struct {
-    uint32_t pc, insn, next;               /* next: pc of the next instruction unless dyn_next */
-    uint32_t m_next, m_rd, m_store;        /* all ones: take that value from the block's output */
-    uint8_t  rd, len, store, dyn_next;     /* rd 0: no register written; store: bytes (0: none) */
-    uint8_t  rs1, rs2; uint16_t raw;       /* (cpu_retire_t.src1/src2/raw: raw is a compressed one's 16 bits) */
-} jins_t;                                  /* 32 bytes */
+typedef cpu_bout_t jout_t;                 /* what a block's code computes, per instruction */
+typedef cpu_bins_t jins_t;                 /* the translation's table, per instruction (cpu_model.h) */
 
 typedef struct jblock {
     int (*fn)(void *state, jout_t *out);
@@ -57,7 +51,6 @@ typedef struct {
     jins_t     keep[JIT_MAX];              /* the running block's table when the translations go */
     const jins_t *cur; uint32_t cur_n, cur_i;
     uint64_t   cur_key;                    /* the running block: (flushes << 32) | its index + 1; 0: a copy (smc) */
-    uint64_t   last_key;                   /* cpu_block_key: the last step_n handed out that whole block */
     uint64_t   cur_order;
     uint32_t   x0[32];                     /* registers up to the last handed out of the running block (cpu_xreg
                                             * and src1/src2 inside it; the block itself already wrote f.x) */
@@ -456,7 +449,6 @@ static int run_next(jit_t *j, cpu_retire_t *r)
 static void jit_step(cpu_model_t *mm, cpu_retire_t *r)
 {
     jit_t *j = (jit_t *)mm;
-    j->last_key = 0;
     if (j->cur_i < j->cur_n || run_next(j, r)) hand_out(j, r);   /* (else the interpreter filled *r) */
 }
 
@@ -464,12 +456,9 @@ static void jit_step(cpu_model_t *mm, cpu_retire_t *r)
 static int jit_step_n(cpu_model_t *mm, cpu_retire_t *r, int n)
 {
     jit_t *j = (jit_t *)mm;
-    j->last_key = 0;
     if (j->cur_i == j->cur_n && !run_next(j, r)) return 1;
-    const uint32_t from = j->cur_i;
     int k = 0;
     while (k < n && j->cur_i < j->cur_n) hand_out(j, &r[k++]);
-    if (from == 0 && j->cur_i == j->cur_n) j->last_key = j->cur_key;
     return k;
 }
 
@@ -555,10 +544,19 @@ static uint32_t jit_pc(cpu_model_t *m)
     return j->f.pc;
 }
 
-static uint64_t jit_block_key(cpu_model_t *m) { return ((jit_t *)m)->last_key; }
+/* the next block as a whole (cpu_block_t): its table and outputs as they are, nothing handed out */
+static int jit_block(cpu_model_t *mm, cpu_block_t *b, cpu_retire_t *r)
+{
+    jit_t *j = (jit_t *)mm;
+    if (j->cur_i < j->cur_n) { hand_out(j, r); return 0; }
+    if (!run_next(j, r)) return 0;                              /* (the interpreter filled *r) */
+    b->ins = j->cur; b->out = j->out; b->x = j->x0; b->key = j->cur_key;
+    j->cur_i = j->cur_n;
+    return (int)j->cur_n;
+}
 
 static const cpu_impl_t cpu_jit_impl = {
     "jit", "\"fast\" translated block by block into AArch64 code (the board's A72)", 0,
-    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1, jit_block_key
+    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1, jit_block
 };
 #endif

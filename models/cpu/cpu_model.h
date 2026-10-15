@@ -63,6 +63,27 @@ typedef struct {
     uint32_t raw, src1, src2;
 } cpu_retire_t;
 
+/* A translated block as it ran (cpu_impl_t.block): per instruction what is the same each time the block runs
+ * (cpu_bins_t) and what this run computed (cpu_bout_t), so a caller takes the block in one go instead of a
+ * cpu_retire_t per instruction. As cpu_retire_t: rd_addr = rd, rd_wdata = wdata & m_rd,
+ * pc_next = (next & m_next) | (ins.next & ~m_next), raw = len 2 ? raw : insn, src1/src2 = the registers rs1/rs2
+ * (from x, the registers before the block, and the block's writes so far); a store: mem_we = m_store & 1,
+ * mem_wmask = ((1 << store) - 1) & m_store, mem_addr = maddr & m_store, mem_wdata = mdata & m_store. A block
+ * has no traps, CSR accesses or device accesses (those come one by one). */
+typedef struct {
+    uint32_t pc, insn, next;               /* next: pc of the next instruction unless dyn_next */
+    uint32_t m_next, m_rd, m_store;        /* all ones: take that value from cpu_bout_t */
+    uint8_t  rd, len, store, dyn_next;     /* rd 0: no register written; store: bytes (0: none) */
+    uint8_t  rs1, rs2; uint16_t raw;       /* raw: a compressed one's 16 bits */
+} cpu_bins_t;                              /* 32 bytes */
+typedef struct { uint32_t wdata, next, maddr, mdata; } cpu_bout_t;
+typedef struct {
+    const cpu_bins_t *ins; const cpu_bout_t *out;
+    const uint32_t *x;                     /* the registers before the block */
+    uint64_t key;                          /* nonzero: the block ran whole - the same key each time it runs, never
+                                            * another block's (its cpu_bins_t: the same each time) */
+} cpu_block_t;
+
 typedef struct cpu_model cpu_model_t;
 
 typedef struct {
@@ -81,10 +102,10 @@ typedef struct {
     /* optional: the next n instructions one by one, nothing executed ahead (cpu_sync) */
     void         (*sync)(cpu_model_t *m, uint64_t n);
     int          gives_src;     /* cpu_retire_t.raw / src1 / src2 are set */
-    /* optional: nonzero if the last step_n handed out one whole translated block from its start - a key that
-     * is the same each time that block runs and never another block's (its instructions, pc and insn: the
-     * same each time; the values they compute: not) */
-    uint64_t     (*block_key)(cpu_model_t *m);
+    /* optional: the next instructions - a translated block, run, into *b (returns how many instructions, all of
+     * them taken), or one instruction into *r (returns 0). Not with instructions of a block still to hand out
+     * (step_n took part of it): then one of them into *r. */
+    int          (*block)(cpu_model_t *m, cpu_block_t *b, cpu_retire_t *r);
 } cpu_impl_t;
 
 struct cpu_model { const cpu_impl_t *impl; };          /* first member of every implementation */

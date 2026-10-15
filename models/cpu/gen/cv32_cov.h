@@ -62,9 +62,21 @@ void     cov_reset(void);
 /* one executed instruction: raw = its encoding (16 bits for a compressed one), insn = the 32-bit form,
  * a, b = values of rs1, rs2 before it ran, trap = it raised an exception */
 void     cov_exec(uint32_t raw, int compressed, uint32_t insn, uint32_t a, uint32_t b, int trap);
+/* cov_exec of an instruction that does not trap, in two halves: what depends on the instruction alone, once
+ * (cov_plan: a translated block's instructions, the same each time it runs), and per execution the part that
+ * depends on its operands (cov_run) - the same bins counted as cov_exec(raw, compressed, insn, a, b, 0) */
+typedef struct {
+    uint16_t v, s0, s1;          /* bins (flat): v with the operand classes added; s0, s1 fixed (0xFFFF none) */
+    uint8_t  kind, nc2;          /* 0: no v; 1: v + class(a) * nc2 + class(b); 2: v + class(a) * nc2 */
+    int16_t  mimm;               /* a load / store: the offset (misaligned bins from a + mimm) */
+    uint8_t  mop, mf3;           /* its opcode (0: none) and funct3 */
+} cov_plan_t;
+void     cov_plan(uint32_t raw, int compressed, uint32_t insn, cov_plan_t *p);
+void     cov_run(const cov_plan_t *p, uint32_t a, uint32_t b);
 void     cov_irq(uint32_t id);                    /* an interrupt the core took */
 uint32_t cov_irq_unhit(void);                     /* the interrupt lines not taken yet (a mask) */
 unsigned cov_total(void);                         /* bins that exist */
+uint64_t cov_hash(void);                          /* of every bin's count (tests: two ways count the same) */
 unsigned cov_hit(void);                           /* bins hit at least once */
 unsigned cov_group_total(int g), cov_group_hit(int g);
 const char *cov_group_name(int g);

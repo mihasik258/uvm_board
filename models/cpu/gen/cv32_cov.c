@@ -148,6 +148,17 @@ static int csr_index(uint32_t csr)
     return -1;
 }
 
+/* the misaligned bin of a load / store at this offset in its word, -1 if none */
+static int mis_bin(uint32_t op, uint32_t f3, uint32_t off)
+{
+    if (op == 0x03 && f3 == 1) return off == 1 ? COV_M_LH1 : off == 3 ? COV_M_LH3 : -1;
+    if (op == 0x03 && f3 == 5) return off == 1 ? COV_M_LHU1 : off == 3 ? COV_M_LHU3 : -1;
+    if (op == 0x03 && f3 == 2 && off) return COV_M_LW1 + (int)off - 1;
+    if (op == 0x23 && f3 == 1) return off == 1 ? COV_M_SH1 : off == 3 ? COV_M_SH3 : -1;
+    if (op == 0x23 && f3 == 2 && off) return COV_M_SW1 + (int)off - 1;
+    return -1;
+}
+
 /* the kind of exception (or mret) an instruction is, -1 if none */
 static int exc_kind(uint32_t raw, int compressed, uint32_t insn, int trap)
 {
@@ -190,15 +201,85 @@ void cov_exec(uint32_t raw, int compressed, uint32_t insn, uint32_t a, uint32_t 
     }
     if ((!trap || mis_trap) && (op == 0x03 || op == 0x23)) {
         const int32_t imm = op == 0x03 ? (int32_t)insn >> 20 : (((int32_t)insn >> 25) << 5) | (int32_t)((insn >> 7) & 31);
-        const uint32_t off = (a + (uint32_t)imm) & 3;
-        int m = -1;
-        if (op == 0x03 && f3 == 1) m = off == 1 ? COV_M_LH1 : off == 3 ? COV_M_LH3 : -1;
-        if (op == 0x03 && f3 == 5) m = off == 1 ? COV_M_LHU1 : off == 3 ? COV_M_LHU3 : -1;
-        if (op == 0x03 && f3 == 2 && off) m = COV_M_LW1 + (int)off - 1;
-        if (op == 0x23 && f3 == 1) m = off == 1 ? COV_M_SH1 : off == 3 ? COV_M_SH3 : -1;
-        if (op == 0x23 && f3 == 2 && off) m = COV_M_SW1 + (int)off - 1;
+        const int m = mis_bin(op, f3, (a + (uint32_t)imm) & 3);
         if (m >= 0) hits[COV_G_MIS][m]++;
     }
+}
+
+#define FLAT(g, i) ((uint16_t)((g) * MAXB + (i)))
+void cov_plan(uint32_t raw, int compressed, uint32_t insn, cov_plan_t *p)
+{
+    const uint32_t opc = insn & 0x7F, f3 = (insn >> 12) & 7, f7 = insn >> 25;
+    const int32_t imm = (int32_t)insn >> 20;
+    static const int alu_op[8] = { 0, 2, 3, 4, 5, 6, 8, 9 };    /* (as cov_insn) */
+    static const int alui_op[8] = { 0, -1, 1, 2, 3, -1, 4, 5 };
+    static const int br_op[8] = { 0, 1, -1, -1, 2, 3, 4, 5 };
+    static const int ld[8] = { 0, 1, 2, -1, 3, 4, -1, -1 };
+    uint16_t s[2] = { 0xFFFF, 0xFFFF };
+    int ns = 0, k;
+    p->kind = 0; p->v = 0; p->nc2 = 0; p->mop = 0; p->mf3 = 0; p->mimm = 0;
+    switch (opc) {                                              /* cov_insn */
+    case 0x33:
+        if (f7 == 0x01) { p->kind = 1; p->v = FLAT(COV_G_MUL, idx(COV_G_MUL, (int)f3, 0, 0)); p->nc2 = (uint8_t)n_c2[COV_G_MUL]; break; }
+        {
+            int op = alu_op[f3];
+            if (f7 == 0x20 && f3 == 0) op = 1;
+            if (f7 == 0x20 && f3 == 5) op = 7;
+            p->kind = 1; p->v = FLAT(COV_G_ALU, idx(COV_G_ALU, op, 0, 0)); p->nc2 = (uint8_t)n_c2[COV_G_ALU];
+        }
+        break;
+    case 0x13:
+        if (f3 == 1 || f3 == 5) {
+            const int op = f3 == 1 ? 0 : (f7 == 0x20 ? 2 : 1);
+            p->kind = 2; p->v = FLAT(COV_G_SHI, idx(COV_G_SHI, op, 0, sh_class((insn >> 20) & 31))); p->nc2 = (uint8_t)n_c2[COV_G_SHI];
+        } else {
+            p->kind = 2; p->v = FLAT(COV_G_ALUI, idx(COV_G_ALUI, alui_op[f3], 0, imm_class(imm))); p->nc2 = (uint8_t)n_c2[COV_G_ALUI];
+        }
+        break;
+    case 0x63:
+        if (br_op[f3] >= 0) { p->kind = 1; p->v = FLAT(COV_G_BR, idx(COV_G_BR, br_op[f3], 0, 0)); p->nc2 = (uint8_t)n_c2[COV_G_BR]; }
+        break;
+    case 0x03:
+        if (ld[f3] >= 0) s[ns++] = FLAT(COV_G_MEM, idx(COV_G_MEM, ld[f3], 0, 0));
+        break;
+    case 0x23:
+        if (f3 <= 2) s[ns++] = FLAT(COV_G_MEM, idx(COV_G_MEM, 5 + (int)f3, 0, 0));
+        break;
+    default:
+        break;
+    }
+    /* the rest of cov_exec (no trap) */
+    if ((k = exc_kind(raw, compressed, insn, 0)) >= 0 && ns < 2) s[ns++] = FLAT(COV_G_EXC, k);
+    if (compressed && (k = rvc_kind(raw & 0xFFFF)) >= 0 && ns < 2) s[ns++] = FLAT(COV_G_RVC, k);
+    if (opc == 0x73 && f3 != 0 && f3 != 4 && (k = csr_index(insn >> 20)) >= 0 && ns < 2) {
+        static const int cop[8] = { -1, 0, 1, 2, -1, 3, 4, 5 };
+        s[ns++] = FLAT(COV_G_CSR, idx(COV_G_CSR, cop[f3], k, ((insn >> 15) & 31) != 0));
+    }
+    p->s0 = s[0]; p->s1 = s[1];
+    if (opc == 0x03 || opc == 0x23) {
+        p->mop = (uint8_t)opc; p->mf3 = (uint8_t)f3;
+        p->mimm = (int16_t)(opc == 0x03 ? (int32_t)insn >> 20 : (((int32_t)insn >> 25) << 5) | (int32_t)((insn >> 7) & 31));
+    }
+}
+
+void cov_run(const cov_plan_t *p, uint32_t a, uint32_t b)
+{
+    uint32_t *const h = &hits[0][0];
+    if (p->kind == 1) h[p->v + (unsigned)cov_class(a) * p->nc2 + (unsigned)cov_class(b)]++;
+    else if (p->kind == 2) h[p->v + (unsigned)cov_class(a) * p->nc2]++;
+    if (p->s0 != 0xFFFF) h[p->s0]++;
+    if (p->s1 != 0xFFFF) h[p->s1]++;
+    if (p->mop) {
+        const int m = mis_bin(p->mop, p->mf3, (a + (uint32_t)(int32_t)p->mimm) & 3);
+        if (m >= 0) hits[COV_G_MIS][m]++;
+    }
+}
+
+uint64_t cov_hash(void)
+{
+    uint64_t x = 1469598103934665603ull;
+    for (unsigned i = 0; i < sizeof hits / sizeof hits[0][0]; i++) x = (x ^ (&hits[0][0])[i]) * 1099511628211ull;
+    return x;
 }
 
 unsigned cov_group_total(int g) { return group_bins(g); }
