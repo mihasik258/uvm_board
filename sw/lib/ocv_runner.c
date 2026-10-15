@@ -73,8 +73,7 @@ typedef struct {
     unsigned  n_retired;
     uint32_t  qw;       /* words per queued record: rec_words, + 3 for a squashed channel */
     /* squash: the model's records folded into the open window */
-    uint32_t  sq_n, sq_c, sq_z;
-    uint32_t  sq_last[256];
+    ocv_squash_t sq;                     /* the open window (squash): also the model's (io->squash) */
 } queue_t;
 
 typedef struct { uint16_t ch; uint32_t i; } stim_ref_t;
@@ -179,15 +178,15 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
     queue_t *q = &r->q[ch];
     uint32_t fused[259];
     if (c->squash) {                             /* fold into the window, as the endpoint does */
-        if (q->sq_n == 0) q->sq_c = q->sq_z = 0xFFFFFFFFu;
-        ocv_squash_add(&q->sq_c, &q->sq_z, rec, r->mask[ch], c->rec_words);
-        for (uint32_t j = 0; j < c->rec_words; j++) q->sq_last[j] = rec[j];   /* (a few words: no libc call) */
-        if (++q->sq_n < r->window) return;
-        memcpy(fused, q->sq_last, c->rec_words * 4u);
-        fused[c->rec_words] = q->sq_n;
-        fused[c->rec_words + 1] = q->sq_c;
-        fused[c->rec_words + 2] = q->sq_z;
-        q->sq_n = 0;
+        if (q->sq.n == 0) q->sq.c = q->sq.z = 0xFFFFFFFFu;
+        ocv_squash_add(&q->sq.c, &q->sq.z, rec, r->mask[ch], c->rec_words);
+        for (uint32_t j = 0; j < c->rec_words; j++) q->sq.last[j] = rec[j];   /* (a few words: no libc call) */
+        if (++q->sq.n < r->window) return;
+        memcpy(fused, q->sq.last, c->rec_words * 4u);
+        fused[c->rec_words] = q->sq.n;
+        fused[c->rec_words + 1] = q->sq.c;
+        fused[c->rec_words + 2] = q->sq.z;
+        q->sq.n = 0;
         rec = fused;
     }
     recbuf_push(&q->exp, rec, q->qw);
@@ -214,7 +213,7 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
     }
     queue_t *q = &r->q[ch];
     const uint32_t W = c->rec_words, win = r->window, *mask = r->mask[ch];
-    uint32_t a = q->sq_c, z = q->sq_z, k = q->sq_n;
+    uint32_t a = q->sq.c, z = q->sq.z, k = q->sq.n;
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t *rec = recs + (size_t)i * stride;
         if (k == 0) a = z = 0xFFFFFFFFu;
@@ -226,8 +225,8 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
         recbuf_push(&q->exp, fused, q->qw);
         k = 0;
     }
-    if (k && n) for (uint32_t j = 0; j < W; j++) q->sq_last[j] = recs[(size_t)(n - 1) * stride + j];
-    q->sq_c = a; q->sq_z = z; q->sq_n = k;
+    if (k && n) for (uint32_t j = 0; j < W; j++) q->sq.last[j] = recs[(size_t)(n - 1) * stride + j];
+    q->sq.c = a; q->sq.z = z; q->sq.n = k;
 }
 
 /* a piece of records (ocv_fold_t): squashed channels (not --overlap), inside one window - folded with
@@ -243,12 +242,32 @@ static int emit_fold(ocv_model_io_t *io, int ch, const ocv_fold_t *f)
 {
     run_t *r = io->priv;
     queue_t *q = &r->q[ch];
-    if (q->sq_n + f->n >= r->window) return 0;  /* (the window would end inside: record by record) */
-    if (q->sq_n == 0) q->sq_c = q->sq_z = 0xFFFFFFFFu;
-    ocv_fold_apply(&q->sq_c, &q->sq_z, f);
-    q->sq_n += f->n;
-    for (uint32_t j = 0; j < f->words; j++) q->sq_last[j] = f->last[j];
+    if (q->sq.n + f->n >= r->window) return 0;  /* (the window would end inside: record by record) */
+    if (q->sq.n == 0) q->sq.c = q->sq.z = 0xFFFFFFFFu;
+    ocv_fold_apply(&q->sq.c, &q->sq.z, f);
+    q->sq.n += f->n;
+    for (uint32_t j = 0; j < f->words; j++) q->sq.last[j] = f->last[j];
     return 1;
+}
+
+/* the window state for a model that folds its records itself: as emit_n, squashed channels without --overlap */
+static ocv_squash_t *squash(ocv_model_io_t *io, int ch)
+{
+    run_t *r = io->priv;
+    const ocv_channel_t *c = &r->env.dut->channels[ch];
+    if (!c->squash || r->overlap || c->kind == OCV_CH_SOURCE || c->rec_words > 256) return NULL;
+    return &r->q[ch].sq;
+}
+static void squash_close(ocv_model_io_t *io, int ch)
+{   /* the window is full: its fused record, as emit_n makes it */
+    run_t *r = io->priv;
+    queue_t *q = &r->q[ch];
+    const uint32_t W = r->env.dut->channels[ch].rec_words;
+    uint32_t fused[259];
+    for (uint32_t j = 0; j < W; j++) fused[j] = q->sq.last[j];
+    fused[W] = q->sq.n; fused[W + 1] = q->sq.c; fused[W + 2] = q->sq.z;
+    recbuf_push(&q->exp, fused, q->qw);
+    q->sq.n = 0;
 }
 
 static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec)
@@ -732,6 +751,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
     for (int ch = 0; ch < dut->n_channels; ch++) {
         const ocv_channel_t *c = &dut->channels[ch];
         r.q[ch].qw = ocv_store_words(c);
+        r.q[ch].sq.window = window; r.q[ch].sq.words = c->rec_words; r.q[ch].sq.mask = r.mask[ch];   /* (io->squash) */
         if (c->kind != OCV_CH_SOURCE && c->squash) {
             ocv_squash_window(&r.env, ch, window);
             uint32_t got_w = ocv_ep_rd(&r.env, ch, OCV_EP_REG_SQUASH);
@@ -768,7 +788,8 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
 
     /* (OCV_NO_EMITN=1: records one by one, emit() - to tell the batched path apart when something differs) */
     ocv_model_io_t io = { emit, observed, &r, send_rec, 0, getenv("OCV_NO_EMITN") ? NULL : emit_n,
-                          getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold };
+                          getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold,
+                          getenv("OCV_NO_SQPUSH") ? NULL : squash, squash_close };
     r.io = &io;
     uint64_t rng = seed ? seed : 1, stim_total = 0, cycles = 0, polls_total = 0, done_batches = 0;
     double t0 = now_s();
@@ -988,13 +1009,13 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
         for (int ch = 0; ch < dut->n_channels; ch++) {          /* squash: the model's open windows */
             const ocv_channel_t *c = &dut->channels[ch];
             queue_t *q = &r.q[ch];
-            if (c->kind == OCV_CH_SOURCE || !c->squash || q->sq_n == 0) continue;
+            if (c->kind == OCV_CH_SOURCE || !c->squash || q->sq.n == 0) continue;
             uint32_t fused[259];
-            memcpy(fused, q->sq_last, c->rec_words * 4u);
-            fused[c->rec_words] = q->sq_n;
-            fused[c->rec_words + 1] = q->sq_c;
-            fused[c->rec_words + 2] = q->sq_z;
-            q->sq_n = 0;
+            memcpy(fused, q->sq.last, c->rec_words * 4u);
+            fused[c->rec_words] = q->sq.n;
+            fused[c->rec_words + 1] = q->sq.c;
+            fused[c->rec_words + 2] = q->sq.z;
+            q->sq.n = 0;
             recbuf_push(&q->exp, fused, q->qw);
             uint32_t i = q->exp.n - 1;
             if (r.overlap && r.mm_ch < 0 && i < q->got.n) {

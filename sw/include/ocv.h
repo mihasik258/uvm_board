@@ -126,6 +126,36 @@ typedef struct ocv_fold { uint32_t n, words, c, z, kc, kz; uint32_t last[16]; } 
 int      ocv_fold_make(ocv_fold_t *f, const uint32_t *recs, uint32_t n, uint32_t stride, const uint32_t *mask, uint32_t words);
 /* = ocv_squash_add of the piece's n records, one by one */
 void     ocv_fold_apply(uint32_t *crc32c, uint32_t *crc32, const ocv_fold_t *f);
+/* A squashed output channel's open window as the runner keeps it (ocv_model_io_t.squash): a model folds its
+ * expected records into it in place instead of emitting them one by one. */
+typedef struct ocv_squash {
+    uint32_t n, c, z;                           /* records in the window so far; its CRC32C and CRC32 */
+    uint32_t window, words;                     /* records per window; words per record */
+    const uint32_t *mask;                       /* the compared bits of a record (words) */
+    uint32_t last[256];                         /* the last record folded */
+} ocv_squash_t;
+/* fold one record into such a window, in the caller (inlined: a record built in registers goes straight into
+ * the CRCs); 1 when the window is full (then: io->squash_close) */
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
+static inline __attribute__((always_inline)) int ocv_squash_push(ocv_squash_t *q, const uint32_t *rec, uint32_t words)
+{
+    if (q->n == 0) q->c = q->z = 0xFFFFFFFFu;
+#if defined(__ARM_FEATURE_CRC32)
+    uint32_t a = q->c, b = q->z, j = 0;
+    for (; j + 1 < words; j += 2) {
+        const uint64_t d = (uint64_t)(rec[j] & q->mask[j]) | ((uint64_t)(rec[j + 1] & q->mask[j + 1]) << 32);
+        a = __crc32cd(a, d); b = __crc32d(b, d);
+    }
+    for (; j < words; j++) { const uint32_t w = rec[j] & q->mask[j]; a = __crc32cw(a, w); b = __crc32w(b, w); }
+    q->c = a; q->z = b;
+#else
+    ocv_squash_add(&q->c, &q->z, rec, q->mask, words);
+#endif
+    for (uint32_t k = 0; k < words; k++) q->last[k] = rec[k];
+    return ++q->n >= q->window;
+}
 /* set the window (records per fused record; 1 = every record) / emit the open window */
 void     ocv_squash_window(ocv_env_t *env, int ch, uint32_t n);
 /* the compared-bits mask the squash signatures cover (rec_words words): 1 if the endpoint has

@@ -72,7 +72,40 @@ typedef struct {
     uint8_t  mop, mf3;           /* its opcode (0: none) and funct3 */
 } cov_plan_t;
 void     cov_plan(uint32_t raw, int compressed, uint32_t insn, cov_plan_t *p);
-void     cov_run(const cov_plan_t *p, uint32_t a, uint32_t b);
+
+/* the bins, flat (group g, bin i at g * COV_MAXB + i): hit or not (a flag - only that is ever asked) */
+#define COV_MAXB (10 * COV_NV * COV_NV)              /* the largest group (CSR: 6 x 13 x 2 is smaller) */
+extern uint8_t cov_hits[];
+static inline __attribute__((always_inline)) int cov_class_of(uint32_t v)
+{   /* (two branches, taken rarely: -1 0 1 are v + 1 <= 2; MIN MAX are (v ^ MIN) + 1 <= 1) */
+    const uint32_t u = v + 1u, t = (v ^ 0x80000000u) + 1u;
+    if (u <= 2u) return u == 0 ? COV_V_M1 : u == 1 ? COV_V_ZERO : COV_V_ONE;
+    if (t <= 1u) return t ? COV_V_MIN : COV_V_MAX;
+    return (v >> 31) ? COV_V_NEG : COV_V_POS;
+}
+/* the misaligned bin of a load / store at this offset in its word, -1 if none */
+static inline __attribute__((always_inline)) int cov_mis_bin(uint32_t op, uint32_t f3, uint32_t off)
+{
+    if (op == 0x03 && f3 == 1) return off == 1 ? COV_M_LH1 : off == 3 ? COV_M_LH3 : -1;
+    if (op == 0x03 && f3 == 5) return off == 1 ? COV_M_LHU1 : off == 3 ? COV_M_LHU3 : -1;
+    if (op == 0x03 && f3 == 2 && off) return COV_M_LW1 + (int)off - 1;
+    if (op == 0x23 && f3 == 1) return off == 1 ? COV_M_SH1 : off == 3 ? COV_M_SH3 : -1;
+    if (op == 0x23 && f3 == 2 && off) return COV_M_SW1 + (int)off - 1;
+    return -1;
+}
+/* inline in the caller's loop: a store per bin, no call */
+static inline __attribute__((always_inline)) void cov_run(const cov_plan_t *p, uint32_t a, uint32_t b)
+{
+    uint8_t *const h = cov_hits;
+    if (p->kind == 1) h[p->v + (unsigned)cov_class_of(a) * p->nc2 + (unsigned)cov_class_of(b)] = 1;
+    else if (p->kind == 2) h[p->v + (unsigned)cov_class_of(a) * p->nc2] = 1;
+    if (p->s0 != 0xFFFF) h[p->s0] = 1;
+    if (p->s1 != 0xFFFF) h[p->s1] = 1;
+    if (p->mop) {
+        const int m = cov_mis_bin(p->mop, p->mf3, (a + (uint32_t)(int32_t)p->mimm) & 3);
+        if (m >= 0) h[COV_G_MIS * COV_MAXB + m] = 1;
+    }
+}
 void     cov_irq(uint32_t id);                    /* an interrupt the core took */
 uint32_t cov_irq_unhit(void);                     /* the interrupt lines not taken yet (a mask) */
 unsigned cov_total(void);                         /* bins that exist */

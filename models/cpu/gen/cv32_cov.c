@@ -27,21 +27,14 @@ void cov_profile(int core)
 const uint32_t cov_csrs[COV_NCSR] = { 0x300, 0x301, 0x304, 0x305, 0x340, 0x341, 0x342, 0x343, 0x344,
                                       0xF11, 0xF12, 0xF13, 0xF14 };
 
-#define MAXB (10 * COV_NV * COV_NV)           /* the largest group (CSR: 6 x 13 x 2 is smaller) */
-static uint32_t hits[COV_NG][MAXB];
+#define MAXB COV_MAXB
+uint8_t cov_hits[COV_NG * COV_MAXB];
+#define hits ((uint8_t (*)[MAXB])cov_hits)
 
 static unsigned idx(int g, int op, int c1, int c2) { return ((unsigned)op * n_c1[g] + c1) * n_c2[g] + c2; }
 static unsigned group_bins(int g) { return (unsigned)(n_ops[g] * n_c1[g] * n_c2[g]); }
 
-int cov_class(uint32_t v)
-{
-    if (v == 0) return COV_V_ZERO;
-    if (v == 1) return COV_V_ONE;
-    if (v == 0xFFFFFFFFu) return COV_V_M1;
-    if (v == 0x80000000u) return COV_V_MIN;
-    if (v == 0x7FFFFFFFu) return COV_V_MAX;
-    return (v >> 31) ? COV_V_NEG : COV_V_POS;
-}
+int cov_class(uint32_t v) { return cov_class_of(v); }
 
 static int imm_class(int32_t imm)
 {
@@ -53,7 +46,7 @@ static int imm_class(int32_t imm)
 
 static int sh_class(unsigned sh) { return sh == 0 ? COV_S_ZERO : sh == 1 ? COV_S_ONE : sh == 31 ? COV_S_31 : COV_S_OTHER; }
 
-void cov_reset(void) { memset(hits, 0, sizeof hits); }
+void cov_reset(void) { memset(cov_hits, 0, sizeof cov_hits); }
 
 uint32_t cov_irq_unhit(void)
 {
@@ -64,7 +57,7 @@ uint32_t cov_irq_unhit(void)
 
 void cov_irq(uint32_t id)
 {
-    for (int i = 0; i < cov_nirq; i++) if (cov_irqs[i] == id) hits[COV_G_IRQ][i]++;
+    for (int i = 0; i < cov_nirq; i++) if (cov_irqs[i] == id) hits[COV_G_IRQ][i] = 1;
 }
 
 static void cov_insn(uint32_t insn, uint32_t a, uint32_t b)
@@ -76,32 +69,32 @@ static void cov_insn(uint32_t insn, uint32_t a, uint32_t b)
     static const int br_op[8] = { 0, 1, -1, -1, 2, 3, 4, 5 };
     switch (opc) {
     case 0x33:
-        if (f7 == 0x01) { hits[COV_G_MUL][idx(COV_G_MUL, (int)f3, cov_class(a), cov_class(b))]++; break; }
+        if (f7 == 0x01) { hits[COV_G_MUL][idx(COV_G_MUL, (int)f3, cov_class(a), cov_class(b))] = 1; break; }
         {
             int op = alu_op[f3];
             if (f7 == 0x20 && f3 == 0) op = 1;                      /* sub */
             if (f7 == 0x20 && f3 == 5) op = 7;                      /* sra */
-            hits[COV_G_ALU][idx(COV_G_ALU, op, cov_class(a), cov_class(b))]++;
+            hits[COV_G_ALU][idx(COV_G_ALU, op, cov_class(a), cov_class(b))] = 1;
         }
         break;
     case 0x13:
         if (f3 == 1 || f3 == 5) {                                   /* slli / srli / srai */
             int op = f3 == 1 ? 0 : (f7 == 0x20 ? 2 : 1);
-            hits[COV_G_SHI][idx(COV_G_SHI, op, cov_class(a), sh_class((insn >> 20) & 31))]++;
+            hits[COV_G_SHI][idx(COV_G_SHI, op, cov_class(a), sh_class((insn >> 20) & 31))] = 1;
         } else {
-            hits[COV_G_ALUI][idx(COV_G_ALUI, alui_op[f3], cov_class(a), imm_class(imm))]++;
+            hits[COV_G_ALUI][idx(COV_G_ALUI, alui_op[f3], cov_class(a), imm_class(imm))] = 1;
         }
         break;
     case 0x63:
-        if (br_op[f3] >= 0) hits[COV_G_BR][idx(COV_G_BR, br_op[f3], cov_class(a), cov_class(b))]++;
+        if (br_op[f3] >= 0) hits[COV_G_BR][idx(COV_G_BR, br_op[f3], cov_class(a), cov_class(b))] = 1;
         break;
     case 0x03: {
         static const int ld[8] = { 0, 1, 2, -1, 3, 4, -1, -1 };
-        if (ld[f3] >= 0) hits[COV_G_MEM][idx(COV_G_MEM, ld[f3], 0, 0)]++;
+        if (ld[f3] >= 0) hits[COV_G_MEM][idx(COV_G_MEM, ld[f3], 0, 0)] = 1;
         break;
     }
     case 0x23:
-        if (f3 <= 2) hits[COV_G_MEM][idx(COV_G_MEM, 5 + (int)f3, 0, 0)]++;
+        if (f3 <= 2) hits[COV_G_MEM][idx(COV_G_MEM, 5 + (int)f3, 0, 0)] = 1;
         break;
     default:
         break;
@@ -148,17 +141,6 @@ static int csr_index(uint32_t csr)
     return -1;
 }
 
-/* the misaligned bin of a load / store at this offset in its word, -1 if none */
-static int mis_bin(uint32_t op, uint32_t f3, uint32_t off)
-{
-    if (op == 0x03 && f3 == 1) return off == 1 ? COV_M_LH1 : off == 3 ? COV_M_LH3 : -1;
-    if (op == 0x03 && f3 == 5) return off == 1 ? COV_M_LHU1 : off == 3 ? COV_M_LHU3 : -1;
-    if (op == 0x03 && f3 == 2 && off) return COV_M_LW1 + (int)off - 1;
-    if (op == 0x23 && f3 == 1) return off == 1 ? COV_M_SH1 : off == 3 ? COV_M_SH3 : -1;
-    if (op == 0x23 && f3 == 2 && off) return COV_M_SW1 + (int)off - 1;
-    return -1;
-}
-
 /* the kind of exception (or mret) an instruction is, -1 if none */
 static int exc_kind(uint32_t raw, int compressed, uint32_t insn, int trap)
 {
@@ -193,16 +175,16 @@ void cov_exec(uint32_t raw, int compressed, uint32_t insn, uint32_t a, uint32_t 
     const int ls = (op == 0x03 && f3 != 3 && f3 < 6) || (op == 0x23 && f3 <= 2);
     const int mis_trap = cva6 && trap && ls && !compressed;
     int k = mis_trap ? -1 : exc_kind(raw, compressed, insn, trap);
-    if (k >= 0) hits[COV_G_EXC][k]++;
-    if (compressed && (k = rvc_kind(raw & 0xFFFF)) >= 0 && (!trap || k == COV_C_EBREAK)) hits[COV_G_RVC][k]++;
+    if (k >= 0) hits[COV_G_EXC][k] = 1;
+    if (compressed && (k = rvc_kind(raw & 0xFFFF)) >= 0 && (!trap || k == COV_C_EBREAK)) hits[COV_G_RVC][k] = 1;
     if (op == 0x73 && f3 != 0 && f3 != 4 && (k = csr_index(insn >> 20)) >= 0) {
         static const int cop[8] = { -1, 0, 1, 2, -1, 3, 4, 5 };
-        hits[COV_G_CSR][idx(COV_G_CSR, cop[f3], k, ((insn >> 15) & 31) != 0)]++;
+        hits[COV_G_CSR][idx(COV_G_CSR, cop[f3], k, ((insn >> 15) & 31) != 0)] = 1;
     }
     if ((!trap || mis_trap) && (op == 0x03 || op == 0x23)) {
         const int32_t imm = op == 0x03 ? (int32_t)insn >> 20 : (((int32_t)insn >> 25) << 5) | (int32_t)((insn >> 7) & 31);
-        const int m = mis_bin(op, f3, (a + (uint32_t)imm) & 3);
-        if (m >= 0) hits[COV_G_MIS][m]++;
+        const int m = cov_mis_bin(op, f3, (a + (uint32_t)imm) & 3);
+        if (m >= 0) hits[COV_G_MIS][m] = 1;
     }
 }
 
@@ -262,23 +244,11 @@ void cov_plan(uint32_t raw, int compressed, uint32_t insn, cov_plan_t *p)
     }
 }
 
-void cov_run(const cov_plan_t *p, uint32_t a, uint32_t b)
-{
-    uint32_t *const h = &hits[0][0];
-    if (p->kind == 1) h[p->v + (unsigned)cov_class(a) * p->nc2 + (unsigned)cov_class(b)]++;
-    else if (p->kind == 2) h[p->v + (unsigned)cov_class(a) * p->nc2]++;
-    if (p->s0 != 0xFFFF) h[p->s0]++;
-    if (p->s1 != 0xFFFF) h[p->s1]++;
-    if (p->mop) {
-        const int m = mis_bin(p->mop, p->mf3, (a + (uint32_t)(int32_t)p->mimm) & 3);
-        if (m >= 0) hits[COV_G_MIS][m]++;
-    }
-}
 
 uint64_t cov_hash(void)
 {
     uint64_t x = 1469598103934665603ull;
-    for (unsigned i = 0; i < sizeof hits / sizeof hits[0][0]; i++) x = (x ^ (&hits[0][0])[i]) * 1099511628211ull;
+    for (unsigned i = 0; i < sizeof cov_hits / sizeof cov_hits[0]; i++) x = (x ^ cov_hits[i]) * 1099511628211ull;
     return x;
 }
 

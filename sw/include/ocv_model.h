@@ -33,6 +33,7 @@
 
 typedef struct ocv_model_io ocv_model_io_t;
 struct ocv_fold;                                /* (ocv.h) */
+struct ocv_squash;                              /* (ocv.h: a squashed channel's open window) */
 struct ocv_model_io {
     /* Expect this record next on output channel ch. */
     void (*emit)(ocv_model_io_t *io, int ch, const uint32_t *rec);
@@ -54,6 +55,12 @@ struct ocv_model_io {
      * ends inside the piece...): then emit them as records. */
     int  (*fold_make)(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride, struct ocv_fold *f);
     int  (*emit_fold)(ocv_model_io_t *io, int ch, const struct ocv_fold *f);
+    /* Optional (NULL: not offered): output channel ch's window state, NULL if records of this channel must go
+     * through emit (not squashed, --overlap); squash_close: the window is full (n == window, last set): the
+     * runner takes it as one fused record and starts the next. Records emitted with emit / emit_n go into the
+     * same state, in order. */
+    struct ocv_squash *(*squash)(ocv_model_io_t *io, int ch);
+    void (*squash_close)(ocv_model_io_t *io, int ch);
 };
 
 typedef struct {

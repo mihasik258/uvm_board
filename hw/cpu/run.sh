@@ -88,6 +88,7 @@ case $MODE in
         python3 "$OCV/gen/ocv_gen.py" "$DESC" -o "$P/gen" > "$P/gen.log"
         if [ "$A" = aarch64 ]; then CC=aarch64-linux-gnu-gcc; F="-O3 -mcpu=cortex-a72 -flto -fno-stack-protector -fno-pie -no-pie -U_FORTIFY_SOURCE -static"
         else CC=cc; F="-O3 -march=native -flto -fno-stack-protector -U_FORTIFY_SOURCE"; fi
+        F="$F ${OCV_BENCH_EXTRA:-}"            # (e.g. -g: lines for a profile; the code stays the same)
         # shellcheck disable=SC2086
         $CC -std=c99 $F -Wall -Wextra -Werror -D_POSIX_C_SOURCE=200809L -I"$OCV/sw/include" -I"$P/gen" $MODEL_CFLAGS \
             "$OCV/hw/cpu/pc/bench_model.c" "$OCV/sw/lib/ocv.c" "$OCV/models/cpu/ocv_cpu_model.c" $MODEL_SRCS \
