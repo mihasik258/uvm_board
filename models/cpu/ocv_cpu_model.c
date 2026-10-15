@@ -711,7 +711,7 @@ static void run_program(ocv_model_io_t *io)
 #define NEXT_IRQ() do { \
         uint32_t ir_[CPU_REC_WORDS]; \
         irq_seq = ~0ull; \
-        if (irq_f && io->observed(io, irq_ch, irq_j, ir_)) { \
+        if (irq_f && (io->peek ? io->peek : io->observed)(io, irq_ch, irq_j, ir_)) { \
             irq_cause = (uint32_t)ocv_get_raw(ir_, irq_f[0]); \
             irq_seq = ocv_get_raw(ir_, irq_f[1]); \
             irq_cycle = irq_cy ? ocv_get_raw(ir_, irq_cy) : 0; \
@@ -726,6 +726,15 @@ static void run_program(ocv_model_io_t *io)
     cpu_block_t bv;
     uint32_t s_raw = 0, s_insn = 0, s_a = 0, s_b = 0;   /* (a model without gives_src: read before its step) */
     uint64_t next_ask = 0xFFFF;
+    /* the DUT running alongside (interleaved: io->progress): no interrupt record yet means none before what the
+     * DUT has issued so far, less a margin (its records reach memory long before 64K more instructions): the
+     * model runs up to irq_bound and then looks again; without a DUT running, the bound is infinite */
+    enum { IRQ_MARGIN = 65536, IRQ_AHEAD = 512 };
+    uint64_t irq_bound = UINT64_MAX, next_idle = 16384;
+    int iss_ch = -1;
+    for (int s = 0; s < CPU_N_STREAMS && iss_ch < 0; s++)
+        if (cpu_streams[s].kind == CPU_S_ISSUE || cpu_streams[s].kind == CPU_S_RETIRE) iss_ch = cpu_streams[s].channel;
+    if (io->progress && iss_ch >= 0 && irq_f) irq_bound = 0;
     uint64_t order = 0;
     const cpu_region_t *last_rg = NULL;
     const int gives_src = cpu->impl->gives_src;
@@ -794,6 +803,15 @@ static void run_program(ocv_model_io_t *io)
         /* no interrupt known yet: ask again now and then - a testbench running the core alongside the model
          * (tb_pc) answers only as far as the core has run (not yet = none) */
         if (n >= next_ask) { next_ask = n + 0x10000; if (irq_f && irq_seq == ~0ull) NEXT_IRQ(); }
+        if (io->idle && n >= next_idle) { next_idle = n + 16384; io->idle(io); }   /* (interleaved: the DUT goes on) */
+        while (irq_seq == ~0ull && issued + IRQ_AHEAD >= irq_bound) {   /* at the bound: what has the DUT done */
+            const uint64_t p = io->progress(io, iss_ch);
+            NEXT_IRQ();                        /* (after progress: a record from before it is in by now) */
+            if (irq_seq != ~0ull || p == UINT64_MAX) { if (p == UINT64_MAX) irq_bound = UINT64_MAX; break; }
+            irq_bound = p > IRQ_MARGIN ? p - IRQ_MARGIN : 0;
+            if (issued + IRQ_AHEAD < irq_bound) break;
+            io->idle(io);                      /* the DUT is not far enough ahead: let it run */
+        }
         if (irq_seq != ~0ull && irq_seq - issued < 256) cpu_sync(cpu, irq_seq - issued + 64);   /* (traps: not issued) */
         while (irq_f && irq_seq == issued) {   /* the core took an interrupt here: so does the model */
             if (trace) fprintf(trace, "interrupt %u before issue %llu at pc %08x\n", irq_cause,

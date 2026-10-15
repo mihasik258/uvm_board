@@ -110,6 +110,14 @@ typedef struct {
     uint64_t        max_polls;
     uint32_t        window;     /* --squash: records per fused record */
     int             obs_squash; /* the model asked for DUT records it cannot see in squash mode */
+    /* interleaved (not --overlap, not --no-interleave): the model runs in this thread while the DUT runs,
+     * making poll passes itself (io->idle, and while it waits for a DUT record in observed()) */
+    int             interleave, il_active, il_quiet;
+    uint32_t        settle, il_settled;
+    uint64_t        il_polls;
+    uint32_t       *il_prev;    /* per channel: count at the last pass (what "moved" compares) */
+    uint64_t       *taken_hi;   /* per channel: TAKEN's wraps (a 64-bit count of a squashed channel) */
+    uint32_t       *taken_lo;
 } run_t;
 
 static int    exec_argc;          /* the main's command line, to run again for a squash replay */
@@ -270,9 +278,66 @@ static void squash_close(ocv_model_io_t *io, int ch)
     q->sq.n = 0;
 }
 
-static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec)
+/* interleaved: one pass over the channels as the wait loop makes it (records in, answers out, full buffers
+ * restarted) - the DUT goes on while the model runs; quiet once nothing moved for --settle passes with all
+ * stimulus taken (or after --max-polls passes: then the wait loop after the model reports it) */
+static uint32_t react_new(run_t *r, int ch);
+static void collect(run_t *r, int ch, int restart);
+static void il_poll(run_t *r)
+{
+    const ocv_dut_t *dut = r->env.dut;
+    int quiet = 1;
+    for (int ch = 0; ch < dut->n_channels; ch++) {
+        const ocv_channel_t *c = &dut->channels[ch];
+        uint32_t n;
+        if (c->kind == OCV_CH_SOURCE) {
+            if (ocv_ep_rd(&r->env, ch, OCV_EP_REG_STATUS) & OCV_SRC_ST_DONE) continue;
+            quiet = 0;
+            continue;
+        } else if (r->reactive && !(r->react_skip_squash && c->squash)) {
+            if (react_new(r, ch)) quiet = 0;
+            continue;
+        }
+        n = ocv_ep_rd(&r->env, ch, OCV_EP_REG_COUNT);
+        if (ocv_ring_on(&r->env, ch)) {
+            if (n != r->env.ep[ch].tail) collect(r, ch, 0);
+        } else if (c->lossless && n == c->depth) {
+            collect(r, ch, 1);
+            r->q[ch].drains++;
+            n = ~0u;
+        }
+        if (c->squash && n != ~0u) n = ocv_ep_rd(&r->env, ch, OCV_EP_REG_TAKEN);
+        if (n != r->il_prev[ch]) quiet = 0;
+        r->il_prev[ch] = n;
+    }
+    r->il_settled = quiet ? r->il_settled + 1 : 0;
+    if (r->il_settled >= r->settle || ++r->il_polls >= r->max_polls) r->il_quiet = 1;
+}
+static void idle(ocv_model_io_t *io)
 {
     run_t *r = io->priv;
+    if (r->il_active && !r->il_quiet) il_poll(r);
+}
+/* how many records the DUT has made on output channel ch so far (squashed: taken by its endpoint);
+ * UINT64_MAX once it is quiet (or the model runs after it): all it will make are there */
+static uint64_t progress(ocv_model_io_t *io, int ch)
+{
+    run_t *r = io->priv;
+    const ocv_channel_t *c = &r->env.dut->channels[ch];
+    if (!r->il_active || r->il_quiet) return UINT64_MAX;
+    if (!c->squash) return r->q[ch].got.n;
+    const uint32_t t = ocv_ep_rd(&r->env, ch, OCV_EP_REG_TAKEN);
+    if (t < r->taken_lo[ch]) r->taken_hi[ch] += 1ull << 32;
+    r->taken_lo[ch] = t;
+    return r->taken_hi[ch] + t;
+}
+
+static int observed_at(run_t *r, int ch, uint32_t index, uint32_t *rec, int wait);
+static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec) { return observed_at(io->priv, ch, index, rec, 1); }
+/* observed() without waiting for the DUT: 0 if the record is not there yet */
+static int peek(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec) { return observed_at(io->priv, ch, index, rec, 0); }
+static int observed_at(run_t *r, int ch, uint32_t index, uint32_t *rec, int wait)
+{
     const ocv_channel_t *c = &r->env.dut->channels[ch];
     if (c->kind == OCV_CH_SOURCE) return 0;
     if (c->squash && r->window > 1) { r->obs_squash = 1; return 0; }   /* single records are not seen */
@@ -282,6 +347,7 @@ static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec)
         memcpy(rec, g, c->rec_words * 4u);
         return 1;
     }
+    if (wait) while (index >= r->q[ch].got.n && r->il_active && !r->il_quiet) il_poll(r);   /* (interleaved) */
     if (index >= r->q[ch].got.n) return 0;
     memcpy(rec, r->q[ch].got.w + (size_t)index * r->q[ch].qw, c->rec_words * 4u);
     return 1;
@@ -571,6 +637,7 @@ static void usage(const char *prog)
             "  --ring-bytes N      at most N bytes per DMA ring (default: an even share of the DMA memory)\n"
             "                      (default: on when an output channel is lossless, i.e. streams during the run)\n"
             "  --no-overlap        model after the DUT, in the same thread\n"
+            "  --no-interleave     (without --overlap) the model after the DUT, not while it runs\n"
             "  --info              check the hub, endpoints and bus against the metadata; run nothing\n"
             "  --squash N          channels built with \"squash\": compare fused windows of N records (signatures);\n"
             "                      a differing window is located by running again with --squash 1 (default 1)\n", prog);
@@ -639,6 +706,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
     const ocv_dut_t *dut = ocv_model_dut;
     uint64_t batches = 1, seed = 1, max_polls = 10000000, stall_polls = 100000, max_cycles = 0;
     uint32_t batch = 0, thr_in = 0, thr_out = 0, thr_stream = 0;
+    int no_interleave = getenv("OCV_NO_INTERLEAVE") != NULL;
     int reset_each = 0, context = 3, quiet = 0, settle = 32, profile = 0, no_block = 0, slow_compare = 0, overlap = -1, no_dma = 0;
     size_t ring_bytes = 0;
     uint32_t window = 1;
@@ -678,6 +746,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
         else if (!strcmp(o, "--slow-compare"))     slow_compare = 1;
         else if (!strcmp(o, "--overlap"))          overlap = 1;
         else if (!strcmp(o, "--no-overlap"))       overlap = 0;
+        else if (!strcmp(o, "--no-interleave"))    no_interleave = 1;
         else if (!strcmp(o, "--info"))             return ocv_hub_info(bus, dut, stdout) ? 1 : 0;
         else { usage(argv[0]); return 1; }
     }
@@ -738,6 +807,12 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
             if (dut->channels[ch].kind != OCV_CH_SOURCE && dut->channels[ch].lossless) overlap = 1;
     }
     r.overlap = overlap;
+    /* not overlapped: the model still runs while the DUT does - in this thread, polling as it goes */
+    r.interleave = !overlap && !no_interleave;
+    r.settle = (uint32_t)settle;
+    r.il_prev = calloc(dut->n_channels, sizeof *r.il_prev);
+    r.taken_hi = calloc(dut->n_channels, sizeof *r.taken_hi);
+    r.taken_lo = calloc(dut->n_channels, sizeof *r.taken_lo);
     r.max_polls = max_polls;
     r.seen = calloc(dut->n_channels, sizeof *r.seen);
     r.stream_n = calloc(dut->n_channels, sizeof *r.stream_n);
@@ -789,7 +864,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
     /* (OCV_NO_EMITN=1: records one by one, emit() - to tell the batched path apart when something differs) */
     ocv_model_io_t io = { emit, observed, &r, send_rec, 0, getenv("OCV_NO_EMITN") ? NULL : emit_n,
                           getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold,
-                          getenv("OCV_NO_SQPUSH") ? NULL : squash, squash_close };
+                          getenv("OCV_NO_SQPUSH") ? NULL : squash, squash_close, peek, progress, idle };
     r.io = &io;
     uint64_t rng = seed ? seed : 1, stim_total = 0, cycles = 0, polls_total = 0, done_batches = 0;
     double t0 = now_s();
@@ -900,6 +975,15 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                 RUN_END(1);
             }
         }
+        /* interleaved: the model now, while the DUT runs (it polls the DUT itself); the wait below then
+         * only sees the DUT go quiet */
+        if (r.interleave) {
+            for (int ch = 0; ch < dut->n_channels; ch++) { r.il_prev[ch] = ~0u; r.taken_hi[ch] = 0; r.taken_lo[ch] = 0; }
+            r.il_active = 1; r.il_quiet = 0; r.il_settled = 0; r.il_polls = 0;
+            phase(PH_MODEL);
+            model_thread(&r);
+            r.il_active = 0;
+        }
         phase(PH_WAIT);
         uint64_t polls = 0, still = 0;         /* polls without any channel moving */
         const uint64_t cyc0 = max_cycles ? ocv_cycles(&r.env) : 0;
@@ -1003,7 +1087,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                 for (unsigned k = 0; k < q->n_retired; k++) free(q->retired[k]);
                 q->n_retired = 0;
             }
-        } else {
+        } else if (!r.interleave) {
             model_thread(&r);
         }
         for (int ch = 0; ch < dut->n_channels; ch++) {          /* squash: the model's open windows */
@@ -1128,6 +1212,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
 
     for (int ch = 0; ch < dut->n_channels; ch++) { free(r.q[ch].exp.w); free(r.q[ch].got.w); free(r.stim[ch]); }
     for (int ch = 0; ch < dut->n_channels; ch++) free(r.mask[ch]);
+    free(r.il_prev); free(r.taken_hi); free(r.taken_lo);
     for (int ch = 0; ch < dut->n_channels; ch++) free(r.q[ch].retired);
     free(r.mask); free(r.by_mask); free(r.seen); free(r.stream_n); free(r.dirty); free(r.answers);
     free(r.q); free(r.stim); free(r.n_stim); free(r.order); free(stim_index);

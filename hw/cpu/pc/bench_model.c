@@ -110,7 +110,7 @@ int main(int argc, char **argv)
         sqs[ch].window = window; sqs[ch].words = ocv_model_dut->channels[ch].rec_words; sqs[ch].mask = ones;
     }
     ocv_model_io_t io = { emit, observed, NULL, send, 0, emit_n, getenv("OCV_NO_FOLD") ? NULL : fold_make, emit_fold,
-                          getenv("OCV_NO_SQPUSH") ? NULL : squash, squash_close };
+                          getenv("OCV_NO_SQPUSH") ? NULL : squash, squash_close, NULL, NULL, NULL };
     uint64_t rng = 1, idx[256] = { 0 };
     double t_stim = 0, t_model = 0;
     uint32_t rec[64];

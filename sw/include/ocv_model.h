@@ -61,6 +61,14 @@ struct ocv_model_io {
      * same state, in order. */
     struct ocv_squash *(*squash)(ocv_model_io_t *io, int ch);
     void (*squash_close)(ocv_model_io_t *io, int ch);
+    /* Optional (NULL: not offered). The runner may run input() while the DUT runs (interleaved): observed()
+     * then waits for a record the DUT has not made yet (polling it), until the DUT is quiet. peek: observed()
+     * without waiting (0: not there yet). progress: records the DUT has made on output channel ch so far,
+     * UINT64_MAX when it will make no more (quiet, or input() runs after it). idle: let the runner poll the DUT
+     * once - a model calls it now and then on long runs, so its buffers drain and it goes on. */
+    int      (*peek)(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec);
+    uint64_t (*progress)(ocv_model_io_t *io, int ch);
+    void     (*idle)(ocv_model_io_t *io);
 };
 
 typedef struct {
