@@ -27,12 +27,17 @@
 typedef cpu_bout_t jout_t;                 /* what a block's code computes, per instruction */
 typedef cpu_bins_t jins_t;                 /* the translation's table, per instruction (cpu_model.h) */
 
+
+enum { JP_ENTER, JP_ARG, JP_OP, JP_OUT, JP_CVA, JP_CVB, JP_CVBIN, JP_CVS, JP_CVM, JP_REC, JP_EXIT, JP_N };
+
 typedef struct jblock {
     int (*fn)(void *state, jout_t *out);
     int (*fnf)(void *state, jout_t *out);  /* the same doing cpu_fuse_t's work too (NULL: not translated so) */
     uint32_t n;                            /* instructions translated (0: the first one is not) */
     uint16_t cntf[2];                      /* records per fused stream, one whole run */
     jins_t  *ins;                          /* in the pool */
+    /* OCV_JIT_STATS=phases: where the generated code's words go (weighted by the block's runs at the end) */
+    uint32_t runs, runsf; uint16_t ph[JP_N], phf[JP_N];
 } jblock_t;
 
 #define JIT_BLOCKS  (1u << 16)
@@ -61,16 +66,33 @@ typedef struct {
     uint64_t   single;                     /* cpu_sync: instructions still to run one by one */
     int        smc;                        /* a store hit translated code */
     uint64_t   n_blocks, n_trans, n_flush, n_interp, n_cold, n_fused;   /* OCV_JIT_STATS: printed at the end */
+    int        phstats;                  /* count where the generated code's words go */
+    FILE      *phfile;                   /* OCV_JIT_PHASES: a line per block (start nw off[]) */
     /* for the generated code: [x19 + JIT_OFF_*] */
     uint8_t   *host[2]; uint64_t base[2], size[2]; uint8_t *cmap[2];
     uint8_t   *cov; uint32_t *fst[2];     /* fused code: the coverage bins, the windows' state */
 } jit_t;
 
 /* ---------------------------------------------------------------- AArch64 encoder */
-typedef struct { uint32_t *p, *end; int ok; } em_t;
+#define JIT_IV 4096
+typedef struct {
+    uint32_t *p, *end, *b0, *start; int ok; uint32_t ph[16]; int tag; uint32_t ngreg, nregw;
+    uint32_t niv; uint16_t iv_off[JIT_IV]; uint8_t iv_tag[JIT_IV];   /* the phase intervals of this range */
+} em_t;
 static void emit(em_t *e, uint32_t w) { if (e->p < e->end) *e->p++ = w; else e->ok = 0; }
+static void mark(em_t *e)                                      /* close the phase into an interval */
+{
+    const uint32_t n = (uint32_t)(e->p - e->b0);
+    e->ph[e->tag] += n;
+    if (n && e->niv < JIT_IV) { e->iv_off[e->niv] = (uint16_t)(e->b0 - e->start); e->iv_tag[e->niv] = (uint8_t)e->tag; e->niv++; }
+    e->b0 = e->p;
+}
+static void set_ph(em_t *e, int tag) { if (tag != e->tag) { mark(e); e->tag = tag; } }
 
 enum { W0 = 0, W1, W2, W3, W4, W5, W6, W7, W8, W9, W10, W11, XO = 14, XS = 15, XZR = 31 };   /* x15: jit_t, x14: out */
+/* the fused code keeps the open windows' CRCs in callee-saved registers through the whole block (saved in the
+ * prologue, written back and restored at every exit): stream 0 in x19/x20, stream 1 in x21/x22 */
+enum { CZ0 = 19, WC0 = 20, CZ1 = 21, WC1 = 22 };
 
 static void movw(em_t *e, int rd, uint32_t v)                  /* 32-bit constant */
 {
@@ -95,6 +117,7 @@ static void ldr_x(em_t *e, int rt, int rn, uint32_t off) { emit(e, 0xF9400000u |
 static int greg(em_t *e, int host, int g)
 {
     if (!g) return XZR;
+    e->ngreg++;
     ldr_w(e, host, XS, (uint32_t)OFF_X + 4u * (uint32_t)g);
     return host;
 }
@@ -132,8 +155,9 @@ static void add_imm(em_t *e, int rd, int rn, uint32_t v, int tmp)          /* wd
 }
 
 /* wd = the coverage class of ws (cpu_fuse_t.cls; ws XZR: 0); w16 scratch. Most values take no branch. */
-static void fz_class(em_t *e, const cpu_fuse_t *f, int wd, int ws)
+static void fz_class(em_t *e, const cpu_fuse_t *f, int wd, int ws, int tag)
 {
+    set_ph(e, tag);
     if (ws == XZR) { movw(e, wd, f->cls[0]); return; }
     emit(e, 0x11000400u | ((uint32_t)ws << 5) | W16);          /* add w16, ws, #1 */
     emit(e, 0x7100081Fu | (W16 << 5));                         /* cmp w16, #2 */
@@ -167,19 +191,22 @@ static int fz_cov(em_t *e, const cpu_fuse_t *f, const cpu_covp_t *p, int va, int
     for (int o = 0; o < 4; o++) mis |= p->mis[o] != 0xFFFF;
     if ((p->kind && va < 0) || (p->kind == 1 && vb < 0) || (mis && !has_addr)) return 0;
     if (p->kind) {
-        fz_class(e, f, W13, va);
-        if (p->kind == 1) fz_class(e, f, W10, vb);
+        fz_class(e, f, W13, va, JP_CVA);
+        if (p->kind == 1) fz_class(e, f, W10, vb, JP_CVB);
+        set_ph(e, JP_CVBIN);
         movw(e, W16, p->nc2);
         emit(e, 0x1B000000u | (W16 << 16) | ((uint32_t)(p->kind == 1 ? W10 : XZR) << 10) | (W13 << 5) | W16);  /* madd w16, w13, w16, w10|wzr */
         add_imm(e, W16, W16, p->v, W11);
         movw(e, W17, 1); strb_reg(e, W17, W12, W16);
     }
+    set_ph(e, JP_CVS);
     for (int k = 0; k < 2; k++) {
         const uint16_t b = k ? p->s1 : p->s0;
         if (b == 0xFFFF) continue;
         movw(e, W16, b); movw(e, W17, 1); strb_reg(e, W17, W12, W16);
     }
     if (mis) {
+        set_ph(e, JP_CVM);
         emit(e, 0x12000400u | (W3 << 5) | W16);                /* and w16, w3, #3 */
         movw(e, W17, 1);
         for (uint32_t o = 0; o < 4; o++) {
@@ -222,26 +249,40 @@ static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v)
     }
     for (uint32_t w = 0; w < fs->words; w++)
         if (fs->mask[w] != ~0u) { movw(e, W17, fs->mask[w]); dp3(e, ANDW, wr[w], wr[w], W17); }
-    ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));   /* (not x9: a jump's next pc is there) */
-    ldr_w(e, W0, W17, 4); ldr_w(e, W5, W17, 8);
+    const int c0 = s ? WC1 : WC0, c1 = s ? CZ1 : CZ0;          /* (in registers since the prologue) */
     uint32_t w = 0;
     for (; w + 1 < fs->words; w += 2) {
         emit(e, 0xAA000000u | ((uint32_t)wr[w + 1] << 16) | (32u << 10) | ((uint32_t)wr[w] << 5) | (uint32_t)wr[w]);   /* orr xa, xa, xb, lsl #32 */
-        emit(e, 0x9AC05C00u | ((uint32_t)wr[w] << 16) | (W0 << 5) | W0);   /* crc32cx w0, w0, xa */
-        emit(e, 0x9AC04C00u | ((uint32_t)wr[w] << 16) | (W5 << 5) | W5);   /* crc32x w5, w5, xa */
+        emit(e, 0x9AC05C00u | ((uint32_t)wr[w] << 16) | (c0 << 5) | c0);   /* crc32cx */
+        emit(e, 0x9AC04C00u | ((uint32_t)wr[w] << 16) | (c1 << 5) | c1);   /* crc32x */
     }
     if (w < fs->words) {
-        emit(e, 0x1AC05800u | ((uint32_t)wr[w] << 16) | (W0 << 5) | W0);   /* crc32cw */
-        emit(e, 0x1AC04800u | ((uint32_t)wr[w] << 16) | (W5 << 5) | W5);   /* crc32w */
+        emit(e, 0x1AC05800u | ((uint32_t)wr[w] << 16) | (c0 << 5) | c0);   /* crc32cw */
+        emit(e, 0x1AC04800u | ((uint32_t)wr[w] << 16) | (c1 << 5) | c1);   /* crc32w */
     }
-    str_w(e, W0, W17, 4); str_w(e, W5, W17, 8);
 }
 
 /* ---------------------------------------------------------------- translation */
 
-/* exit before instruction k (not executed): pc = its pc, return k */
-static void exit_before(em_t *e, uint32_t pc, uint32_t k)
+/* the fused code's way out: the windows' CRCs back into their state, x19..x22 as they were */
+static void fz_crc_out(em_t *e, const cpu_fuse_t *fz)
 {
+    if (!fz || !fz->nstreams) return;
+    ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 0));
+    str_w(e, WC0, W17, 4); str_w(e, CZ0, W17, 8);
+    if (fz->nstreams > 1) {
+        ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8));
+        str_w(e, WC1, W17, 4); str_w(e, CZ1, W17, 8);
+    }
+    emit(e, 0xA9410000u | (2u << 15) | (22u << 10) | (31u << 5) | 21u);   /* ldp x21, x22, [sp, #16] */
+    emit(e, 0xA8C00000u | (4u << 15) | (20u << 10) | (31u << 5) | 19u);   /* ldp x19, x20, [sp], #32 */
+}
+
+/* exit before instruction k (not executed): pc = its pc, return k */
+static void exit_before(em_t *e, const cpu_fuse_t *fz, uint32_t pc, uint32_t k)
+{
+    set_ph(e, JP_EXIT);
+    fz_crc_out(e, fz);
     movw(e, W9, pc); str_w(e, W9, XS, OFF_PC);
     movw(e, W0, k);
     emit(e, 0xD65F03C0u);           /* ret */
@@ -322,13 +363,25 @@ static int is_code(jit_t *j, uint32_t a, uint32_t n)
  * b->cntf; 0 if it cannot be translated so */
 static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
 {
-    em_t e = { (uint32_t *)j->code_cur, (uint32_t *)j->code_end, 1 };
+    em_t e = { 0 };
+    e.p = e.b0 = e.start = (uint32_t *)j->code_cur; e.end = (uint32_t *)j->code_end; e.ok = 1; e.tag = JP_ENTER;
     uint32_t *start = e.p;
     const uint32_t n0 = b->n;
     if (fz) { b->cntf[0] = b->cntf[1] = 0; }
     emit(&e, 0xAA0003EFu);              /* mov x15, x0: jit_t */
     emit(&e, 0xAA0103EEu);              /* mov x14, x1: out */
     if (fz && fz->cov) ldr_x(&e, W12, XS, OFF_COV);   /* x12: the coverage bins */
+    if (fz && fz->nstreams > 0) {                 /* the windows' CRCs, kept in registers through the block */
+        emit(&e, 0xA9800000u | ((-4u & 0x7Fu) << 15) | (20u << 10) | (31u << 5) | 19u);   /* stp x19, x20, [sp, #-32]! */
+        emit(&e, 0xA9010000u | (2u << 15) | (22u << 10) | (31u << 5) | 21u);             /* stp x21, x22, [sp, #16] */
+        ldr_x(&e, W17, XS, (uint32_t)(OFF_FST + 0));
+        ldr_w(&e, WC0, W17, 4); ldr_w(&e, CZ0, W17, 8);
+        if (fz->nstreams > 1) {
+            ldr_x(&e, W17, XS, (uint32_t)(OFF_FST + 8));
+            ldr_w(&e, WC1, W17, 4); ldr_w(&e, CZ1, W17, 8);
+        }
+    }
+    set_ph(&e, JP_OP);
     uint32_t *miss_patches[2 * JIT_MAX], miss_target[2 * JIT_MAX];   /* region miss; cva6: misaligned */
     int nmiss = 0;
     uint32_t p = pc;
@@ -347,6 +400,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
         I->rd = (d->rd && d->op != OP_SB && d->op != OP_SH && d->op != OP_SW && d->op != OP_SNONE &&
                  !(d->op >= OP_BEQ && d->op <= OP_BGEU) && d->op != OP_FENCE) ? d->rd : 0;
         const uint32_t ob = 16u * k;                              /* this instruction's jout_t */
+        set_ph(&e, JP_OP);                                        /* (the instruction's own code) */
         int ra, rb, wr = 1;                                       /* wr: w2 holds the result for rd */
         int va = -1, vb = -1, addr = 0;                           /* (fused: where the operands are) */
         switch (d->op) {
@@ -406,6 +460,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
             }
             emit(&e, st[d->op - OP_SB]);
             /* out: address, data masked to the width */
+            set_ph(&e, JP_OUT);
             str_w(&e, W3, XO, ob + 8);
             if (n == 1) emit(&e, 0x12001C21u);                      /* and w1, w1, #0xff */
             else if (n == 2) emit(&e, 0x12003C21u);                 /* and w1, w1, #0xffff */
@@ -416,7 +471,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
                 emit(&e, 0x38666906u);                                  /* ldrb w6, [x8, x6] */
                 uint32_t *cb = e.p; emit(&e, 0x34000006u);               /* cbz w6, cont (patched) */
                 movw(&e, W9, 1); str_w(&e, W9, XS, OFF_SMC);
-                exit_before(&e, p + d->len, k + 1);
+                exit_before(&e, fz, p + d->len, k + 1);
                 *cb = 0x34000006u | ((uint32_t)((e.p - cb) & 0x7FFFF) << 5);
             }
             I->store = (uint8_t)n; wr = 0;
@@ -483,17 +538,22 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
             break;
         }
         if (wr && I->rd) {
-            str_w(&e, W2, XS, OFF_X + 4u * I->rd);
+            set_ph(&e, JP_OUT);
+            str_w(&e, W2, XS, OFF_X + 4u * I->rd); e.nregw++;
             str_w(&e, W2, XO, ob);
         }
-        if (I->dyn_next) str_w(&e, W9, XO, ob + 4);
+        if (I->dyn_next) { set_ph(&e, JP_OUT); str_w(&e, W9, XO, ob + 4); }
+        set_ph(&e, JP_OP);
         I->m_next = I->dyn_next ? ~0u : 0; I->m_rd = I->rd ? ~0u : 0; I->m_store = I->store ? ~0u : 0;
         if (fz) {                                                 /* coverage, then the records */
+            set_ph(&e, (fz->cov ? JP_CVA : JP_REC));
             if (fz->cov) {
+                set_ph(&e, JP_CVA);
                 cpu_covp_t cp;
                 fz->cov_plan(I->len == 2 ? I->raw : I->insn & 0xFFFFu, I->len == 2, I->insn, &cp);
                 if (!fz_cov(&e, fz, &cp, va, vb, addr)) return 0;
             }
+            set_ph(&e, JP_REC);
             for (int s = 0; s < fz->nstreams; s++) {
                 const cpu_fstream_t *fs = &fz->s[s];
                 if (!fs->store) {
@@ -519,6 +579,8 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
         b->n = k + 1;
         p += d->len;
         if (ends_block(d)) {
+            set_ph(&e, JP_EXIT);
+            fz_crc_out(&e, fz);
             if (d->op == OP_JAL) movw(&e, W9, I->next);
             str_w(&e, W9, XS, OFF_PC);
             movw(&e, W0, k + 1);
@@ -526,16 +588,41 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
             goto done;
         }
     }
-    exit_before(&e, p, b->n);                                     /* no branch: continue at p */
+    exit_before(&e, fz, p, b->n);                                     /* no branch: continue at p */
 done:
     for (int i = 0; i < nmiss; i++) {                             /* device registers: out before k */
         patch_bcond(miss_patches[i], e.p);
-        exit_before(&e, b->ins[miss_target[i]].pc, miss_target[i]);
+        exit_before(&e, fz, b->ins[miss_target[i]].pc, miss_target[i]);
     }
     if (!e.ok || b->n == 0 || (fz && b->n != n0)) return 0;
+    set_ph(&e, JP_N - 1); mark(&e);              /* (the last one) */
     __builtin___clear_cache((char *)start, (char *)e.p);
     int (*fn)(void *, jout_t *) = (int (*)(void *, jout_t *))(void *)start;
+    for (int i = 0; i < JP_N; i++) {
+        const uint16_t w = (uint16_t)e.ph[i];
+        if (fz) b->phf[i] = w; else b->ph[i] = w;
+    }
     if (fz) b->fnf = fn; else b->fn = fn;
+    if (getenv("OCV_JIT_DUMPCODE")) {            /* the raw code words of this range, with the phase intervals */
+        FILE *f = fopen(getenv("OCV_JIT_DUMPCODE"), "ab");
+        if (f) {
+            uint32_t w = 0x4F43564A;               /* header: magic, nwords, niv */
+            uint32_t nw = (uint32_t)(e.p - start);
+            fwrite(&w, 4, 1, f); fwrite(&nw, 4, 1, f); fwrite(&e.niv, 4, 1, f);
+            for (uint32_t i = 0; i < e.niv; i++) {
+                uint32_t o2 = e.iv_off[i], t = e.iv_tag[i];
+                fwrite(&o2, 4, 1, f); fwrite(&t, 4, 1, f);
+            }
+            fwrite(start, 4, nw, f);
+            fclose(f);
+        }
+    }
+    if (j->phfile) {                             /* every code range (the plain and the fused copy), by phase */
+        fprintf(j->phfile, "%llx %u %u", (unsigned long long)(uintptr_t)start, (uint32_t)(e.p - start),
+                (unsigned)e.niv);
+        for (uint32_t i = 0; i < e.niv; i++) fprintf(j->phfile, " %u %u", e.iv_off[i], e.iv_tag[i]);
+        fprintf(j->phfile, "\n");
+    }
     j->code_cur = (uint8_t *)e.p;
     return 1;
 }
@@ -624,6 +711,7 @@ static int run_next(jit_t *j, cpu_retire_t *r)
                 }
             const uint32_t n = (uint32_t)(fused ? b->fnf : b->fn)(j, j->out);
             j->cur_fused = fused; j->n_fused += (uint64_t)fused;
+            b->runs++; if (fused) b->runsf++;
             if (n) {
                 j->n_blocks++;
                 j->cur = b->ins; j->cur_n = n; j->cur_i = 0; j->cur_order = j->f.order;
@@ -689,7 +777,30 @@ static void jit_destroy(cpu_model_t *mm)
                 (unsigned long long)j->n_blocks, j->n_blocks ? (double)(j->f.order - j->n_interp) / (double)j->n_blocks : 0.0,
                 (unsigned long long)j->n_trans, (unsigned long long)j->n_flush, (unsigned long long)j->n_interp,
                 (unsigned long long)j->n_cold, (unsigned long long)j->n_fused);
+    if (j->phstats) {
+        static const char *const nm[JP_N] = { "enter", "arg", "op+mem", "out", "cov.classA", "cov.classB", "cov.bin", "cov.s0s1", "cov.mis", "rec", "exit" };
+        uint64_t w[JP_N] = { 0 }, wf[JP_N] = { 0 }, nin = 0;
+        for (uint32_t b = 0; b < j->nblocks; b++) {
+            const jblock_t *B = &j->blocks[b];
+            if (!B->n || (!B->runs && !B->runsf)) continue;
+            nin += (uint64_t)B->n * B->runs;
+            for (int i = 0; i < JP_N; i++) {
+                wf[i] += (uint64_t)B->phf[i] * B->runsf;                          /* the fused runs: fnf */
+                w[i] += (uint64_t)B->ph[i] * (B->runs - B->runsf) + (uint64_t)B->phf[i] * B->runsf;
+            }
+        }
+        double tot = 0, totf = 0;
+        for (int i = 0; i < JP_N; i++) { tot += (double)w[i]; totf += (double)wf[i]; }
+        fprintf(stderr, "jit: generated code: %.2f A72 words per RISC-V instruction (%llu instructions);"
+                " fused runs take %.2f\n", nin ? tot / (double)nin : 0.0, (unsigned long long)nin,
+                nin ? totf / (double)nin : 0.0);
+        for (int i = 0; i < JP_N; i++)
+            fprintf(stderr, "jit:   %-10s %6.2f  %4.1f%%  (of the fused runs %6.2f)\n", nm[i],
+                    nin ? (double)w[i] / (double)nin : 0.0, tot ? 100.0 * (double)w[i] / tot : 0.0,
+                    nin ? (double)wf[i] / (double)nin : 0.0);
+    }
     for (int i = 0; i < j->f.nreg; i++) { dec_put(&j->f.reg[i]); free(j->map[i]); free(j->code_map[i]); free(j->hits[i]); }
+    if (j->phfile) fclose(j->phfile);
     if (j->code) munmap(j->code, JIT_CODE);
     free(j->blocks); free(j->pool);
     free(j);
@@ -722,6 +833,8 @@ static cpu_model_t *jit_create(const char *isa, const cpu_env_t *env, uint32_t r
         snprintf(err, n, "jit: out of memory or no executable memory (mmap RWX)"); return NULL;
     }
     j->code_end = j->code + JIT_CODE; j->code_cur = j->code;
+    j->phstats = getenv("OCV_JIT_STATS") && !strcmp(getenv("OCV_JIT_STATS"), "phases");
+    if (getenv("OCV_JIT_PHASES")) j->phfile = fopen(getenv("OCV_JIT_PHASES"), "w");
     const char *hv = getenv("OCV_JIT_HOT");
     j->hot = hv ? (uint32_t)strtoul(hv, 0, 0) : 3;
     if (j->hot > 255) j->hot = 255;
