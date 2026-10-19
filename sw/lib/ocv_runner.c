@@ -175,6 +175,20 @@ static int wait_got(run_t *r, int ch, uint32_t index, uint32_t *rec)
     return 1;
 }
 
+#if defined(OCV_SQ_DUMP)
+/* (debugging: every record folded into a squashed channel's window, in order - channel, words; OCV_SQ_DUMP=<file>) */
+static uint32_t sq_dump_window;                /* (<file>.<window>: a replay does not overwrite the run) */
+static void sq_dump(int ch, const uint32_t *rec, uint32_t words)
+{
+    static FILE *f; static int init;
+    if (!init++ && getenv("OCV_SQ_DUMP")) {
+        char nm[512]; snprintf(nm, sizeof nm, "%s.%u", getenv("OCV_SQ_DUMP"), sq_dump_window);
+        f = fopen(nm, "wb");
+    }
+    if (!f) return;
+    uint32_t c = (uint32_t)ch; fwrite(&c, 4, 1, f); fwrite(rec, 4, words, f);
+}
+#endif
 static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
 {
     run_t *r = io->priv;
@@ -186,6 +200,9 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
     queue_t *q = &r->q[ch];
     uint32_t fused[259];
     if (c->squash) {                             /* fold into the window, as the endpoint does */
+#if defined(OCV_SQ_DUMP)
+        sq_dump(ch, rec, c->rec_words);
+#endif
         if (q->sq.n == 0) q->sq.c = q->sq.z = 0xFFFFFFFFu;
         ocv_squash_add(&q->sq.c, &q->sq.z, rec, r->mask[ch], c->rec_words);
         for (uint32_t j = 0; j < c->rec_words; j++) q->sq.last[j] = rec[j];   /* (a few words: no libc call) */
@@ -224,6 +241,9 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
     uint32_t a = q->sq.c, z = q->sq.z, k = q->sq.n;
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t *rec = recs + (size_t)i * stride;
+#if defined(OCV_SQ_DUMP)
+        sq_dump(ch, rec, W);
+#endif
         if (k == 0) a = z = 0xFFFFFFFFu;
         ocv_squash_add(&a, &z, rec, mask, W);
         if (++k < win) continue;
@@ -791,6 +811,9 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
         r.by_mask[ch] = !slow_compare && maskable;
     }
     r.window = window;
+#if defined(OCV_SQ_DUMP)
+    sq_dump_window = window;
+#endif
     /* Overlap pays off only when records stream in during the run (lossless channels are drained
      * while the DUT runs). Otherwise every record arrives in one drain at the end of the batch:
      * nothing to overlap with, and a thread per batch costs more than it saves (measured on the

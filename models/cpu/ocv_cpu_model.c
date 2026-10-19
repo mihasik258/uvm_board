@@ -880,7 +880,9 @@ static void run_program(ocv_model_io_t *io)
         if (io->idle && n >= next_idle) { next_idle = n + 16384; io->idle(io); }   /* (interleaved: the DUT goes on) */
         while (irq_seq == ~0ull && issued + IRQ_AHEAD >= irq_bound) {   /* at the bound: what has the DUT done */
             const uint64_t p = io->progress(io, iss_ch);
-            NEXT_IRQ();                        /* (after progress: a record from before it is in by now) */
+            if (io->idle) io->idle(io);        /* take in what the rings hold now: an interrupt record from before
+                                                * p is in memory by now, but not read until a poll pass */
+            NEXT_IRQ();
             if (irq_seq != ~0ull || p == UINT64_MAX) { if (p == UINT64_MAX) irq_bound = UINT64_MAX; break; }
             irq_bound = p > IRQ_MARGIN ? p - IRQ_MARGIN : 0;
             if (issued + IRQ_AHEAD < irq_bound) break;

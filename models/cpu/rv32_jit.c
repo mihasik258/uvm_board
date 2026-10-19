@@ -681,7 +681,9 @@ static inline void hand_out(jit_t *j, cpu_retire_t *r)
 
 /* the next unit: a translated block into the buffer (returns 1), or one instruction by the interpreter
  * into *r (returns 0) */
-static int run_next(jit_t *j, cpu_retire_t *r)
+/* fusable: the caller takes the block whole (jit_block) and so knows what the fused code did - handed out
+ * instruction by instruction (step, step_n) its records and coverage would be made twice */
+static int run_next(jit_t *j, cpu_retire_t *r, int fusable)
 {
     const uint32_t pc = j->f.pc;
     fregion_t *reg = j->single ? NULL : region_of(&j->f, pc, 2);   /* (cpu_sync: the interpreter) */
@@ -699,7 +701,7 @@ static int run_next(jit_t *j, cpu_retire_t *r)
             j->smc = 0;
             memcpy(j->x0, j->f.x, sizeof j->x0);
             /* the fused version when no window fills inside it (a full one is closed by the caller) */
-            int fused = b->fnf != NULL;
+            int fused = fusable && b->fnf != NULL;
             for (int s = 0; fused && s < j->fz->nstreams; s++) {
                 uint32_t *st = j->fz->s[s].state;
                 if (st[0] + b->cntf[s] >= st[3]) fused = 0;
@@ -737,14 +739,14 @@ static int run_next(jit_t *j, cpu_retire_t *r)
 static void jit_step(cpu_model_t *mm, cpu_retire_t *r)
 {
     jit_t *j = (jit_t *)mm;
-    if (j->cur_i < j->cur_n || run_next(j, r)) hand_out(j, r);   /* (else the interpreter filled *r) */
+    if (j->cur_i < j->cur_n || run_next(j, r, 0)) hand_out(j, r);   /* (else the interpreter filled *r) */
 }
 
 /* the rest of the running block, or the next block, or one interpreted instruction */
 static int jit_step_n(cpu_model_t *mm, cpu_retire_t *r, int n)
 {
     jit_t *j = (jit_t *)mm;
-    if (j->cur_i == j->cur_n && !run_next(j, r)) return 1;
+    if (j->cur_i == j->cur_n && !run_next(j, r, 0)) return 1;
     int k = 0;
     while (k < n && j->cur_i < j->cur_n) hand_out(j, &r[k++]);
     return k;
@@ -862,7 +864,7 @@ static int jit_block(cpu_model_t *mm, cpu_block_t *b, cpu_retire_t *r)
 {
     jit_t *j = (jit_t *)mm;
     if (j->cur_i < j->cur_n) { hand_out(j, r); return 0; }
-    if (!run_next(j, r)) return 0;                              /* (the interpreter filled *r) */
+    if (!run_next(j, r, 1)) return 0;                           /* (the interpreter filled *r) */
     b->ins = j->cur; b->out = j->out; b->x = j->x0; b->key = j->cur_key; b->fused = j->cur_fused;
     j->cur_i = j->cur_n;
     return (int)j->cur_n;
