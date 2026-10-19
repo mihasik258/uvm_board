@@ -35,6 +35,7 @@ typedef struct jblock {
     int (*fnf)(void *state, jout_t *out);  /* the same doing cpu_fuse_t's work too (NULL: not translated so) */
     uint32_t n;                            /* instructions translated (0: the first one is not) */
     uint16_t cntf[2];                      /* records per fused stream, one whole run */
+    void    *user;                         /* cpu_block_t.user */
     jins_t  *ins;                          /* in the pool */
     /* OCV_JIT_STATS=phases: where the generated code's words go (weighted by the block's runs at the end) */
     uint32_t runs, runsf; uint16_t ph[JP_N], phf[JP_N];
@@ -59,6 +60,7 @@ typedef struct {
     const jins_t *cur; uint32_t cur_n, cur_i;
     uint64_t   cur_key;                    /* the running block: (flushes << 32) | its index + 1; 0: a copy (smc) */
     int        cur_fused;                  /* it ran its fnf */
+    jblock_t  *cur_blk;                    /* it (NULL: a copy, smc) */
     const cpu_fuse_t *fz;                  /* cpu_jit_fuse (NULL: none) */
     uint64_t   cur_order;
     uint32_t   x0[32];                     /* registers up to the last handed out of the running block (cpu_xreg
@@ -633,7 +635,7 @@ static jblock_t *translate(jit_t *j, uint32_t pc)
         return NULL;                                              /* full: the caller flushes */
     jblock_t *b = &j->blocks[j->nblocks++];
     b->ins = &j->pool[j->npool];
-    b->n = 0; b->fn = NULL; b->fnf = NULL;
+    b->n = 0; b->fn = NULL; b->fnf = NULL; b->user = NULL;
     if (!gen(j, pc, b, NULL)) { b->n = 0; return b; }             /* the interpreter runs it */
     const uint32_t n = b->n;
     if (j->fz && !gen(j, pc, b, j->fz)) b->fnf = NULL;            /* (the plain one only) */
@@ -699,7 +701,6 @@ static int run_next(jit_t *j, cpu_retire_t *r, int fusable)
         }
         if (b && b->n) {
             j->smc = 0;
-            memcpy(j->x0, j->f.x, sizeof j->x0);
             /* the fused version when no window fills inside it (a full one is closed by the caller) */
             int fused = fusable && b->fnf != NULL;
             for (int s = 0; fused && s < j->fz->nstreams; s++) {
@@ -711,6 +712,8 @@ static int run_next(jit_t *j, cpu_retire_t *r, int fusable)
                     uint32_t *st = j->fz->s[s].state;
                     if (st[0] == 0) st[1] = st[2] = 0xFFFFFFFFu;  /* (a window starts) */
                 }
+            if (!fused) memcpy(j->x0, j->f.x, sizeof j->x0);   /* (the registers before it: for hand_out, cpu_block_t.x;
+                                                                 * a fused block is taken whole, its operands not needed) */
             const uint32_t n = (uint32_t)(fused ? b->fnf : b->fn)(j, j->out);
             j->cur_fused = fused; j->n_fused += (uint64_t)fused;
             b->runs++; if (fused) b->runsf++;
@@ -718,10 +721,11 @@ static int run_next(jit_t *j, cpu_retire_t *r, int fusable)
                 j->n_blocks++;
                 j->cur = b->ins; j->cur_n = n; j->cur_i = 0; j->cur_order = j->f.order;
                 j->cur_key = n == b->n ? (j->n_flush << 32) | (uint64_t)(b - j->blocks + 1) : 0;   /* (left early: no) */
+                j->cur_blk = b;
                 j->f.order += n;
                 if (j->smc) {                                     /* code written: translate again */
                     memcpy(j->keep, b->ins, n * sizeof *j->keep);
-                    j->cur = j->keep; j->cur_key = 0;
+                    j->cur = j->keep; j->cur_key = 0; j->cur_blk = NULL;
                     jit_flush(j);
                 }
                 return 1;
@@ -866,6 +870,7 @@ static int jit_block(cpu_model_t *mm, cpu_block_t *b, cpu_retire_t *r)
     if (j->cur_i < j->cur_n) { hand_out(j, r); return 0; }
     if (!run_next(j, r, 1)) return 0;                           /* (the interpreter filled *r) */
     b->ins = j->cur; b->out = j->out; b->x = j->x0; b->key = j->cur_key; b->fused = j->cur_fused;
+    b->user = j->cur_blk ? &j->cur_blk->user : NULL;
     j->cur_i = j->cur_n;
     return (int)j->cur_n;
 }

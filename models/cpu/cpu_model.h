@@ -83,6 +83,8 @@ typedef struct {
     uint64_t key;                          /* nonzero: the block ran whole - the same key each time it runs, never
                                             * another block's (its cpu_bins_t: the same each time) */
     int      fused;                        /* its code also did what cpu_impl_t.fuse asked (coverage, records) */
+    void   **user;                         /* a slot the caller may keep a pointer in, per translated block (NULL
+                                            * again when the block is translated anew; NULL: none) */
 } cpu_block_t;
 
 /* What a translating model's code can do for its caller as it runs (cpu_impl_t.fuse), instead of the caller
