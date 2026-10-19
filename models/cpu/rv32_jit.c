@@ -240,9 +240,11 @@ static int fz_cov(em_t *e, const cpu_fuse_t *f, const cpu_covp_t *p, int va, int
 /* a record of fused stream s from its fields (each a register, reg >= 0, or a constant), folded into the
  * window: words in w10 w11 w13 w16 (w17 scratch), the CRCs through w0 w5 */
 typedef struct { int reg; uint32_t val; } fzv_t;
-static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v, uint32_t last_off)
+static const int fz_wr[4] = { W10, W11, W13, W16 };
+/* the record's words into w10 w11 w13 w16 (unmasked; w17 scratch) */
+static void fz_words(em_t *e, const cpu_fstream_t *fs, const fzv_t *v)
 {
-    static const int wr[4] = { W10, W11, W13, W16 };
+    const int *const wr = fz_wr;
     uint32_t cst[4] = { 0, 0, 0, 0 };
     for (int k = 0; k < 3; k++) {                              /* the constant fields */
         const cpu_ffield_t *fl = &fs->f[k];
@@ -263,10 +265,11 @@ static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v, u
         if (o && o + fl->width > 32u)
             emit(e, 0x2A400000u | ((uint32_t)src << 16) | ((32u - o) << 10) | ((uint32_t)wr[w + 1] << 5) | (uint32_t)wr[w + 1]);   /* orr, lsr #32-o */
     }
-    if (last_off) {                                            /* the window's last record: this one */
-        ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));
-        for (uint32_t w = 0; w < fs->words; w++) str_w(e, wr[w], W17, last_off + 4u * w);
-    }
+}
+static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v)
+{
+    const int *const wr = fz_wr;
+    fz_words(e, fs, v);
     for (uint32_t w = 0; w < fs->words; w++)
         if (fs->mask[w] != ~0u) { movw(e, W17, fs->mask[w]); dp3(e, ANDW, wr[w], wr[w], W17); }
     const int c0 = s ? WC1 : WC0, c1 = s ? CZ1 : CZ0;          /* (in registers since the prologue) */
@@ -298,10 +301,42 @@ static void fz_crc_out(em_t *e, const cpu_fuse_t *fz)
     emit(e, 0xA8C00000u | (4u << 15) | (20u << 10) | (31u << 5) | 19u);   /* ldp x19, x20, [sp], #32 */
 }
 
+/* a store's record fields from w3 (its address) and w1 (its data, masked to its width): w6 the word, w8 the
+ * bytes, w4 the data at them (w7 scratch) */
+static void fz_store_vals(em_t *e, uint32_t bytes)
+{
+    emit(e, 0x121E7400u | (W3 << 5) | W6);                      /* and w6, w3, #~3: the word */
+    emit(e, 0x12000400u | (W3 << 5) | W7);                      /* and w7, w3, #3 */
+    movw(e, W8, bytes == 1 ? 1u : bytes == 2 ? 3u : 0xFu);
+    dp3(e, LSLV, W8, W8, W7);                                   /* be */
+    emit(e, 0x531D7000u | (W7 << 5) | W7);                      /* lsl w7, w7, #3 */
+    dp3(e, LSLV, W4, W1, W7);                                   /* the data at its bytes */
+}
+
 /* the end of a whole fused block (chaining): its records into the windows' counts, its issue records' piece
  * into the issue window (the next pc is stored), then on to the dispatcher with w0 = its instructions */
-static void fz_block_done(em_t *e, const jit_t *j, const cpu_fuse_t *fz, const jblock_t *b, const cpu_piece_t *pc_, uint32_t n)
+static void fz_block_done(em_t *e, const jit_t *j, const cpu_fuse_t *fz, const jblock_t *b, const cpu_piece_t *pc_, uint32_t n,
+                          const int *lasti)
 {
+    for (int s = 0; s < fz->nstreams; s++) {                    /* each window's last record: from the block's outputs */
+        const int i = lasti[s];
+        if (i < 0) continue;
+        const cpu_fstream_t *fs = &fz->s[s];
+        const jins_t *I = &b->ins[i];
+        const uint32_t ob = 16u * (uint32_t)i;
+        if (!fs->store) {
+            ldr_w(e, W2, XO, ob);                               /* its rd value */
+            const fzv_t v[3] = { { -1, I->rd }, { W2, 0 }, { -1, 0 } };
+            fz_words(e, fs, v);
+        } else {
+            ldr_w(e, W3, XO, ob + 8); ldr_w(e, W1, XO, ob + 12);   /* its address, its data */
+            fz_store_vals(e, I->store);
+            const fzv_t v[3] = { { W6, 0 }, { W8, 0 }, { W4, 0 } };
+            fz_words(e, fs, v);
+        }
+        ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));
+        for (uint32_t w = 0; w < fs->words; w++) str_w(e, fz_wr[w], W17, fz->last_off + 4u * w);
+    }
     for (int s = 0; s < fz->nstreams; s++) {
         if (!b->cntf[s]) continue;
         ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));
@@ -430,6 +465,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
         }
     }
     uint32_t *body = e.p;                         /* (chaining: where the dispatcher enters) */
+    int lasti[2] = { -1, -1 };                    /* per fused stream: its last record's instruction */
     const int chain = fz && fz->istate && fz->nstreams > 0 && j->dispatch;
     set_ph(&e, JP_OP);
     uint32_t *miss_patches[2 * JIT_MAX], miss_target[2 * JIT_MAX];   /* region miss; cva6: misaligned */
@@ -611,19 +647,15 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
                     if (!I->rd || !(fs->filter == 0 || (fs->filter == 1) == load)) continue;
                     if (!wr) return 0;
                     const fzv_t v[3] = { { -1, I->rd }, { W2, 0 }, { -1, 0 } };
-                    fz_record(&e, fs, s, v, fz->istate ? fz->last_off : 0);
+                    fz_record(&e, fs, s, v);
                 } else {
                     if (!I->store) continue;
-                    emit(&e, 0x121E7400u | (W3 << 5) | W6);           /* and w6, w3, #~3: the word */
-                    emit(&e, 0x12000400u | (W3 << 5) | W7);           /* and w7, w3, #3 */
-                    movw(&e, W8, I->store == 1 ? 1u : I->store == 2 ? 3u : 0xFu);
-                    dp3(&e, LSLV, W8, W8, W7);                        /* be */
-                    emit(&e, 0x531D7000u | (W7 << 5) | W7);           /* lsl w7, w7, #3 */
-                    dp3(&e, LSLV, W4, W1, W7);                        /* the data at its bytes */
+                    fz_store_vals(&e, I->store);
                     const fzv_t v[3] = { { W6, 0 }, { W8, 0 }, { W4, 0 } };
-                    fz_record(&e, fs, s, v, fz->istate ? fz->last_off : 0);
+                    fz_record(&e, fs, s, v);
                 }
                 b->cntf[s]++;
+                lasti[s] = (int)k;
             }
         }
         b->n = k + 1;
@@ -635,7 +667,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
             if (chain) {                                          /* the whole block: its own work, then on */
                 cpu_piece_t pc_;
                 if (!fz->piece(b->ins, (int)(k + 1), &pc_)) return 0;
-                fz_block_done(&e, j, fz, b, &pc_, k + 1);
+                fz_block_done(&e, j, fz, b, &pc_, k + 1, lasti);
                 goto done;
             }
             fz_crc_out(&e, fz);
@@ -649,7 +681,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
         movw(&e, W9, p); str_w(&e, W9, XS, OFF_PC);
         cpu_piece_t pc_;
         if (!b->n || !fz->piece(b->ins, (int)b->n, &pc_)) return 0;
-        fz_block_done(&e, j, fz, b, &pc_, b->n);
+        fz_block_done(&e, j, fz, b, &pc_, b->n, lasti);
     } else
         exit_before(&e, fz, p, b->n);
 done:

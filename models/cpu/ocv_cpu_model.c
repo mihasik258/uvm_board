@@ -666,10 +666,21 @@ static inline __attribute__((always_inline)) void block_fill(int kind, cpu_retir
 }
 
 /* a fused block that left early (cpu_block_t.fused, not done): the records its code folded into the windows of
- * the streams fzl[0..nfz) (and kept their last ones), counted there now */
-static void fused_done(const binfo_t *bf, const int8_t *fzl, int nfz, struct ocv_squash **sq)
+ * the streams fzl[0..nfz), counted there now, and their last ones kept (a whole block keeps them itself) */
+static void fused_done(const cpu_block_t *v, const binfo_t *bf, const int8_t *fzl, int nfz, struct ocv_squash **sq)
 {
-    for (int k = 0; k < nfz; k++) sq[fzl[k]]->n += bf->cnt[fzl[k]];
+    for (int k = 0; k < nfz; k++) {
+        const int s = fzl[k];
+        if (!bf->cnt[s]) continue;
+        sq[s]->n += bf->cnt[s];
+        const cpu_bins_t *I = &v->ins[bf->lastrec[s]];
+        const cpu_bout_t *o = &v->out[bf->lastrec[s]];
+        cpu_retire_t r = { 0 };
+        block_fill(cpu_streams[s].kind, &r, I, o, o->wdata & I->m_rd);
+        uint32_t rec[2][CPU_REC_WORDS];
+        const int nr = cpu_stream_out(&cpu_streams[s], &r, I->len == 2, I->len == 2 ? I->raw : I->insn & 0xFFFFu, fields[s], rec);
+        if (nr) memcpy(sq[s]->last, rec[nr - 1], CPU_DUT.channels[cpu_streams[s].channel].rec_words * 4u);
+    }
 }
 
 #if defined(CPU_GEN_CV32) && defined(CPU_FOR_STREAMS)
@@ -1012,7 +1023,7 @@ static void run_program(ocv_model_io_t *io)
             if (!bv.fused || ends) memcpy(xr, bv.x, sizeof xr);
             static binfo_t bf_tmp;             /* (a block that left early: its info, not cached) */
             const binfo_t *const bf = !bv.fused ? NULL : bi_ ? bi_ : (binfo_fill(&bf_tmp, &bv, k), &bf_tmp);
-            if (bf) fused_done(bf, fzl, nfz, sq_);   /* fused, left early: what the code did, counted */
+            if (bf) fused_done(&bv, bf, fzl, nfz, sq_);   /* fused, left early: what the code did, counted */
             if (ends) {                        /* the program's end inside: instruction by instruction below */
                 for (int i = 0; i < k; i++) block_retire(&bv, i, xr, &rb[i]);
                 bn = k;

@@ -20,7 +20,13 @@ static uint32_t window = 4096, ones[64];
 static ocv_squash_t sqs[256];                 /* the open windows, as the runner's (io->squash: the model folds into them) */
 static uint64_t sig[256];                     /* per channel, every closed window's two CRCs: the same for two models
                                                * that agree (channels apart: their windows close in any order) */
-static int crc_off;                           /* --crc-off: the PC has no CRC32 instruction (the A72 has) */
+static int crc_off;
+/* a closed window into its channel's signature: both CRCs and its last record (the runner's fused record) */
+static void sig_win(int ch, uint32_t c, uint32_t z, const uint32_t *last, uint32_t words)
+{
+    sig[ch] = sig[ch] * 1000003u + ((uint64_t)c << 32 | z);
+    for (uint32_t j = 0; j < words; j++) sig[ch] = sig[ch] * 31u + last[j];
+}                           /* --crc-off: the PC has no CRC32 instruction (the A72 has) */
 
 static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
 {
@@ -31,7 +37,7 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
         if (sqs[ch].n == 0) sqs[ch].c = sqs[ch].z = 0xFFFFFFFFu;
         if (!crc_off) ocv_squash_add(&sqs[ch].c, &sqs[ch].z, rec, sqs[ch].mask, c->rec_words);
         for (uint32_t j = 0; j < c->rec_words; j++) sqs[ch].last[j] = rec[j];
-        if (++sqs[ch].n >= window) { sqs[ch].n = 0; n_win[ch]++; sig[ch] = sig[ch] * 1000003u + ((uint64_t)sqs[ch].c << 32 | sqs[ch].z); }
+        if (++sqs[ch].n >= window) { sqs[ch].n = 0; n_win[ch]++; sig_win(ch, sqs[ch].c, sqs[ch].z, sqs[ch].last, c->rec_words); }
     }
 }
 static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n, uint32_t stride)
@@ -46,7 +52,7 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
         if (k == 0) a = z = 0xFFFFFFFFu;
         if (!crc_off) ocv_squash_add(&a, &z, rec, sqs[ch].mask, W);
         if (++k >= window) { for (uint32_t j = 0; j < W; j++) sqs[ch].last[j] = rec[j]; k = 0; n_win[ch]++;
-                             sig[ch] = sig[ch] * 1000003u + ((uint64_t)a << 32 | z); }
+                             sig_win(ch, a, z, rec, W); }
     }
     sqs[ch].c = a; sqs[ch].z = z; sqs[ch].n = k;
 }
@@ -74,7 +80,7 @@ static ocv_squash_t *squash(ocv_model_io_t *io, int ch)
 static void squash_close(ocv_model_io_t *io, int ch)
 {
     (void)io;
-    n_win[ch]++; sig[ch] = sig[ch] * 1000003u + ((uint64_t)sqs[ch].c << 32 | sqs[ch].z);
+    n_win[ch]++; sig_win(ch, sqs[ch].c, sqs[ch].z, sqs[ch].last, sqs[ch].words);
     sqs[ch].n = 0;
 }
 static int observed(ocv_model_io_t *io, int ch, uint32_t index, uint32_t *rec) { (void)io; (void)ch; (void)index; (void)rec; return 0; }
@@ -139,6 +145,8 @@ int main(int argc, char **argv)
     }
     uint64_t instr = 0, recs = 0, sg = 0;
     for (int ch = 0; ch < d->n_channels; ch++) sg = sg * 31u + sig[ch];
+    for (int ch = 0; ch < d->n_channels; ch++)                /* the windows left open: as the runner takes them */
+        if (d->channels[ch].squash && sqs[ch].n) sig_win(ch, sqs[ch].c, sqs[ch].z, sqs[ch].last, sqs[ch].words);
     for (int ch = 0; ch < d->n_channels; ch++)                /* (squashed: windows, whoever folded them) */
         if (d->channels[ch].squash) n_rec[ch] = n_win[ch] * window + sqs[ch].n;
     for (int ch = 0; ch < d->n_channels; ch++) recs += n_rec[ch];
