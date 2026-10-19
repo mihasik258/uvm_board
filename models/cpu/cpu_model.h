@@ -85,6 +85,13 @@ typedef struct {
     int      fused;                        /* its code also did what cpu_impl_t.fuse asked (coverage, records) */
     void   **user;                         /* a slot the caller may keep a pointer in, per translated block (NULL
                                             * again when the block is translated anew; NULL: none) */
+    /* chained (cpu_impl_t.fuse with an issue window): fused blocks run one after another in the translated code,
+     * each doing all of its work itself (records, coverage, its issue records, the windows' counts) */
+    uint32_t budget;                       /* in: instructions the call may run at most (whole blocks) */
+    uint64_t done;                         /* out: instructions run so, all their work done; the view (ins, out) is
+                                            * then the block that left early, if any: block() returned done + its
+                                            * instructions */
+    const cpu_bins_t *last;                /* out: done, no such block: the last instruction run (the end check) */
 } cpu_block_t;
 
 /* What a translating model's code can do for its caller as it runs (cpu_impl_t.fuse), instead of the caller
@@ -96,6 +103,9 @@ typedef struct {                           /* an instruction's coverage, decided
     uint16_t mis[4];                       /* a load / store: the bin at each offset (a + imm) & 3, 0xFFFF none */
 } cpu_covp_t;
 typedef struct { uint8_t lsb, width; } cpu_ffield_t;   /* a field of a record (width 0: not reported) */
+/* a block's issue records folded once, as a piece (ocv.h's ocv_fold_t): a window's CRCs move past it as
+ * crc(0, clmul(state, kc)) ^ c (and kz, z), n records more, last its last record */
+typedef struct { uint32_t c, z, kc, kz, n, words, last[4]; } cpu_piece_t;
 typedef struct {
     uint32_t    *state;                    /* the window: [0] records in it, [1] CRC32C, [2] CRC32, [3] records
                                             * per window - the code folds into [1], [2]; the caller counts [0] */
@@ -114,6 +124,12 @@ typedef struct {
     int          nstreams;
     cpu_fstream_t s[2];
     uint32_t     exit_pc;                  /* the program's end: no block with an instruction there does it */
+    /* chaining (optional, istate NULL: none): the issue records' window, and the piece of a block's issue
+     * records (0: none - the block is then not fused); last_off: bytes from a window's state ([0]) to its last
+     * record, which the code keeps (every window here) */
+    uint32_t    *istate;
+    int        (*piece)(const cpu_bins_t *ins, int n, cpu_piece_t *p);
+    uint32_t     last_off;
 } cpu_fuse_t;
 
 typedef struct cpu_model cpu_model_t;

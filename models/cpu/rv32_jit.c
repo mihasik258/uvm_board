@@ -36,6 +36,7 @@ typedef struct jblock {
     uint32_t n;                            /* instructions translated (0: the first one is not) */
     uint16_t cntf[2];                      /* records per fused stream, one whole run */
     void    *user;                         /* cpu_block_t.user */
+    void    *fnb;                          /* chaining: fnf's body (after its prologue), NULL: not chained into */
     jins_t  *ins;                          /* in the pool */
     /* OCV_JIT_STATS=phases: where the generated code's words go (weighted by the block's runs at the end) */
     uint32_t runs, runsf; uint16_t ph[JP_N], phf[JP_N];
@@ -73,6 +74,13 @@ typedef struct {
     /* for the generated code: [x19 + JIT_OFF_*] */
     uint8_t   *host[2]; uint64_t base[2], size[2]; uint8_t *cmap[2];
     uint8_t   *cov; uint32_t *fst[2];     /* fused code: the coverage bins, the windows' state */
+    uint32_t  *ist;                       /* chaining: the issue window's state (NULL: no chaining) */
+    jblock_t **map0;                      /* region 0's map: the dispatcher's next block */
+    uint32_t   budget;                    /* instructions the call may still run (cpu_block_t.budget) */
+    uint64_t   chain_n;                   /* instructions of whole fused blocks run in this call */
+    jblock_t  *chain_last;                /* the block running / run last in this call */
+    uint64_t   n_chained;                 /* blocks entered from the dispatcher (OCV_JIT_STATS) */
+    uint32_t  *dispatch;                  /* the dispatcher (at the code buffer's start) */
 } jit_t;
 
 /* ---------------------------------------------------------------- AArch64 encoder */
@@ -114,6 +122,12 @@ static void ldr_x(em_t *e, int rt, int rn, uint32_t off) { emit(e, 0xF9400000u |
 #define OFF_CMAP  offsetof(jit_t, cmap)
 #define OFF_COV   offsetof(jit_t, cov)
 #define OFF_FST   offsetof(jit_t, fst)
+#define OFF_IST   offsetof(jit_t, ist)
+#define OFF_MAP0  offsetof(jit_t, map0)
+#define OFF_BUD   offsetof(jit_t, budget)
+#define OFF_CHN   offsetof(jit_t, chain_n)
+#define OFF_CHL   offsetof(jit_t, chain_last)
+#define OFF_NCH   offsetof(jit_t, n_chained)
 
 /* guest register into a host register (x0 reads 0) */
 static int greg(em_t *e, int host, int g)
@@ -226,7 +240,7 @@ static int fz_cov(em_t *e, const cpu_fuse_t *f, const cpu_covp_t *p, int va, int
 /* a record of fused stream s from its fields (each a register, reg >= 0, or a constant), folded into the
  * window: words in w10 w11 w13 w16 (w17 scratch), the CRCs through w0 w5 */
 typedef struct { int reg; uint32_t val; } fzv_t;
-static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v)
+static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v, uint32_t last_off)
 {
     static const int wr[4] = { W10, W11, W13, W16 };
     uint32_t cst[4] = { 0, 0, 0, 0 };
@@ -248,6 +262,10 @@ static void fz_record(em_t *e, const cpu_fstream_t *fs, int s, const fzv_t *v)
         emit(e, 0x2A000000u | ((uint32_t)src << 16) | (o << 10) | ((uint32_t)wr[w] << 5) | (uint32_t)wr[w]);   /* orr ww, ww, src, lsl #o */
         if (o && o + fl->width > 32u)
             emit(e, 0x2A400000u | ((uint32_t)src << 16) | ((32u - o) << 10) | ((uint32_t)wr[w + 1] << 5) | (uint32_t)wr[w + 1]);   /* orr, lsr #32-o */
+    }
+    if (last_off) {                                            /* the window's last record: this one */
+        ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));
+        for (uint32_t w = 0; w < fs->words; w++) str_w(e, wr[w], W17, last_off + 4u * w);
     }
     for (uint32_t w = 0; w < fs->words; w++)
         if (fs->mask[w] != ~0u) { movw(e, W17, fs->mask[w]); dp3(e, ANDW, wr[w], wr[w], W17); }
@@ -278,6 +296,34 @@ static void fz_crc_out(em_t *e, const cpu_fuse_t *fz)
     }
     emit(e, 0xA9410000u | (2u << 15) | (22u << 10) | (31u << 5) | 21u);   /* ldp x21, x22, [sp, #16] */
     emit(e, 0xA8C00000u | (4u << 15) | (20u << 10) | (31u << 5) | 19u);   /* ldp x19, x20, [sp], #32 */
+}
+
+/* the end of a whole fused block (chaining): its records into the windows' counts, its issue records' piece
+ * into the issue window (the next pc is stored), then on to the dispatcher with w0 = its instructions */
+static void fz_block_done(em_t *e, const jit_t *j, const cpu_fuse_t *fz, const jblock_t *b, const cpu_piece_t *pc_, uint32_t n)
+{
+    for (int s = 0; s < fz->nstreams; s++) {
+        if (!b->cntf[s]) continue;
+        ldr_x(e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)s));
+        ldr_w(e, W16, W17, 0); add_imm(e, W16, W16, b->cntf[s], W11); str_w(e, W16, W17, 0);
+    }
+    ldr_x(e, W17, XS, (uint32_t)OFF_IST);                      /* the issue window */
+    ldr_w(e, W16, W17, 0); add_imm(e, W16, W16, pc_->n, W11); str_w(e, W16, W17, 0);
+    for (int k = 0; k < 2; k++) {                               /* CRC32C, then CRC32: crc(0, clmul(state, k)) ^ c */
+        ldr_w(e, W0, W17, 4u + 4u * (uint32_t)k);
+        movw(e, W16, k ? pc_->kz : pc_->kc);
+        emit(e, 0x9E670000u);                                   /* fmov d0, x0 */
+        emit(e, 0x9E670201u);                                   /* fmov d1, x16 */
+        emit(e, 0x0EE1E000u);                                   /* pmull v0.1q, v0.1d, v1.1d */
+        emit(e, 0x9E660000u);                                   /* fmov x0, d0 */
+        emit(e, (k ? 0x9AC04C00u : 0x9AC05C00u) | (31u << 5));   /* crc32x / crc32cx w0, wzr, x0 */
+        movw(e, W16, k ? pc_->z : pc_->c);
+        dp3(e, EORW, W0, W0, W16);
+        str_w(e, W0, W17, 4u + 4u * (uint32_t)k);
+    }
+    for (uint32_t w = 0; w < pc_->words; w++) { movw(e, W16, pc_->last[w]); str_w(e, W16, W17, fz->last_off + 4u * w); }
+    movw(e, W0, n);
+    emit(e, 0x14000000u | (uint32_t)((j->dispatch - e->p) & 0x3FFFFFF));   /* b dispatch */
 }
 
 /* exit before instruction k (not executed): pc = its pc, return k */
@@ -383,6 +429,8 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
             ldr_w(&e, WC1, W17, 4); ldr_w(&e, CZ1, W17, 8);
         }
     }
+    uint32_t *body = e.p;                         /* (chaining: where the dispatcher enters) */
+    const int chain = fz && fz->istate && fz->nstreams > 0 && j->dispatch;
     set_ph(&e, JP_OP);
     uint32_t *miss_patches[2 * JIT_MAX], miss_target[2 * JIT_MAX];   /* region miss; cva6: misaligned */
     int nmiss = 0;
@@ -563,7 +611,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
                     if (!I->rd || !(fs->filter == 0 || (fs->filter == 1) == load)) continue;
                     if (!wr) return 0;
                     const fzv_t v[3] = { { -1, I->rd }, { W2, 0 }, { -1, 0 } };
-                    fz_record(&e, fs, s, v);
+                    fz_record(&e, fs, s, v, fz->istate ? fz->last_off : 0);
                 } else {
                     if (!I->store) continue;
                     emit(&e, 0x121E7400u | (W3 << 5) | W6);           /* and w6, w3, #~3: the word */
@@ -573,7 +621,7 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
                     emit(&e, 0x531D7000u | (W7 << 5) | W7);           /* lsl w7, w7, #3 */
                     dp3(&e, LSLV, W4, W1, W7);                        /* the data at its bytes */
                     const fzv_t v[3] = { { W6, 0 }, { W8, 0 }, { W4, 0 } };
-                    fz_record(&e, fs, s, v);
+                    fz_record(&e, fs, s, v, fz->istate ? fz->last_off : 0);
                 }
                 b->cntf[s]++;
             }
@@ -582,15 +630,28 @@ static int gen(jit_t *j, uint32_t pc, jblock_t *b, const cpu_fuse_t *fz)
         p += d->len;
         if (ends_block(d)) {
             set_ph(&e, JP_EXIT);
-            fz_crc_out(&e, fz);
             if (d->op == OP_JAL) movw(&e, W9, I->next);
             str_w(&e, W9, XS, OFF_PC);
+            if (chain) {                                          /* the whole block: its own work, then on */
+                cpu_piece_t pc_;
+                if (!fz->piece(b->ins, (int)(k + 1), &pc_)) return 0;
+                fz_block_done(&e, j, fz, b, &pc_, k + 1);
+                goto done;
+            }
+            fz_crc_out(&e, fz);
             movw(&e, W0, k + 1);
             emit(&e, 0xD65F03C0u);                                /* ret */
             goto done;
         }
     }
-    exit_before(&e, fz, p, b->n);                                     /* no branch: continue at p */
+    if (chain) {                                                  /* no branch: continue at p - as above */
+        set_ph(&e, JP_EXIT);
+        movw(&e, W9, p); str_w(&e, W9, XS, OFF_PC);
+        cpu_piece_t pc_;
+        if (!b->n || !fz->piece(b->ins, (int)b->n, &pc_)) return 0;
+        fz_block_done(&e, j, fz, b, &pc_, b->n);
+    } else
+        exit_before(&e, fz, p, b->n);
 done:
     for (int i = 0; i < nmiss; i++) {                             /* device registers: out before k */
         patch_bcond(miss_patches[i], e.p);
@@ -604,7 +665,7 @@ done:
         const uint16_t w = (uint16_t)e.ph[i];
         if (fz) b->phf[i] = w; else b->ph[i] = w;
     }
-    if (fz) b->fnf = fn; else b->fn = fn;
+    if (fz) { b->fnf = fn; b->fnb = chain ? (void *)body : NULL; } else b->fn = fn;
     if (getenv("OCV_JIT_DUMPCODE")) {            /* the raw code words of this range, with the phase intervals */
         FILE *f = fopen(getenv("OCV_JIT_DUMPCODE"), "ab");
         if (f) {
@@ -629,13 +690,79 @@ done:
     return 1;
 }
 
+/* the dispatcher (chaining), at the code buffer's start: entered at the end of a whole fused block with w0 its
+ * instructions (counted), the next pc stored. On to that pc's fused block if there is one in region 0, the
+ * budget still holds a block and no window would fill inside it; else out of the chain (back to the caller,
+ * returning 0: no block left early) */
+static void gen_dispatch(jit_t *j)
+{
+    const cpu_fuse_t *fz = j->fz;
+    j->dispatch = NULL;
+    if (!fz || !fz->istate || fz->nstreams <= 0) return;
+    em_t e = { 0 };
+    e.p = e.b0 = e.start = (uint32_t *)j->code_cur; e.end = (uint32_t *)j->code_end; e.ok = 1; e.tag = JP_EXIT;
+    uint32_t *start = e.p, *stop[16]; int ns = 0;
+    ldr_x(&e, W16, XS, (uint32_t)OFF_CHN);
+    emit(&e, 0x8B204210u);                                       /* add x16, x16, w0, uxtw */
+    emit(&e, 0xF9000000u | ((uint32_t)(OFF_CHN / 8) << 10) | (XS << 5) | W16);   /* str x16, chain_n */
+    ldr_w(&e, W17, XS, (uint32_t)OFF_BUD);
+    dp3(&e, SUBW, W17, W17, W0);
+    str_w(&e, W17, XS, (uint32_t)OFF_BUD);
+    emit(&e, 0x7100001Fu | (64u << 10) | (W17 << 5));           /* cmp w17, #64 */
+    stop[ns] = e.p; emit(&e, 0x54000003u); ns++;                 /* b.lo stop: no whole block left */
+    ldr_w(&e, W9, XS, OFF_PC);
+    ldr_x(&e, 5, XS, OFF_BASE);
+    dp3(&e, SUBW, W5, W9, W5);                                   /* w5 = pc - base0 */
+    ldr_x(&e, 6, XS, OFF_SIZE);
+    emit(&e, 0xEB0600BFu);                                       /* cmp x5, x6 */
+    stop[ns] = e.p; emit(&e, 0x54000002u); ns++;                 /* b.hs stop: not region 0 */
+    ldr_x(&e, 7, XS, (uint32_t)OFF_MAP0);
+    emit(&e, 0x53017CA5u);                                       /* lsr w5, w5, #1 */
+    emit(&e, 0xF86578E7u);                                       /* ldr x7, [x7, x5, lsl #3]: the block */
+    stop[ns] = e.p; emit(&e, 0xB4000007u); ns++;                 /* cbz x7, stop: not translated */
+    ldr_x(&e, 8, 7, (uint32_t)offsetof(jblock_t, fnb));
+    stop[ns] = e.p; emit(&e, 0xB4000008u); ns++;                 /* cbz x8, stop: no chained version */
+    for (int k = 0; k <= fz->nstreams; k++) {                    /* every window: room for the block's records */
+        if (k < fz->nstreams) {
+            ldr_x(&e, W17, XS, (uint32_t)(OFF_FST + 8u * (uint32_t)k));
+            emit(&e, 0x79400000u | ((uint32_t)((offsetof(jblock_t, cntf) + 2u * (uint32_t)k) / 2) << 10) | (7u << 5) | W6);   /* ldrh w6 */
+        } else {
+            ldr_x(&e, W17, XS, (uint32_t)OFF_IST);
+            ldr_w(&e, W6, 7, (uint32_t)offsetof(jblock_t, n));
+        }
+        ldr_w(&e, W16, W17, 0);
+        dp3(&e, ADDW, W16, W16, W6);
+        ldr_w(&e, W6, W17, 12);
+        dp3(&e, SUBSW, XZR, W16, W6);
+        stop[ns] = e.p; emit(&e, 0x54000002u); ns++;             /* b.hs stop: it would fill inside */
+    }
+    emit(&e, 0xF9000000u | ((uint32_t)(OFF_CHL / 8) << 10) | (XS << 5) | 7u);    /* str x7, chain_last */
+    ldr_x(&e, W16, XS, (uint32_t)OFF_NCH);
+    emit(&e, 0x91000610u);                                       /* add x16, x16, #1 */
+    emit(&e, 0xF9000000u | ((uint32_t)(OFF_NCH / 8) << 10) | (XS << 5) | W16);
+    emit(&e, 0xD61F0100u);                                       /* br x8 */
+    uint32_t *st = e.p;                                          /* stop: out of the chain */
+    fz_crc_out(&e, fz);
+    movw(&e, W0, 0);
+    emit(&e, 0xD65F03C0u);                                       /* ret */
+    if (!e.ok) return;
+    for (int i = 0; i < ns; i++) {
+        uint32_t w = *stop[i];
+        if ((w & 0xFF000000u) == 0xB4000000u) cbz_at(stop[i], st, (int)(w & 31u)), *stop[i] |= 0x80000000u;   /* (cbz x) */
+        else bcond_at(stop[i], st, (int)(w & 15u));
+    }
+    __builtin___clear_cache((char *)start, (char *)e.p);
+    j->code_cur = (uint8_t *)e.p;
+    j->dispatch = start;
+}
+
 static jblock_t *translate(jit_t *j, uint32_t pc)
 {
     if (j->nblocks == JIT_BLOCKS || j->npool + JIT_MAX > JIT_POOL || j->code_end - j->code_cur < 128 * 1024)
         return NULL;                                              /* full: the caller flushes */
     jblock_t *b = &j->blocks[j->nblocks++];
     b->ins = &j->pool[j->npool];
-    b->n = 0; b->fn = NULL; b->fnf = NULL; b->user = NULL;
+    b->n = 0; b->fn = NULL; b->fnf = NULL; b->fnb = NULL; b->user = NULL;
     if (!gen(j, pc, b, NULL)) { b->n = 0; return b; }             /* the interpreter runs it */
     const uint32_t n = b->n;
     if (j->fz && !gen(j, pc, b, j->fz)) b->fnf = NULL;            /* (the plain one only) */
@@ -662,6 +789,7 @@ static void jit_flush(jit_t *j)
     }
     j->nblocks = 0; j->npool = 0;
     j->code_cur = j->code;
+    gen_dispatch(j);
 }
 
 static inline void hand_out(jit_t *j, cpu_retire_t *r)
@@ -707,16 +835,28 @@ static int run_next(jit_t *j, cpu_retire_t *r, int fusable)
                 uint32_t *st = j->fz->s[s].state;
                 if (st[0] + b->cntf[s] >= st[3]) fused = 0;
             }
-            if (fused)
+            if (fused && b->fnb && (j->ist[0] + b->n >= j->ist[3] || j->budget < b->n)) fused = 0;   /* (chained: also the issue window, the budget) */
+            if (fused) {
                 for (int s = 0; s < j->fz->nstreams; s++) {
                     uint32_t *st = j->fz->s[s].state;
                     if (st[0] == 0) st[1] = st[2] = 0xFFFFFFFFu;  /* (a window starts) */
                 }
+                if (b->fnb && j->ist[0] == 0) j->ist[1] = j->ist[2] = 0xFFFFFFFFu;
+            }
+            j->chain_n = 0; j->chain_last = b;
             if (!fused) memcpy(j->x0, j->f.x, sizeof j->x0);   /* (the registers before it: for hand_out, cpu_block_t.x;
                                                                  * a fused block is taken whole, its operands not needed) */
             const uint32_t n = (uint32_t)(fused ? b->fnf : b->fn)(j, j->out);
             j->cur_fused = fused; j->n_fused += (uint64_t)fused;
             b->runs++; if (fused) b->runsf++;
+            if (fused && b->fnb && j->chain_n) {               /* chained: whole blocks done, then maybe one left early */
+                jblock_t *lb = j->chain_last;
+                j->n_blocks++;
+                j->cur = lb->ins; j->cur_n = n; j->cur_i = 0; j->cur_order = j->f.order + j->chain_n;
+                j->cur_key = 0; j->cur_blk = NULL;
+                j->f.order += j->chain_n + n;
+                return 1;
+            }
             if (n) {
                 j->n_blocks++;
                 j->cur = b->ins; j->cur_n = n; j->cur_i = 0; j->cur_order = j->f.order;
@@ -779,10 +919,10 @@ static void jit_destroy(cpu_model_t *mm)
     jit_t *j = (jit_t *)mm;
     if (getenv("OCV_JIT_STATS"))
         fprintf(stderr, "jit: %llu blocks run (%.1f instructions each), %llu translated, %llu flushes, %llu interpreted"
-                " (%llu of them not hot yet), %llu blocks run fused\n",
+                " (%llu of them not hot yet), %llu blocks run fused, %llu of them chained\n",
                 (unsigned long long)j->n_blocks, j->n_blocks ? (double)(j->f.order - j->n_interp) / (double)j->n_blocks : 0.0,
                 (unsigned long long)j->n_trans, (unsigned long long)j->n_flush, (unsigned long long)j->n_interp,
-                (unsigned long long)j->n_cold, (unsigned long long)j->n_fused);
+                (unsigned long long)j->n_cold, (unsigned long long)(j->n_fused + j->n_chained), (unsigned long long)j->n_chained);
     if (j->phstats) {
         static const char *const nm[JP_N] = { "enter", "arg", "op+mem", "out", "cov.classA", "cov.classB", "cov.bin", "cov.s0s1", "cov.mis", "rec", "exit" };
         uint64_t w[JP_N] = { 0 }, wf[JP_N] = { 0 }, nin = 0;
@@ -868,11 +1008,18 @@ static int jit_block(cpu_model_t *mm, cpu_block_t *b, cpu_retire_t *r)
 {
     jit_t *j = (jit_t *)mm;
     if (j->cur_i < j->cur_n) { hand_out(j, r); return 0; }
+    j->budget = b->budget;
     if (!run_next(j, r, 1)) return 0;                           /* (the interpreter filled *r) */
     b->ins = j->cur; b->out = j->out; b->x = j->x0; b->key = j->cur_key; b->fused = j->cur_fused;
     b->user = j->cur_blk ? &j->cur_blk->user : NULL;
+    b->done = 0; b->last = NULL;
+    if (j->cur_fused && j->chain_n && j->chain_last->fnb) {    /* chained */
+        b->done = j->chain_n;
+        if (!j->cur_n) b->last = &j->chain_last->ins[j->chain_last->n - 1];
+        j->chain_n = 0;
+    }
     j->cur_i = j->cur_n;
-    return (int)j->cur_n;
+    return (int)(b->done + j->cur_n);
 }
 
 /* cpu_fuse_t: the translations made from now on have their fused version (the ones there: dropped) */
@@ -882,12 +1029,16 @@ static int jit_fuse(cpu_model_t *mm, const cpu_fuse_t *f)
     if (f && (f->nstreams > 2 || (f->cov && (!f->cov_plan || f->cls[6] != f->cls[5] + 1)))) return 0;
     for (int s = 0; f && s < f->nstreams; s++)
         if (f->s[s].words < 1 || f->s[s].words > 4 || f->s[s].filter < 0 || f->s[s].filter > 2) return 0;
-    jit_flush(j);
+    if (f && f->istate && (!f->piece || !f->last_off || f->last_off > 4000)) return 0;
     j->fz = f;
     j->cov = f ? f->cov : NULL;
     for (int s = 0; s < 2; s++) j->fst[s] = f && s < f->nstreams ? f->s[s].state : NULL;
+    j->ist = f ? f->istate : NULL;
+    j->map0 = j->f.nreg ? j->map[0] : NULL;
+    jit_flush(j);                                              /* (then the dispatcher, at the buffer's start) */
     return 1;
 }
+_Static_assert(offsetof(jit_t, n_chained) < 4 * 4000, "jit_t: the fields the generated code reaches by an immediate offset");
 
 static const cpu_impl_t cpu_jit_impl = {
     "jit", "\"fast\" translated block by block into AArch64 code (the board's A72)", 0,

@@ -665,34 +665,11 @@ static inline __attribute__((always_inline)) void block_fill(int kind, cpu_retir
     }
 }
 
-/* a fused block (cpu_block_t.fused): the records its code folded into the windows of the streams fzl[0..nfz)
- * - counted there now; the last one (the window's last record) only kept as its instruction and outputs: built
- * when the window is taken open (fused_last, at the program's end), unless a record the model folds itself
- * comes after it (that one sets the window's last: the pending one is dropped) */
-static struct { int valid; cpu_bins_t I; cpu_bout_t o; } fz_pend[8];
-static void fused_done(const cpu_block_t *v, const binfo_t *bf, const int8_t *fzl, int nfz, struct ocv_squash **sq)
+/* a fused block that left early (cpu_block_t.fused, not done): the records its code folded into the windows of
+ * the streams fzl[0..nfz) (and kept their last ones), counted there now */
+static void fused_done(const binfo_t *bf, const int8_t *fzl, int nfz, struct ocv_squash **sq)
 {
-    for (int k = 0; k < nfz; k++) {
-        const int s = fzl[k];
-        if (!bf->cnt[s]) continue;
-        sq[s]->n += bf->cnt[s];
-        const int i = bf->lastrec[s];
-        fz_pend[s].valid = 1; fz_pend[s].I = v->ins[i]; fz_pend[s].o = v->out[i];
-    }
-}
-static void fused_last(struct ocv_squash **sq)
-{
-    for (int s = 0; s < CPU_N_STREAMS && s < 8; s++) {
-        if (!fz_pend[s].valid) continue;
-        fz_pend[s].valid = 0;
-        const cpu_bins_t *I = &fz_pend[s].I;
-        const cpu_bout_t *o = &fz_pend[s].o;
-        cpu_retire_t r = { 0 };
-        block_fill(cpu_streams[s].kind, &r, I, o, o->wdata & I->m_rd);
-        uint32_t rec[2][CPU_REC_WORDS];
-        const int nr = cpu_stream_out(&cpu_streams[s], &r, I->len == 2, I->len == 2 ? I->raw : I->insn & 0xFFFFu, fields[s], rec);
-        if (nr) memcpy(sq[s]->last, rec[nr - 1], CPU_DUT.channels[cpu_streams[s].channel].rec_words * 4u);
-    }
+    for (int k = 0; k < nfz; k++) sq[fzl[k]]->n += bf->cnt[fzl[k]];
 }
 
 #if defined(CPU_GEN_CV32) && defined(CPU_FOR_STREAMS)
@@ -706,6 +683,27 @@ static void fz_cov_plan(uint32_t raw, int c, uint32_t insn, cpu_covp_t *p)
         const int m = q.mop ? cov_mis_bin(q.mop, q.mf3, o) : -1;
         p->mis[o] = m >= 0 ? (uint16_t)(COV_G_MIS * COV_MAXB + m) : 0xFFFF;
     }
+}
+#endif
+
+#if defined(CPU_FOR_STREAMS)
+/* a block's issue records as one piece for the translated code (chaining: cpu_fuse_t.piece) */
+static int fz_piece(const cpu_bins_t *ins, int n, cpu_piece_t *p)
+{
+    if (fold_s < 0 || n < 1 || n > 64 || !cur_io || !cur_io->fold_make) return 0;
+    uint32_t recs[64 + 1][CPU_REC_WORDS];
+    for (int i = 0; i < n; i++) {
+        const cpu_bins_t *I = &ins[i];
+        cpu_retire_t r = { 0 };
+        r.pc = I->pc; r.insn = I->insn;
+        if (cpu_stream_out(&cpu_streams[fold_s], &r, I->len == 2, I->len == 2 ? I->raw : I->insn & 0xFFFFu,
+                           fields[fold_s], &recs[i]) != 1) return 0;
+    }
+    ocv_fold_t f;
+    if (!cur_io->fold_make(cur_io, cpu_streams[fold_s].channel, &recs[0][0], (uint32_t)n, CPU_REC_WORDS, &f) || f.words > 4) return 0;
+    p->c = f.c; p->z = f.z; p->kc = f.kc; p->kz = f.kz; p->n = f.n; p->words = f.words;
+    for (uint32_t w = 0; w < f.words; w++) p->last[w] = f.last[w];
+    return 1;
 }
 #endif
 
@@ -829,7 +827,6 @@ static void run_program(ocv_model_io_t *io)
                 for (int k_ = 0; k_ < nr_; k_++) \
                     if (ocv_squash_push(sq_[s], rec_[k_], CPU_DUT.channels[cpu_streams[s].channel].rec_words)) \
                         io->squash_close(io, cpu_streams[s].channel); \
-                if (nr_ && (s) < 8) fz_pend[(s) & 7].valid = 0;   /* (its last record is this one now) */ \
                 emitted[cpu_streams[s].channel] += (uint64_t)nr_; \
                 if (cpu_streams[s].kind == CPU_S_ISSUE || cpu_streams[s].kind == CPU_S_RETIRE) issued += (uint64_t)nr_; \
                 break; \
@@ -854,7 +851,6 @@ static void run_program(ocv_model_io_t *io)
                 for (int k_ = 0; k_ < nr_; k_++) \
                     if (ocv_squash_push(sq_[s], rec_[k_], CPU_DUT.channels[cpu_streams[s].channel].rec_words)) \
                         io->squash_close(io, cpu_streams[s].channel); \
-                if (nr_ && (s) < 8) fz_pend[(s) & 7].valid = 0; \
             } else { \
                 en[s] += cpu_stream_out(&cpu_streams[s], rp, c, raw, F_, &ebuf[s][en[s]]); \
                 if (en[s] >= EBUF - 1) ebuf_flush(io, s); \
@@ -898,11 +894,17 @@ static void run_program(ocv_model_io_t *io)
         const uint8_t cls[7] = { COV_V_ZERO, COV_V_ONE, COV_V_M1, COV_V_MIN, COV_V_MAX, COV_V_POS, COV_V_NEG };
         memcpy(fz.cls, cls, sizeof cls);
         fz.exit_pc = CPU_EXIT;
+        /* chaining: the issue window too (its records as one piece per block) - required: the fused blocks then
+         * do all their work themselves, the model only counts */
+        if (fold_s >= 0 && fold && sq_[fold_s]) {
+            fz.istate = &sq_[fold_s]->n; fz.piece = fz_piece;
+            fz.last_off = (uint32_t)(offsetof(ocv_squash_t, last) - offsetof(ocv_squash_t, n));
+        } else ok = 0;
         if (!ok || !cpu->impl->fuse(cpu, &fz)) fzmask = 0;
     }
 #endif
     int8_t fzl[8]; int nfz = 0;                /* the streams in fzmask, as a list */
-    for (int s = 0; s < 8; s++) { if (fzmask >> s & 1) fzl[nfz++] = (int8_t)s; fz_pend[s].valid = 0; }
+    for (int s = 0; s < 8; s++) if (fzmask >> s & 1) fzl[nfz++] = (int8_t)s;
     unsigned fz_skip = 0;                      /* a fused block taken instruction by instruction: what its code did */
     int cov_skip = 0;
     fold_run++;
@@ -950,9 +952,47 @@ static void run_program(ocv_model_io_t *io)
         }
         bi = 0; folded = 0; cur_order = order; fz_skip = 0; cov_skip = 0;
         int k = -1;                            /* a block of k instructions; 0: one instruction in rb[0] */
-        if (by_blocks && (irq_seq == ~0ull || irq_seq - issued >= 256 + 64) && max_steps - n >= 64)   /* (no interrupt inside) */
+        uint32_t fz_n0[9];                     /* (chained: the windows' counts before) */
+        if (by_blocks && (irq_seq == ~0ull || irq_seq - issued >= 256 + 64) && max_steps - n >= 64) {   /* (no interrupt inside) */
+            /* chained blocks: as far as the next look at the interrupts, the DUT, the steps allows */
+            uint64_t bud = max_steps - n;
+            if (irq_seq != ~0ull) bud = bud < irq_seq - issued - 320 ? bud : irq_seq - issued - 320;
+            else if (irq_bound != UINT64_MAX) bud = bud < irq_bound - issued - IRQ_AHEAD ? bud : irq_bound - issued - IRQ_AHEAD;
+            if (io->idle && next_idle - n < bud) bud = next_idle - n;
+            if (irq_f && irq_seq == ~0ull && next_ask - n < bud) bud = next_ask - n;
+            bv.budget = bud > 0x40000000u ? 0x40000000u : (uint32_t)bud;
+            for (int t = 0; t < nfz; t++) fz_n0[t] = sq_[fzl[t]]->n;
+            if (nfz) fz_n0[8] = sq_[fold_s]->n;
             k = cpu->impl->block(cpu, &bv, &rb[0]);
+        }
 #if defined(CPU_FOR_STREAMS)
+        if (k > 0 && bv.fused && bv.done) {    /* chained: whole blocks done by their code - counted from the windows */
+            for (int t = 0; t < nfz; t++) emitted[cpu_streams[fzl[t]].channel] += sq_[fzl[t]]->n - fz_n0[t];
+            const uint32_t di = sq_[fold_s]->n - fz_n0[8];
+            emitted[cpu_streams[fold_s].channel] += di; issued += di;
+            order += bv.done; executed += bv.done; n += bv.done;
+            k -= (int)bv.done;
+            if (k == 0) {                      /* none left early: the end? (a jump there is a block's last) */
+                if (cpu_pc(cpu) == CPU_EXIT && bv.last) {
+                    const uint32_t op = bv.last->insn & 0x7f;
+                    if (!CPU_END_ISSUE || op == 0x6f || op == 0x67 || op == 0x63 || CPU_EXIT != bv.last->pc + bv.last->len) {
+                        ebuf_flush_all(io);
+                        if (CPU_END_ISSUE)     /* the core issues the instruction there, then stops */
+                            for (int s = 0; s < CPU_N_STREAMS; s++)
+                                if (cpu_streams[s].kind == CPU_S_ISSUE) {
+                                    uint32_t rec[CPU_REC_WORDS] = { 0 };
+                                    if (fields[s][0]) ocv_set_raw(rec, fields[s][0], CPU_EXIT);
+                                    if (fields[s][1]) ocv_set_raw(rec, fields[s][1], JUMP_SELF);
+                                    io->emit(io, cpu_streams[s].channel, rec);
+                                }
+                        break;
+                    }
+                }
+                n--; bn = 0;                   /* (the loop's n++) */
+                continue;
+            }
+            bv.key = 0; bv.user = NULL;        /* the one left early: as a fused block, below */
+        }
         if (k > 0) {
             const binfo_t *bi_ = NULL;         /* (kept with the translated block: no lookup per run) */
             if (bv.key) {
@@ -972,7 +1012,7 @@ static void run_program(ocv_model_io_t *io)
             if (!bv.fused || ends) memcpy(xr, bv.x, sizeof xr);
             static binfo_t bf_tmp;             /* (a block that left early: its info, not cached) */
             const binfo_t *const bf = !bv.fused ? NULL : bi_ ? bi_ : (binfo_fill(&bf_tmp, &bv, k), &bf_tmp);
-            if (bf) fused_done(&bv, bf, fzl, nfz, sq_);   /* fused: what the code did, into the windows */
+            if (bf) fused_done(bf, fzl, nfz, sq_);   /* fused, left early: what the code did, counted */
             if (ends) {                        /* the program's end inside: instruction by instruction below */
                 for (int i = 0; i < k; i++) block_retire(&bv, i, xr, &rb[i]);
                 bn = k;
@@ -1111,7 +1151,6 @@ static void run_program(ocv_model_io_t *io)
 #undef CPU_STREAM_DO
 #undef CPU_BLOCK_DO
 #undef CPU_FLD
-    fused_last(sq_);                           /* (the fused streams' last records, for the open windows) */
     ebuf_flush_all(io);
     /* watched values: not predicted - what the core gave goes into the comparison as it is */
     for (int s = 0; s < CPU_N_STREAMS; s++)
