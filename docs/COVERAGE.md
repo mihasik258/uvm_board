@@ -80,3 +80,24 @@
 - **2.4.** Скрипт проверки допущений по исходникам covergroup.
 - **2.5.** На плате: ключи в jit, отчёт после прогона, цена в тесте A.
 - **2.6.** То же для CV32E40P (`uvme_rv32isa_covg`) и SCR1.
+
+## Статус (21.10.2026)
+
+- **Сделано.**
+  - Verilator доработан: `tools/verilator/ocv_cva6_tb.patch`, тест `tools/verilator/test/t_cg_ieee.sv` —
+    19 форм совпадают с IEEE.
+  - Окружение CVA6 (`uvme_cva6_pkg` со всеми зависимостями) проходит разбор без правок тестбенча.
+    Пути — `build/t/covh/env.sh`, `files.f`.
+  - Регрессия Verilator по покрытию: изменились только случаи, где прежний результат расходился с IEEE
+    (`t_covergroup_auto_bin_max`, `cross`, сообщения «не поддерживается»).
+- **Дальше (2.1).**
+  - Тестовый класс-обвязка: их `uvme_cva6_cfg_c` (рандомизация, `cva6pkg_to_core_cntrl_cfg`,
+    `post_randomize`), агент isacov, `uvme_cva6_cov_model_c`, соединение как в `connect_coverage_model`.
+  - Записи RVFI — из файла через DPI.
+  - `dpi_dasm` собрать из `lib/dpi_dasm/dpi_dasm.cxx`, `spike/disasm.cc`, `regnames.cc` (core-v-verif
+    `mk/Common.mk:680`). Остальные DPI — заглушки.
+  - `coverage.dat` писать в `ocv_main.cpp`.
+- **Допущения.**
+  - AXI-покрытие и `iff` у бинов cross (только AXI) не поддерживаются.
+  - Фильтр `with` у массива фиксированного размера на диапазоне больше 2¹⁶ значений применяется после
+    деления на бины (34 места).
