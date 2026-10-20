@@ -4,6 +4,8 @@
 // against.
 //
 //   tb_pc [--batches N] [--max-cycles N (total, default 200M)] [--model-opt key=value ...]       (as the runner: gen=directed, program=..., cpu=...)
+//         [--vcd FILE --vcd-from C --vcd-to C]   a build with --trace (hw/cpu/run.sh, OCV_PC_VCD=1): the waveform of
+//                                                clocks C..C (a mismatch prints its clock: run again around it)
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,12 @@
 
 #include "verilated.h"
 #include "ocv_cpu_pc.h"
+#if VM_TRACE
+#include "verilated_vcd_c.h"
+static VerilatedVcdC *vcd;                     // --vcd: the waveform of clocks vcd_from..vcd_to
+static uint64_t vcd_from, vcd_to = UINT64_MAX;
+static void vcd_close() { if (vcd) { vcd->close(); delete vcd; vcd = nullptr; } }
+#endif
 
 extern "C" {
 #include "ocv.h"
@@ -78,6 +86,9 @@ void tick()
     }
 #endif
     dut->eval();
+#if VM_TRACE
+    if (vcd && cycles >= vcd_from) vcd->dump(2 * cycles);
+#endif
     was_ready = dut->prog_ready;
 #if CPU_PC_LATENCY
     const bool lat_taken = !lat_q.empty() && cpu_pc_lat_ready(dut);
@@ -89,6 +100,9 @@ void tick()
     for (int i = 0; i < CPU_PC_INPUTS; i++) in_taken[i] = in_give[i] && cpu_pc_in_ready(dut, i);
     Verilated::threadContextp()->time(cycles + 1);  // (the RTL's messages, e.g. a failed assertion, say the clock)
     dut->clk = 1; dut->eval();
+#if VM_TRACE
+    if (vcd && cycles >= vcd_from) { vcd->dump(2 * cycles + 1); if (cycles >= vcd_to) vcd_close(); }
+#endif
     if (++cycles > max_cycles) {            // a core that does not end: what it did so far was compared
         compare();
         printf("tb_pc: FAIL - the core still runs after %llu clocks (--max-cycles); %llu mismatch(es) before\n",
@@ -227,6 +241,9 @@ double now() { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec +
 int main(int argc, char **argv)
 {
     unsigned batches = 1;
+#if VM_TRACE
+    const char *vcd_file = nullptr;
+#endif
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--batches") && i + 1 < argc) batches = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-cycles") && i + 1 < argc) max_cycles = strtoull(argv[++i], 0, 0);
@@ -238,6 +255,14 @@ int main(int argc, char **argv)
                 fprintf(stderr, "tb_pc: model option '%s' not accepted\n", argv[i]);
                 return 2;
             }
+#if VM_TRACE
+        } else if (!strcmp(argv[i], "--vcd") && i + 1 < argc) {
+            Verilated::traceEverOn(true);
+            vcd = new VerilatedVcdC;
+            vcd_file = argv[++i];
+        } else if (!strcmp(argv[i], "--vcd-from") && i + 1 < argc) { vcd_from = strtoull(argv[++i], 0, 0);
+        } else if (!strcmp(argv[i], "--vcd-to") && i + 1 < argc) { vcd_to = strtoull(argv[++i], 0, 0);
+#endif
         } else if (strcmp(argv[i], "--reset-each-batch")) {
             fprintf(stderr, "tb_pc [--batches N] [--max-cycles N] [--model-opt key=value ...]\n");
             return 2;
@@ -245,6 +270,9 @@ int main(int argc, char **argv)
     }
     Verilated::commandArgs(1, argv);
     dut = new cpu_pc_top_t;
+#if VM_TRACE
+    if (vcd) { dut->trace(vcd, 99); vcd->open(vcd_file); std::atexit(vcd_close); }
+#endif
     for (int s = 0; s < NS; s++) {
         const ocv_channel_t *c = &ocv_model_dut->channels[1 + s];
         for (int j = 0; j < 6; j++)

@@ -571,8 +571,25 @@ static cpu_model_t *fast_create(const char *isa, const cpu_env_t *env, uint32_t 
 
 static uint32_t fast_xreg(cpu_model_t *m, int i) { return ((fast_t *)m)->x[i & 31]; }
 static uint32_t fast_pc(cpu_model_t *m) { return ((fast_t *)m)->pc; }
+/* the core profile's machine-mode state (cpu_arch_csrs): in the order a restore writes them */
+static int fast_arch_csrs(cpu_model_t *mm, uint32_t *csr, uint32_t *val, int max)
+{
+    fast_t *m = (fast_t *)mm;
+    static const uint32_t cv32[] = { 0x305, 0x340, 0x341, 0x342, 0x304, 0x300 };
+    static const uint32_t cva6[] = { 0x305, 0x340, 0x341, 0x342, 0x304, 0x300, 0xB82, 0xB02 };
+    if (!m->cv32) return 0;
+    const uint32_t *l = m->cva6 ? cva6 : cv32;
+    const int n = m->cva6 ? (int)(sizeof cva6 / sizeof *cva6) : (int)(sizeof cv32 / sizeof *cv32);
+    int k = 0;
+    for (int i = 0; i < n && k < max; i++) {
+        uint32_t v; int timing;
+        if (!(m->cva6 ? cva6_csr_read(m, l[i], 0, &v, &timing) : cv32_csr_read(m, l[i], 0, &v, &timing)) || timing) continue;
+        csr[k] = l[i]; val[k] = v; k++;
+    }
+    return k;
+}
 
 const cpu_impl_t cpu_fast_impl = {
     "fast", "\"iss\" as a predecoding interpreter (same semantics, faster on the board)", 0,
-    fast_create, fast_step, fast_xreg, fast_pc, fast_destroy, NULL, fast_interrupt, NULL, 1, NULL, NULL
+    fast_create, fast_step, fast_xreg, fast_pc, fast_destroy, NULL, fast_interrupt, NULL, 1, NULL, NULL, fast_arch_csrs
 };

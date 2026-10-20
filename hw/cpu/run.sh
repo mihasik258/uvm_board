@@ -4,6 +4,7 @@
 #
 #   hw/cpu/run.sh <core.bind> cosim gen:random|gen:directed|<program.hex> [-- <cosim/runner options>]
 #   hw/cpu/run.sh <core.bind> pc gen:directed|<program.hex> [-- --batches N]
+#                                                           (OCV_PC_VCD=1: a build with -- --vcd FILE --vcd-from C --vcd-to C)
 #                                                           the PC reference: the wrapper in Verilator (-O3),
 #                                                           the same model, no hub (hw/cpu/pc/tb_pc.cpp)
 #   hw/cpu/run.sh <core.bind> bench [-- --batches N --model-opt k=v]   the reference model path alone (no DUT):
@@ -51,7 +52,8 @@ case $MODE in
         shift
         [ "${1:-}" = "--" ] && shift
         # OCV_VLT_THREADS=N: the core in a multi-threaded Verilator model (the PC baseline's best single run)
-        P=$OUT/pc${OCV_VLT_THREADS:+_t$OCV_VLT_THREADS}
+        # OCV_PC_VCD=1: a build that can write a VCD file (tb_pc --vcd FILE --vcd-from C --vcd-to C) - its own directory
+        P=$OUT/pc${OCV_VLT_THREADS:+_t$OCV_VLT_THREADS}$([ "${OCV_PC_VCD:-0}" = 1 ] && echo _vcd || true)
         mkdir -p "$P/c"
         python3 "$OCV/gen/ocv_gen.py" "$DESC" -o "$P/gen" > "$P/gen.log"
         OBJS=()
@@ -69,6 +71,7 @@ case $MODE in
             verilator --cc --exe --build -j "${OCV_MAKE_J:-6}" -O3 --x-assign fast --x-initial fast \
                 $([ "${OCV_PC_ASSERT:-0}" = 1 ] && echo --assert || echo --noassert) \
                 $([ -n "${OCV_VLT_THREADS:-}" ] && echo --threads "$OCV_VLT_THREADS") \
+                $([ "${OCV_PC_VCD:-0}" = 1 ] && echo --trace) \
                 -Wno-fatal -Wno-lint -Wno-style $RTL_DEFINES --top-module "${NAME}_dut" "${RTL_SIM[@]}" \
                 "$OCV/hw/cpu/pc/tb_pc.cpp" -CFLAGS "-O2 -I$OUT/wrap -I$OCV/sw/include -I$P/gen $(sed -n 's/^#define CPU_STOP  *\(0x[0-9a-fA-F]*\)u.*/-DCPU_STOP_ADDR=\1u/p' "$OUT/wrap/ocv_cpu_wrap.h")" \
                 -LDFLAGS "${OBJS[*]}" --Mdir "$P/obj" -o tb_pc > "$P/build.log" 2>&1 \

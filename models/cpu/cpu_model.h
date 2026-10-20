@@ -158,6 +158,10 @@ typedef struct {
      * run: a window that would fill inside a block is left to the caller). Returns 0 if it will not. f stays the
      * caller's (read at translation and per block). */
     int          (*fuse)(cpu_model_t *m, const cpu_fuse_t *f);
+    /* optional: the machine-mode CSRs that are architectural state (what a checkpoint restores), current
+     * values: up to max into csr[]/val[], returns how many (counters the core supplies - mcycle, mip - are
+     * not among them) */
+    int          (*arch_csrs)(cpu_model_t *m, uint32_t *csr, uint32_t *val, int max);
 } cpu_impl_t;
 
 struct cpu_model { const cpu_impl_t *impl; };          /* first member of every implementation */
@@ -189,6 +193,10 @@ static inline int cpu_interrupt(cpu_model_t *m, uint32_t id)
 static inline void cpu_sync(cpu_model_t *m, uint64_t n) { if (m->impl->sync) m->impl->sync(m, n); }
 static inline uint32_t cpu_xreg(cpu_model_t *m, int i)           { return m->impl->xreg(m, i); }
 static inline uint32_t cpu_pc(cpu_model_t *m)                    { return m->impl->pc(m); }
+static inline int      cpu_arch_csrs(cpu_model_t *m, uint32_t *csr, uint32_t *val, int max)
+{
+    return m->impl->arch_csrs ? m->impl->arch_csrs(m, csr, val, max) : 0;
+}
 static inline void     cpu_destroy(cpu_model_t *m)               { if (m) m->impl->destroy(m); }
 /* the names of the implementations built in, space separated */
 const char *cpu_impls(void);

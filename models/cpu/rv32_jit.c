@@ -1072,6 +1072,10 @@ static uint32_t jit_pc(cpu_model_t *m)
     if (j->cur_i < j->cur_n) return j->cur[j->cur_i].pc;
     return j->f.pc;
 }
+static int jit_arch_csrs(cpu_model_t *m, uint32_t *csr, uint32_t *val, int max)
+{
+    return fast_arch_csrs(&((jit_t *)m)->f.base, csr, val, max);   /* (CSRs: only the interpreter writes them) */
+}
 
 /* the next block as a whole (cpu_block_t): its table and outputs as they are, nothing handed out */
 static int jit_block(cpu_model_t *mm, cpu_block_t *b, cpu_retire_t *r)
@@ -1112,6 +1116,7 @@ _Static_assert(offsetof(jit_t, n_chained) < 4 * 4000, "jit_t: the fields the gen
 
 static const cpu_impl_t cpu_jit_impl = {
     "jit", "\"fast\" translated block by block into AArch64 code (the board's A72)", 0,
-    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1, jit_block, jit_fuse
+    jit_create, jit_step, jit_xreg, jit_pc, jit_destroy, jit_step_n, jit_interrupt, jit_sync, 1, jit_block, jit_fuse,
+    jit_arch_csrs
 };
 #endif

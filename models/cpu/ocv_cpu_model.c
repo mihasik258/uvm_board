@@ -95,6 +95,10 @@ static void images_clear(void) { rams_alloc(); for (int r = 0; r < CPU_N_RAMS; r
 static uint8_t *extra_mem[CPU_N_REGIONS_EXTRA + 1];
 static int      have_image;
 static uint64_t max_steps = 100000000;
+/* checkpoint (ckpt_write): the channel and record of a failing window, the margin before it, the files */
+static char     ckpt_name[32], ckpt_file[256] = "ckpt";
+static uint64_t ckpt_rec, ckpt_margin = 2048, ckpt_order;   /* ckpt_order: at that instruction instead */
+static int      ckpt_ch = -1;
 /* jit on the board by default: OCV is for the long tests (hundreds of millions of instructions, tens of minutes
  * on the PC) - there it beats fast (board 14.10.2026, CVA6 Embench x100: nettle-aes 196 -> 164 s, picojpeg
  * 131 -> 112 s, huffbench 90 -> 82 s). On short generated programs (code run once) fast is quicker, but those
@@ -218,6 +222,16 @@ static int configure(const char *key, const char *value)
     if (!strcmp(key, "irq"))   { irq_hold = strtoull(value, 0, 0); irq_hold_set = 1; return 0; }
     if (!strcmp(key, "strict")) { errata_strict = atoi(value); return 0; }
     if (!strcmp(key, "max"))   { max_steps = strtoull(value, 0, 0); return max_steps == 0; }
+    if (!strcmp(key, "ckpt")) {                /* <channel>:<record> - see ckpt_write */
+        const char *c = strrchr(value, ':');
+        if (!c || c == value || (size_t)(c - value) >= sizeof ckpt_name) return 1;
+        memcpy(ckpt_name, value, (size_t)(c - value)); ckpt_name[c - value] = 0;
+        ckpt_rec = strtoull(c + 1, 0, 0);
+        return 0;
+    }
+    if (!strcmp(key, "ckpt_margin")) { ckpt_margin = strtoull(value, 0, 0); return 0; }
+    if (!strcmp(key, "ckpt_order"))  { ckpt_order = strtoull(value, 0, 0); return ckpt_order == 0; }
+    if (!strcmp(key, "ckpt_file"))   { snprintf(ckpt_file, sizeof ckpt_file, "%s", value); return 0; }
     if (!strcmp(key, "lat"))   return sscanf(value, "%u,%u", &lat_g, &lat_r) != 2 || lat_g > 255 || lat_r > 255;
     return -1;
 }
@@ -733,6 +747,148 @@ static inline __attribute__((always_inline)) void block_retire(const cpu_block_t
     xr[I->rd] = r->rd_wdata;                   /* (rd 0: 0 into x0) */
 }
 
+/* ---------------- checkpoint (--model-opt ckpt=<channel>:<record>) ----------------
+ * A failure the board found deep in a long test (a squash window of <channel> starting at <record>) is looked
+ * at on a PC without simulating the RTL all the way there: the model alone runs up to ckpt_margin records of
+ * that channel before it and writes the architectural state as a program, <ckpt_file>.hex - the RAM as the
+ * model has it, and a loader under the stack pointer (the ABI leaves that memory free; without a stack, in RAM
+ * the run left zero) that the boot address
+ * jumps to: it puts the boot words back (fence.i), writes the machine-mode CSRs (cpu_arch_csrs: minstret set so
+ * that it reads right at the checkpoint's instruction), the registers, and mret's to the checkpoint's pc (so
+ * mepc reads that pc afterwards, mstatus.MPIE 1). The core and the model both run that program from reset:
+ * every record is checked as usual, and record k of a channel on the PC is record k - loader + at[channel] of
+ * the run (<ckpt_file>.txt). ckpt_order=<n>: at instruction n instead. Microarchitectural state (caches, predictors) is not carried: a failure that
+ * depends on it needs a larger margin (a warm-up). */
+
+enum { RV_T0 = 5, RV_T1 = 6, RV_T2 = 7 };
+static uint32_t rv_i(uint32_t op, uint32_t f3, uint32_t rd, uint32_t rs1, int32_t imm)
+{ return ((uint32_t)imm & 0xFFFu) << 20 | rs1 << 15 | f3 << 12 | rd << 7 | op; }
+static uint32_t rv_lui(uint32_t rd, uint32_t v) { return ((v + 0x800u) & 0xFFFFF000u) | rd << 7 | 0x37u; }
+static int32_t  rv_lo(uint32_t v) { return (int32_t)(v << 20) >> 20; }
+static uint32_t rv_sw(uint32_t rs2, uint32_t rs1, int32_t imm)
+{ return ((uint32_t)imm >> 5 & 0x7Fu) << 25 | rs2 << 20 | rs1 << 15 | 2u << 12 | ((uint32_t)imm & 0x1Fu) << 7 | 0x23u; }
+#define RV_LW(rd, rs1, off)   rv_i(0x03u, 2, rd, rs1, off)
+#define RV_ADDI(rd, rs1, imm) rv_i(0x13u, 0, rd, rs1, imm)
+#define RV_JALR(rd, rs1, off) rv_i(0x67u, 0, rd, rs1, off)
+#define RV_CSRW(csr, rs1)     rv_i(0x73u, 1, 0, rs1, (int32_t)(csr))
+#define RV_FENCE_I 0x0000100Fu
+#define RV_MRET    0x30200073u
+
+static void ckpt_write(cpu_model_t *cpu, uint64_t order)
+{
+    uint32_t x[32], csr[16], val[16];
+    for (int i = 1; i < 32; i++) x[i] = cpu_xreg(cpu, i);
+    const uint32_t pc = cpu_pc(cpu);
+    const int nc = cpu_arch_csrs(cpu, csr, val, 16);
+    /* the loader: a table (x1..x31, the boot words, CSR values) then the code, below sp */
+    enum { TAB = 0, T_BOOT = 31 * 4, T_CSR = T_BOOT + 8, CODE = 0x100, SIZE = 0x400, GAP = 0x400 };
+    uint32_t S = ((x[2] - GAP - SIZE) & ~0xFu);
+    int sr = ram_of(S, SIZE);
+    for (int r = CPU_N_RAMS - 1; sr < 0 && r >= 0; r--)         /* no stack: memory the run left zero, from the top */
+        for (uint32_t a = cpu_rams[r][1] >= SIZE ? (cpu_rams[r][1] - SIZE) & ~0xFFu : 1u; sr < 0 && a != 1u; ) {
+            int z = 1;
+            for (uint32_t j = 0; j < SIZE && z; j++) z = !mem[r][a + j];
+            if (z) { S = cpu_rams[r][0] + a; sr = r; }
+            a = a >= 0x100u ? a - 0x100u : 1u;
+        }
+    const int br = ram_of(CPU_BOOT, 8);
+    if (sr < 0 || br < 0) {
+        fprintf(stderr, "%s model: checkpoint - no free RAM for the loader (or no RAM at the boot address)\n", CPU_NAME);
+        exit(1);
+    }
+    uint8_t *M = mem[sr] + (S - cpu_rams[sr][0]), *B = mem[br] + (CPU_BOOT - cpu_rams[br][0]);
+    uint32_t tab[(CODE - TAB) / 4] = { 0 }, code[(SIZE - CODE) / 4], n = 0;
+    for (int i = 1; i < 32; i++) tab[i - 1] = x[i];
+    memcpy(&tab[T_BOOT / 4], B, 8);
+    uint64_t instret = 0; int has_instret = 0;
+    for (int k = 0; k < nc; k++) {
+        if (csr[k] == 0xB02) { instret |= val[k]; has_instret = 1; }
+        if (csr[k] == 0xB82) { instret |= (uint64_t)val[k] << 32; has_instret = 1; }
+    }
+    instret -= 3;                              /* counted after the minstret write: lw, lw, mret */
+    int t = T_CSR / 4;
+    code[n++] = rv_lui(RV_T1, S); code[n++] = RV_ADDI(RV_T1, RV_T1, rv_lo(S));
+    code[n++] = RV_ADDI(RV_T0, 0, (int32_t)CPU_BOOT);           /* (the boot address: below 2 KiB) */
+    code[n++] = RV_LW(RV_T2, RV_T1, T_BOOT);     code[n++] = rv_sw(RV_T2, RV_T0, 0);
+    code[n++] = RV_LW(RV_T2, RV_T1, T_BOOT + 4); code[n++] = rv_sw(RV_T2, RV_T0, 4);
+    code[n++] = RV_FENCE_I;
+    for (int k = 0; k < nc; k++) {
+        uint32_t v = val[k];
+        if (csr[k] == 0xB02) continue;         /* last (below) */
+        if (csr[k] == 0xB82) v = (uint32_t)(instret >> 32);
+        if (csr[k] == 0x341) v = pc;           /* mepc: mret goes there */
+        if (csr[k] == 0x300) v = (v & ~0x88u) | (v >> 3 & 1u) << 7 | 3u << 11;   /* MIE 0, MPIE = MIE, MPP M */
+        tab[t] = v;
+        code[n++] = RV_LW(RV_T2, RV_T1, t * 4); code[n++] = RV_CSRW(csr[k], RV_T2);
+        t++;
+    }
+    for (int i = 1; i < 32; i++)
+        if (i != RV_T1 && i != RV_T2) code[n++] = RV_LW((uint32_t)i, RV_T1, (i - 1) * 4);
+    if (has_instret) {
+        tab[t] = (uint32_t)instret;
+        code[n++] = RV_LW(RV_T2, RV_T1, t * 4); code[n++] = RV_CSRW(0xB02, RV_T2);
+        t++;
+    }
+    code[n++] = RV_LW(RV_T2, RV_T1, (RV_T2 - 1) * 4);
+    code[n++] = RV_LW(RV_T1, RV_T1, (RV_T1 - 1) * 4);
+    code[n++] = RV_MRET;
+    /* the RAM image with the loader in it, the boot words pointing at it */
+    uint8_t save[SIZE], bsave[8];
+    memcpy(save, M, SIZE); memcpy(bsave, B, 8);
+    memcpy(M, tab, sizeof tab); memcpy(M + CODE, code, n * 4u);
+    const uint32_t boot[2] = { rv_lui(RV_T0, S + CODE), RV_JALR(0, RV_T0, rv_lo(S + CODE)) };
+    memcpy(B, boot, 8);
+    char fn[300];
+    snprintf(fn, sizeof fn, "%s.hex", ckpt_file);
+    FILE *f = fopen(fn, "w");
+    if (!f) { perror(fn); exit(1); }
+    for (int r = 0; r < CPU_N_RAMS; r++)
+        for (uint32_t a = 0; a < cpu_rams[r][1]; a += 16) {
+            const uint8_t *p = mem[r] + a;
+            int z = 1;
+            for (int j = 0; j < 16 && z; j++) z = !p[j];
+            if (z) continue;
+            fprintf(f, "@%08X\n", cpu_rams[r][0] + a);
+            for (int j = 0; j < 16 && a + j < cpu_rams[r][1]; j++) fprintf(f, "%02X%c", p[j], j == 15 ? '\n' : ' ');
+        }
+    fclose(f);
+    memcpy(M, save, SIZE); memcpy(B, bsave, 8);
+    /* the loader's records per channel (what the PC run makes before the checkpoint's instruction) */
+    snprintf(fn, sizeof fn, "%s.txt", ckpt_file);
+    f = fopen(fn, "w");
+    if (!f) { perror(fn); exit(1); }
+    fprintf(f, "# %s checkpoint: the run's state before instruction %llu (pc 0x%08x)\n", CPU_NAME, (unsigned long long)order, pc);
+    fprintf(f, "order %llu\npc 0x%08x\n", (unsigned long long)order, pc);
+    uint32_t all[2 + (SIZE - CODE) / 4];
+    all[0] = boot[0]; all[1] = boot[1];
+    memcpy(all + 2, code, n * 4u);
+    for (int s = 0; s < CPU_N_STREAMS; s++) {
+        const int ch = cpu_streams[s].channel;
+        uint64_t k = 0;
+        for (uint32_t i = 0; i < n + 2; i++) {
+            const uint32_t op = all[i] & 0x7f, rd = all[i] >> 7 & 31, ld = op == 0x03;
+            switch (cpu_streams[s].kind) {
+            case CPU_S_RETIRE: case CPU_S_ISSUE: k++; break;
+            case CPU_S_REGW:
+                if (rd && op != 0x23 && op != 0x0F && op != 0x73 &&
+                    (cpu_streams[s].filter == CPU_W_ALL || (cpu_streams[s].filter == CPU_W_LOAD) == ld)) k++;
+                break;
+            case CPU_S_STORE: if (op == 0x23) k++; break;
+            default: break;
+            }
+        }
+        fprintf(f, "channel %s at %llu loader %llu\n", CPU_DUT.channels[ch].name, (unsigned long long)emitted[ch],
+                (unsigned long long)k);
+    }
+    fclose(f);
+    printf("%s model: checkpoint %s.hex / .txt - before instruction %llu, pc 0x%08x", CPU_NAME, ckpt_file,
+           (unsigned long long)order, pc);
+    if (ckpt_ch >= 0) printf(", %s record %llu", ckpt_name, (unsigned long long)emitted[ckpt_ch]);
+    printf("\n");
+    fflush(stdout);
+    exit(0);
+}
+
 static void run_program(ocv_model_io_t *io)
 {
     static int init;
@@ -919,8 +1075,14 @@ static void run_program(ocv_model_io_t *io)
     unsigned fz_skip = 0;                      /* a fused block taken instruction by instruction: what its code did */
     int cov_skip = 0;
     fold_run++;
+    ckpt_ch = -1;
+    for (int c = 0; ckpt_name[0] && c < CPU_DUT.n_channels; c++)
+        if (!strcmp(CPU_DUT.channels[c].name, ckpt_name)) ckpt_ch = c;
+    if (ckpt_name[0] && ckpt_ch < 0) { fprintf(stderr, "%s model: ckpt - no channel '%s'\n", CPU_NAME, ckpt_name); exit(1); }
+    const uint64_t ckpt_at = ckpt_rec > ckpt_margin ? ckpt_rec - ckpt_margin : 0;
     for (uint64_t n = 0; n < max_steps; n++) {
       if (bi == bn) {                          /* the next instruction(s) */
+        if ((ckpt_ch >= 0 && emitted[ckpt_ch] >= ckpt_at) || (ckpt_order && n >= ckpt_order)) ckpt_write(cpu, n);
         /* no interrupt known yet: ask again now and then - a testbench running the core alongside the model
          * (tb_pc) answers only as far as the core has run (not yet = none) */
         if (n >= next_ask) { next_ask = n + 0x10000; if (irq_f && irq_seq == ~0ull) NEXT_IRQ(); }
@@ -971,6 +1133,9 @@ static void run_program(ocv_model_io_t *io)
             else if (irq_bound != UINT64_MAX) bud = bud < irq_bound - issued - IRQ_AHEAD ? bud : irq_bound - issued - IRQ_AHEAD;
             if (io->idle && next_idle - n < bud) bud = next_idle - n;
             if (irq_f && irq_seq == ~0ull && next_ask - n < bud) bud = next_ask - n;
+            if (ckpt_ch >= 0 && ckpt_at - emitted[ckpt_ch] < bud) bud = ckpt_at - emitted[ckpt_ch];   /* (a record or two
+                                                * per instruction at most: the checkpoint comes a little early) */
+            if (ckpt_order && ckpt_order - n < bud) bud = ckpt_order - n;
             bv.budget = bud > 0x40000000u ? 0x40000000u : (uint32_t)bud;
             for (int t = 0; t < nfz; t++) fz_n0[t] = sq_[fzl[t]]->n;
             if (nfz) fz_n0[8] = sq_[fold_s]->n;
