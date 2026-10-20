@@ -1,0 +1,966 @@
+`begin_keywords "1800-2023"
+`line 1 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 1
+
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+
+`line 17 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+
+`line 19 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+ 
+ 
+ 
+ 
+
+
+`line 26 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+ 
+ 
+package ariane_pkg;
+
+`line 31 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam BITS_SATURATION_COUNTER = 2;
+
+`line 34 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam logic [2:0] DEPTH_SPEC = 'd4;
+
+`line 37 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+   
+   
+   
+  localparam logic [2:0] DEPTH_COMMIT = 'd4;
+
+`line 45 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam int unsigned LAT_COMP_FP32 = 'd2;
+  localparam int unsigned LAT_COMP_FP64 = 'd3;
+  localparam int unsigned LAT_COMP_FP16 = 'd1;
+  localparam int unsigned LAT_COMP_FP16ALT = 'd1;
+  localparam int unsigned LAT_COMP_FP8 = 'd1;
+  localparam int unsigned LAT_DIVSQRT = 'd2;
+  localparam int unsigned LAT_NONCOMP = 'd1;
+  localparam int unsigned LAT_CONV = 'd2;
+
+`line 55 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam logic [31:0] OPENHWGROUP_MVENDORID = 32'h0602;
+  localparam logic [31:0] ARIANE_MARCHID = 32'd3;
+  localparam logic [31:0] ARIANE_MIMPID = 32'd0;
+
+`line 59 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam REG_ADDR_SIZE = 5;
+
+`line 62 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam NR_RGPR_PORTS = 2;
+
+`line 65 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+  localparam logic [2:0] CauseBreakpoint = 3'h1;
+  localparam logic [2:0] CauseTrigger = 3'h2;
+  localparam logic [2:0] CauseRequest = 3'h3;
+  localparam logic [2:0] CauseSingleStep = 3'h4;
+   
+  localparam logic [3:0] DataCount = 4'h2;
+
+`line 74 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+  localparam logic [11:0] DataAddr = 12'h380;   
+  typedef struct packed {
+    logic [31:24] zero1;
+    logic [23:20] nscratch;
+    logic [19:17] zero0;
+    logic         dataaccess;
+    logic [15:12] datasize;
+    logic [11:0]  dataaddr;
+  } hartinfo_t;
+
+`line 86 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam hartinfo_t DebugHartInfo = '{
+      zero1: '0,
+      nscratch: 2,   
+      zero0: '0,
+      dataaccess: 1'b1,   
+      datasize: DataCount,
+      dataaddr: DataAddr
+  };
+
+`line 95 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam bit ENABLE_SPIKE_COMMIT_LOG = 1'b1;
+
+`line 98 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+   
+  localparam logic INVALIDATE_ON_FLUSH = 1'b1;
+
+`line 104 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+  
+  
+      
+
+`line 109 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam bit ZERO_TVAL = 1'b0;
+
+
+`line 112 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic [63:0] smode_status_read_mask(config_pkg::cva6_cfg_t Cfg);
+    return riscv::SSTATUS_UIE
+    | riscv::SSTATUS_SIE
+    | riscv::SSTATUS_SPIE
+    | riscv::SSTATUS_UBE
+    | riscv::SSTATUS_SPP
+    | riscv::SSTATUS_FS
+    | riscv::SSTATUS_XS
+    | riscv::SSTATUS_SUM
+    | riscv::SSTATUS_MXR
+    | riscv::SSTATUS_UPIE
+    | riscv::SSTATUS_SPIE
+    | riscv::SSTATUS_UXL
+    | riscv::sstatus_sd(Cfg.IS_XLEN64);
+  endfunction
+
+`line 129 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam logic [63:0] SMODE_STATUS_WRITE_MASK = riscv::SSTATUS_SIE
+                                                    | riscv::SSTATUS_SPIE
+                                                    | riscv::SSTATUS_SPP
+                                                    | riscv::SSTATUS_FS
+                                                    | riscv::SSTATUS_SUM
+                                                    | riscv::SSTATUS_MXR;
+
+`line 136 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam logic [63:0] HSTATUS_WRITE_MASK      = riscv::HSTATUS_VSBE
+                                                    | riscv::HSTATUS_GVA
+                                                    | riscv::HSTATUS_SPV
+                                                    | riscv::HSTATUS_SPVP
+                                                    | riscv::HSTATUS_HU
+                                                    | riscv::HSTATUS_VTVM
+                                                    | riscv::HSTATUS_VTW
+                                                    | riscv::HSTATUS_VTSR;
+
+`line 145 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic [31:0] hs_deleg_interrupts(config_pkg::cva6_cfg_t Cfg);
+    return riscv::MIP_VSSIP | riscv::MIP_VSTIP | riscv::MIP_VSEIP;
+  endfunction
+
+`line 150 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic [31:0] vs_deleg_interrupts(config_pkg::cva6_cfg_t Cfg);
+    return riscv::MIP_VSSIP | riscv::MIP_VSTIP | riscv::MIP_VSEIP;
+  endfunction
+
+`line 155 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+
+`line 159 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef enum logic {
+    SINGLE_REQ,
+    CACHE_LINE_REQ
+  } ad_req_t;
+
+`line 164 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+
+`line 168 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam int unsigned FETCH_FIFO_DEPTH = 4;
+  localparam int unsigned FETCH_ADDR_FIFO_DEPTH = 2;
+
+`line 172 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef enum logic [2:0] {
+    NoCF,     
+    Branch,   
+    Jump,     
+    JumpR,    
+    Return    
+  } cf_t;
+
+`line 180 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef struct packed {
+    logic valid;
+    logic taken;
+  } bht_prediction_t;
+
+`line 185 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef struct packed {
+    logic       valid;
+    logic [1:0] saturation_counter;
+  } bht_t;
+
+`line 190 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef enum logic [3:0] {
+    NONE,        
+    LOAD,        
+    STORE,       
+    ALU,         
+    CTRL_FLOW,   
+    MULT,        
+    CSR,         
+    FPU,         
+    FPU_VEC,     
+    CVXIF,       
+    ACCEL,       
+    AES          
+  } fu_t;
+
+`line 205 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  localparam FLU_WB = 0;
+  localparam STORE_WB = 1;
+  localparam LOAD_WB = 2;
+  localparam FPU_WB = 3;
+  localparam ACC_WB = 4;
+  localparam X_WB = 4;
+
+`line 213 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam EXC_OFF_RST = 8'h80;
+
+`line 215 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam SupervisorIrq = 1;
+  localparam MachineIrq = 0;
+
+`line 218 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+
+`line 222 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+ 
+
+`line 225 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 229 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 233 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 237 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 241 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 245 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 249 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+ 
+   
+
+
+`line 253 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  
+       
+       
+         
+         
+       
+               
+  
+       
+       
+         
+         
+               
+       
+
+`line 268 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+       
+
+
+`line 271 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+
+`line 275 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef enum logic [7:0] {   
+    ADD,
+    SUB,
+    ADDW,
+    SUBW,
+     
+    XORL,
+    ORL,
+    ANDL,
+     
+    SRA,
+    SRL,
+    SLL,
+    SRLW,
+    SLLW,
+    SRAW,
+     
+    LTS,
+    LTU,
+    GES,
+    GEU,
+    EQ,
+    NE,
+     
+    JALR,
+    BRANCH,
+     
+    SLTS,
+    SLTU,
+     
+    MRET,
+    SRET,
+    DRET,
+    ECALL,
+    WFI,
+    FENCE,
+    FENCE_I,
+    SFENCE_VMA,
+    HFENCE_VVMA,
+    HFENCE_GVMA,
+    CSR_WRITE,
+    CSR_READ,
+    CSR_SET,
+    CSR_CLEAR,
+     
+    LD,
+    SD,
+    LW,
+    LWU,
+    SW,
+    LH,
+    LHU,
+    SH,
+    LB,
+    SB,
+    LBU,
+     
+    HLV_B,
+    HLV_BU,
+    HLV_H,
+    HLV_HU,
+    HLVX_HU,
+    HLV_W,
+    HLVX_WU,
+    HSV_B,
+    HSV_H,
+    HSV_W,
+    HLV_WU,
+    HLV_D,
+    HSV_D,
+     
+    AMO_LRW,
+    AMO_LRD,
+    AMO_SCW,
+    AMO_SCD,
+    AMO_SWAPW,
+    AMO_ADDW,
+    AMO_ANDW,
+    AMO_ORW,
+    AMO_XORW,
+    AMO_MAXW,
+    AMO_MAXWU,
+    AMO_MINW,
+    AMO_MINWU,
+    AMO_SWAPD,
+    AMO_ADDD,
+    AMO_ANDD,
+    AMO_ORD,
+    AMO_XORD,
+    AMO_MAXD,
+    AMO_MAXDU,
+    AMO_MIND,
+    AMO_MINDU,
+     
+    CBO_CLEAN,
+    CBO_FLUSH,
+    CBO_INVAL,
+    CBO_NONE,
+     
+    MUL,
+    MULH,
+    MULHU,
+    MULHSU,
+    MULW,
+     
+    DIV,
+    DIVU,
+    DIVW,
+    DIVUW,
+    REM,
+    REMU,
+    REMW,
+    REMUW,
+     
+    FLD,
+    FLW,
+    FLH,
+    FLB,
+    FSD,
+    FSW,
+    FSH,
+    FSB,
+     
+    FADD,
+    FSUB,
+    FMUL,
+    FDIV,
+    FMIN_MAX,
+    FSQRT,
+    FMADD,
+    FMSUB,
+    FNMSUB,
+    FNMADD,
+     
+    FCVT_F2I,
+    FCVT_I2F,
+    FCVT_F2F,
+    FSGNJ,
+    FMV_F2X,
+    FMV_X2F,
+     
+    FCMP,
+     
+    FCLASS,
+     
+    VFMIN,
+    VFMAX,
+    VFSGNJ,
+    VFSGNJN,
+    VFSGNJX,
+    VFEQ,
+    VFNE,
+    VFLT,
+    VFGE,
+    VFLE,
+    VFGT,
+    VFCPKAB_S,
+    VFCPKCD_S,
+    VFCPKAB_D,
+    VFCPKCD_D,
+     
+    OFFLOAD,
+     
+    ORCB,
+    REV8,
+     
+    ROL,
+    ROLW,
+    ROR,
+    RORI,
+    RORIW,
+    RORW,
+     
+    SEXTB,
+    SEXTH,
+    ZEXTH,
+     
+    CPOP,
+    CPOPW,
+     
+    CLZ,
+    CLZW,
+    CTZ,
+    CTZW,
+     
+    CLMUL,
+    CLMULH,
+    CLMULR,
+     
+    BCLR,
+    BCLRI,
+    BEXT,
+    BEXTI,
+    BINV,
+    BINVI,
+    BSET,
+    BSETI,
+     
+    MAX,
+    MAXU,
+    MIN,
+    MINU,
+     
+    SH1ADDUW,
+    SH2ADDUW,
+    SH3ADDUW,
+    ADDUW,
+    SLLIUW,
+     
+    SH1ADD,
+    SH2ADD,
+    SH3ADD,
+     
+    ANDN,
+    ORN,
+    XNOR,
+     
+    ACCEL_OP,
+    ACCEL_OP_FS1,
+    ACCEL_OP_FD,
+    ACCEL_OP_LOAD,
+    ACCEL_OP_STORE,
+     
+    CZERO_EQZ,
+    CZERO_NEZ,
+     
+    PACK,
+    PACK_H,
+    PACK_W,
+     
+    BREV8,
+     
+    UNZIP,
+    ZIP,
+     
+    XPERM8,
+    XPERM4,
+     
+    AES32ESI,
+    AES32ESMI,
+    AES64ES,
+    AES64ESM,
+     
+    AES32DSI,
+    AES32DSMI,
+    AES64DS,
+    AES64DSM,
+    AES64IM,
+     
+    AES64KS1I,
+    AES64KS2,
+     
+    SHA256SIG0,
+    SHA256SIG1,
+    SHA256SUM0,
+    SHA256SUM1,
+    SHA512SIG0H,
+    SHA512SIG0L,
+    SHA512SIG1H,
+    SHA512SIG1L,
+    SHA512SUM0R,
+    SHA512SUM1R,
+    SHA512SIG0,
+    SHA512SIG1,
+    SHA512SUM0,
+    SHA512SUM1
+  } fu_op;
+
+`line 543 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef struct packed {
+    logic rs1_from_rd;
+    logic rs2_from_rd;
+  } alu_bypass_t;
+
+`line 548 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  function automatic logic op_is_branch(input fu_op op);
+    unique case (op) inside
+      EQ, NE, LTS, GES, LTU, GEU: return 1'b1;
+      default:                    return 1'b0;   
+    endcase
+  endfunction
+
+`line 555 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+   
+   
+  function automatic logic is_rs1_fpr(input fu_op op);
+    unique case (op) inside
+      [FMUL : FNMADD],   
+      FCVT_F2I,   
+      FCVT_F2F,   
+      FSGNJ,   
+      FMV_F2X,   
+      FCMP,   
+      FCLASS,   
+      [VFMIN : VFCPKCD_D],   
+      ACCEL_OP_FS1:
+      return 1'b1;   
+      default: return 1'b0;   
+    endcase
+  endfunction
+
+`line 576 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+  function automatic logic is_rs2_fpr(input fu_op op);
+    unique case (op) inside
+      [FSD : FSB],   
+      [FADD : FMIN_MAX],   
+      [FMADD : FNMADD],   
+      FCVT_F2F,   
+      [FSGNJ : FMV_F2X],   
+      FCMP,   
+      [VFMIN : VFCPKCD_D]:
+      return 1'b1;   
+      default: return 1'b0;   
+    endcase
+  endfunction
+
+`line 592 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+  function automatic logic is_imm_fpr(input fu_op op);
+    unique case (op) inside
+      [FADD : FSUB],   
+      [FMADD : FNMADD],   
+      [VFCPKAB_S : VFCPKCD_D]:
+      return 1'b1;   
+      default: return 1'b0;   
+    endcase
+  endfunction
+
+`line 605 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+  function automatic logic is_rd_fpr(input fu_op op);
+    unique case (op) inside
+      [FLD : FLB],   
+      [FADD : FNMADD],   
+      FCVT_I2F,   
+      FCVT_F2F,   
+      FSGNJ,   
+      FMV_X2F,   
+      [VFMIN : VFSGNJX],   
+      [VFCPKAB_S : VFCPKCD_D],   
+      ACCEL_OP_FD:
+      return 1'b1;   
+      default: return 1'b0;   
+    endcase
+  endfunction
+
+`line 623 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  function automatic logic fd_changes_rd_state(input fu_op op);
+    unique case (op) inside
+      FSD, FSW, FSH, FSB,   
+      FCVT_F2I,   
+      FMV_F2X,   
+      FCLASS:   
+      return 1'b0;   
+      default: return 1'b1;   
+    endcase
+  endfunction
+
+`line 634 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  function automatic logic is_amo(fu_op op);
+    case (op) inside
+      [AMO_LRW : AMO_MINDU]: begin
+        return 1'b1;
+      end
+      default: return 1'b0;
+    endcase
+  endfunction
+
+`line 643 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+  localparam int unsigned MHPMCounterNum = 6;
+
+`line 648 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+  typedef enum logic [3:0] {
+    AMO_NONE = 4'b0000,
+    AMO_LR   = 4'b0001,
+    AMO_SC   = 4'b0010,
+    AMO_SWAP = 4'b0011,
+    AMO_ADD  = 4'b0100,
+    AMO_AND  = 4'b0101,
+    AMO_OR   = 4'b0110,
+    AMO_XOR  = 4'b0111,
+    AMO_MAX  = 4'b1000,
+    AMO_MAXU = 4'b1001,
+    AMO_MIN  = 4'b1010,
+    AMO_MINU = 4'b1011,
+    AMO_CAS1 = 4'b1100,   
+    AMO_CAS2 = 4'b1101    
+  } amo_t;
+
+`line 668 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+  localparam PPN4K_WIDTH = 38;
+
+`line 672 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef struct packed {
+    logic             valid;     
+    logic             is_4M;    
+    logic [20-1:0]    vpn;       
+    logic [9-1:0]     asid;      
+    riscv::pte_sv32_t content;
+  } tlb_update_sv32_t;
+
+`line 680 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  typedef enum logic [1:0] {
+    FE_NONE,
+    FE_INSTR_ACCESS_FAULT,
+    FE_INSTR_PAGE_FAULT,
+    FE_INSTR_GUEST_PAGE_FAULT
+  } frontend_exception_t;
+
+`line 687 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+   
+  typedef struct packed {
+    logic        req;         
+    amo_t        amo_op;      
+    logic [1:0]  size;        
+    logic [63:0] operand_a;   
+    logic [63:0] operand_b;   
+  } amo_req_t;
+
+`line 699 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  typedef struct packed {
+    logic        ack;      
+    logic [63:0] result;   
+  } amo_resp_t;
+
+`line 705 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  localparam RVFI = cva6_config_pkg::CVA6ConfigRvfiTrace;
+
+`line 707 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+  function automatic logic [63:0] sext32to64(logic [31:0] operand);
+    return {{32{operand[31]}}, operand[31:0]};
+  endfunction
+
+`line 714 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+   
+  function automatic logic [7:0] be_gen(logic [2:0] addr, logic [1:0] size);
+    case (size)
+      2'b11: begin
+        return 8'b1111_1111;
+      end
+      2'b10: begin
+        case (addr[2:0])
+          3'b000:  return 8'b0000_1111;
+          3'b001:  return 8'b0001_1110;
+          3'b010:  return 8'b0011_1100;
+          3'b011:  return 8'b0111_1000;
+          3'b100:  return 8'b1111_0000;
+          default: ;   
+        endcase
+      end
+      2'b01: begin
+        case (addr[2:0])
+          3'b000:  return 8'b0000_0011;
+          3'b001:  return 8'b0000_0110;
+          3'b010:  return 8'b0000_1100;
+          3'b011:  return 8'b0001_1000;
+          3'b100:  return 8'b0011_0000;
+          3'b101:  return 8'b0110_0000;
+          3'b110:  return 8'b1100_0000;
+          default: ;   
+        endcase
+      end
+      2'b00: begin
+        case (addr[2:0])
+          3'b000: return 8'b0000_0001;
+          3'b001: return 8'b0000_0010;
+          3'b010: return 8'b0000_0100;
+          3'b011: return 8'b0000_1000;
+          3'b100: return 8'b0001_0000;
+          3'b101: return 8'b0010_0000;
+          3'b110: return 8'b0100_0000;
+          3'b111: return 8'b1000_0000;
+        endcase
+      end
+    endcase
+    return 8'b0;
+  endfunction
+
+`line 761 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+  function automatic logic [3:0] be_gen_32(logic [1:0] addr, logic [1:0] size);
+    case (size)
+      2'b10: begin
+        return 4'b1111;
+      end
+      2'b01: begin
+        case (addr[1:0])
+          2'b00:   return 4'b0011;
+          2'b01:   return 4'b0110;
+          2'b10:   return 4'b1100;
+          default: ;   
+        endcase
+      end
+      2'b00: begin
+        case (addr[1:0])
+          2'b00: return 4'b0001;
+          2'b01: return 4'b0010;
+          2'b10: return 4'b0100;
+          2'b11: return 4'b1000;
+        endcase
+      end
+      default: return 4'b0;
+    endcase
+    return 4'b0;
+  endfunction
+
+`line 787 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+  function automatic logic [1:0] extract_transfer_size(fu_op op);
+    case (op)
+      LD, HLV_D, SD, HSV_D, FLD, FSD,
+            AMO_LRD,   AMO_SCD,
+            AMO_SWAPD, AMO_ADDD,
+            AMO_ANDD,  AMO_ORD,
+            AMO_XORD,  AMO_MAXD,
+            AMO_MAXDU, AMO_MIND,
+            AMO_MINDU: begin
+        return 2'b11;
+      end
+      LW, LWU, HLV_W, HLV_WU, HLVX_WU,
+            SW, HSV_W, FLW, FSW,
+            AMO_LRW,   AMO_SCW,
+            AMO_SWAPW, AMO_ADDW,
+            AMO_ANDW,  AMO_ORW,
+            AMO_XORW,  AMO_MAXW,
+            AMO_MAXWU, AMO_MINW,
+            AMO_MINWU: begin
+        return 2'b10;
+      end
+      LH, LHU, HLV_H, HLV_HU, HLVX_HU, SH, HSV_H, FLH, FSH: return 2'b01;
+      LB, LBU, HLV_B, HLV_BU, SB, HSV_B, FLB, FSB:          return 2'b00;
+      CBO_CLEAN, CBO_FLUSH, CBO_INVAL:                      return 2'b00;
+      default:                                              return 2'b11;
+    endcase
+  endfunction
+   
+   
+   
+
+`line 821 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic is_trans_1G(input logic s_st_enbl, input logic g_st_enbl,
+                                       input logic is_s_1G, input logic is_g_1G);
+    return (((is_s_1G && s_st_enbl) || !s_st_enbl) && ((is_g_1G && g_st_enbl) || !g_st_enbl));
+  endfunction : is_trans_1G
+
+`line 827 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic is_trans_2M(input logic s_st_enbl, input logic g_st_enbl,
+                                       input logic is_s_1G, input logic is_s_2M,
+                                       input logic is_g_1G, input logic is_g_2M);
+    return  (s_st_enbl && g_st_enbl) ?
+                ((is_s_2M && (is_g_1G || is_g_2M)) || (is_g_2M && (is_s_1G || is_s_2M))) :
+                ((is_s_2M && s_st_enbl) || (is_g_2M && g_st_enbl));
+  endfunction : is_trans_2M
+
+`line 836 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic [40:0] make_gpaddr(input logic s_st_enbl, input logic is_1G,
+                                              input logic is_2M, input logic [63:0] vaddr,
+                                              input riscv::pte_t pte);
+    logic [40:0] gpaddr;
+    if (s_st_enbl) begin
+      gpaddr = {pte.ppn[28:0], vaddr[11:0]};
+       
+      if (is_1G) gpaddr[29:12] = vaddr[29:12];
+       
+      if (is_2M) gpaddr[20:12] = vaddr[20:12];
+    end else begin
+      gpaddr = vaddr[40:0];
+    end
+    return gpaddr;
+  endfunction : make_gpaddr
+
+`line 853 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+  function automatic logic [28:0] make_gppn(input logic s_st_enbl, input logic is_1G,
+                                            input logic is_2M, input logic [28:0] vpn,
+                                            input riscv::pte_t pte);
+    logic [28:0] gppn;
+    if (s_st_enbl) begin
+      gppn = pte.ppn[28:0];
+      if (is_2M) gppn[8:0] = vpn[8:0];
+      if (is_1G) gppn[17:0] = vpn[17:0];
+    end else begin
+      gppn = vpn;
+    end
+    return gppn;
+  endfunction : make_gppn
+
+`line 868 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+   
+   
+   
+   
+  function automatic int unsigned avoid_neg(int n);
+    return (n < 0) ? 0 : n;
+  endfunction : avoid_neg
+
+`line 876 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
+endpackage
+
+`line 878 "/home/toast/verif-diplom/ext/cva6/core/include/ariane_pkg.sv" 0
