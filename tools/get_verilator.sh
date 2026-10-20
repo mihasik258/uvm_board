@@ -27,8 +27,14 @@ git -C "$TOP/src" checkout --quiet "$VREV"
 # other testbenches (core-v-verif): covergroup calling methods of its class, %b of a string, C macro
 # names, randomize() with a null rand object handle (IEEE 18.5.9); the location text of each constraint
 # built only for an unsatisfiable-constraint message, not on every randomize() (a third of a call on the A72)
+# CVA6's testbench (tools/verilator/ocv_cva6_tb.patch): 'automatic' in method prototypes, extra digits of a sized
+# constant truncated, inside over an associative array, a class parameter equal to its non-constant default,
+# a dynamic array as a DPI open array, ==? / !=? against a variable; functional coverage as IEEE 1800-2023 19.5-19.11
+# (test: tools/verilator/test/t_cg_ieee.sv): a bin's iff and with, ignore/illegal values left out of every bin,
+# fixed-size and wide array bins, enum automatic bins, explicit cross bins (binsof, intersect, with, && || !),
+# transition ranges and enum items, bin bounds from covergroup arguments, coverage averaged over the items
 for PATCH in "$OCV"/tools/verilator/ocv_fast_random.patch "$OCV"/tools/verilator/ocv_tb_compat.patch \
-             "$OCV"/tools/verilator/ocv_lazy_constraint_lines.patch; do
+             "$OCV"/tools/verilator/ocv_lazy_constraint_lines.patch "$OCV"/tools/verilator/ocv_cva6_tb.patch; do
     if ! git -C "$TOP/src" apply --reverse --check "$PATCH" 2>/dev/null; then
         git -C "$TOP/src" apply "$PATCH"
         rm -f "$TOP/install/.rev"                 # changed: build and install again

@@ -1,0 +1,1847 @@
+diff --git a/include/verilated_covergroup.cpp b/include/verilated_covergroup.cpp
+index f7cb3b6ae..b3c243f81 100644
+--- a/include/verilated_covergroup.cpp
++++ b/include/verilated_covergroup.cpp
+@@ -42,6 +42,7 @@ void VlCoverpoint::init(const char* hier, uint32_t atLeast, uint32_t nBins) {
+     m_atLeast = atLeast;
+     m_total = nBins;
+     m_counts.assign(nBins, 0);
++    m_excl.assign(nBins, 0);
+     m_crossIdx.assign(nBins, -1);
+     m_crossToBin.clear();
+ }
+@@ -83,6 +84,7 @@ std::string VlCoverpoint::binName(uint32_t i) const {
+ #if VM_COVERAGE
+ void VlCoverpoint::registerBins(VerilatedCovContext* covcontextp, const char* page) {
+     for (uint32_t i = 0; i < binCount(); ++i) {
++        if (m_excl[i]) continue;  // (OCV: a bin with no values is not a bin)
+         const VlCovNamer& nm = namerFor(i);
+         const VlCovBinKind kind = binKind(i);
+         const std::string binp = binName(i);
+@@ -134,6 +136,54 @@ void VlCoverCross::init(const char* hier, uint32_t dims, VlCoverpoint* const* cp
+     m_flatCounts.assign(m_numAutoBins, 0);
+ }
+ 
++void VlCoverCross::kindArrays() {
++    if (m_kind.empty()) m_kind.assign(m_numAutoBins, KIND_AUTO);
++}
++
++uint32_t VlCoverCross::addUserBin(const char* name) {
++    kindArrays();
++    m_userNames.emplace_back(name);
++    m_userCounts.push_back(0);
++    m_userSize.push_back(0);
++    return KIND_USER + static_cast<uint32_t>(m_userNames.size() - 1);
++}
++
++void VlCoverCross::finalize() {
++    // a coverpoint bin with no values (excluded) leaves every tuple that has it
++    bool any = !m_kind.empty();
++    for (uint32_t d = 0; d < m_dims && !any; ++d)
++        for (uint32_t i = 0; i < m_cpBinCounts[d] && !any; ++i) any = m_cps[d]->normalExcluded(i);
++    if (!any) return;
++    kindArrays();
++    for (uint32_t flat = 0; flat < m_numAutoBins; ++flat) {
++        for (uint32_t d = 0; d < m_dims; ++d) {
++            if (m_cps[d]->normalExcluded((flat / m_stride[d]) % m_cpBinCounts[d])) {
++                if (m_kind[flat] != KIND_ILLEGAL) m_kind[flat] = KIND_IGNORE;
++                break;
++            }
++        }
++    }
++    m_autoTotal = 0;
++    for (const uint32_t k : m_kind) {
++        if (k == KIND_AUTO) ++m_autoTotal;
++        if (k >= KIND_USER) ++m_userSize[k - KIND_USER];
++    }
++}
++
++void VlCoverCross::incrementKind(uint32_t idx) {
++    const uint32_t k = m_kind[idx];
++    const bool first = m_flatCounts[idx]++ == 0;
++    if (k == KIND_AUTO) {
++        if (first) ++m_autoCovered;
++    } else if (k >= KIND_USER) {
++        if (m_userCounts[k - KIND_USER]++ == 0) ++m_userCovered;
++    } else if (k == KIND_ILLEGAL) {
++        VL_PRINTF_MT("%%Error: %s:%d: Illegal cross bin hit in cross %s: %s\n", m_file, m_line,
++                     m_hier.c_str(), binName(idx).c_str());
++        VL_STOP_MT(m_file, m_line, "");
++    }
++}
++
+ void VlCoverCross::iterateProduct(VlCoverpoint* const* cps, uint32_t dim, uint32_t baseIdx) {
+     const uint32_t hits = cps[dim]->hitCount();
+     const uint32_t* const list = cps[dim]->hitList();
+@@ -175,6 +225,7 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
+     const std::string lineStr = std::to_string(m_line);
+     const std::string colStr = std::to_string(m_col);
+     for (uint32_t flat = 0; flat < binCount(); ++flat) {
++        if (!m_kind.empty() && m_kind[flat] != KIND_AUTO) continue;  // (OCV: below, or not a bin)
+         const std::string bin = binName(flat);  // "b1_x_b2_x_..."
+         // cross_bins metadata: the same components joined by ',' (not read by the report)
+         std::string crossBins;
+@@ -188,5 +239,13 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
+                         m_file, "lineno", lineStr.c_str(), "column", colStr.c_str(), "bin",
+                         bin.c_str(), "cross", "1", "cross_bins", crossBins.c_str());
+     }
++    // OCV: the named cross bins
++    for (size_t k = 0; k < m_userNames.size(); ++k) {
++        if (!m_userSize[k]) continue;
++        const std::string full = m_hier + "." + m_userNames[k];
++        VL_COVER_INSERT(covcontextp, full.c_str(), &m_userCounts[k], "page", page, "filename",
++                        m_file, "lineno", lineStr.c_str(), "column", colStr.c_str(), "bin",
++                        m_userNames[k].c_str(), "cross", "1");
++    }
+ }
+ #endif  // VM_COVERAGE
+diff --git a/include/verilated_covergroup.h b/include/verilated_covergroup.h
+index 9c1825daf..97ac2bdbd 100644
+--- a/include/verilated_covergroup.h
++++ b/include/verilated_covergroup.h
+@@ -109,6 +109,10 @@ protected:
+     // [m_normal] inverse of m_crossIdx: cross idx -> full bin idx, appended in cross-index order
+     std::vector<uint32_t> m_crossToBin;
+     uint32_t m_hitCount = 0;  // entries valid in the hit list this sample
++    // OCV: [m_total] 1 = the bin has no values once the covergroup's arguments are known (its with,
++    // values that ignore/illegal bins take - IEEE 1800-2023 19.5): not counted, not reported
++    std::vector<uint8_t> m_excl;
++    std::vector<std::pair<uint64_t, std::vector<int32_t>>> m_maps;  // (OCV: addValueMap)
+ 
+ private:
+     // PRIVATE METHODS
+@@ -131,6 +135,24 @@ public:
+         addNamer(set, count, VlCovBinNaming::Array, name, file, line, col);
+     }
+     void registerBins(VerilatedCovContext* covcontextp, const char* page);
++    // OCV: from the generated constructor, after the namers: bin i has no values (see m_excl)
++    void excludeBin(uint32_t i) { m_excl[i] = 1; }
++    // OCV: a fixed-size array bin over a small domain (IEEE 1800-2023 19.5): which of its bins each value
++    // [lo, lo + n) falls in (-1: none), built by the constructor once its with is known
++    uint32_t addValueMap(uint64_t lo, uint32_t n) {
++        m_maps.push_back({lo, std::vector<int32_t>(n, -1)});
++        return static_cast<uint32_t>(m_maps.size() - 1);
++    }
++    void mapValue(uint32_t map, uint64_t v, uint32_t bin) {
++        m_maps[map].second[v - m_maps[map].first] = static_cast<int32_t>(bin);
++    }
++    int32_t mapped(uint32_t map, uint64_t v) const {
++        const auto& m = m_maps[map];
++        const uint64_t i = v - m.first;
++        return (v >= m.first && i < m.second.size()) ? m.second[i] : -1;
++    }
++    bool binExcluded(uint32_t i) const { return m_excl[i] != 0; }
++    bool normalExcluded(uint32_t crossIdx) const { return m_excl[m_crossToBin[crossIdx]] != 0; }
+ 
+     // ---- hot path (from generated sample()) ----
+     // Clear the hit list at the start of each sample() for a cross-fed coverpoint.
+@@ -157,14 +179,17 @@ public:
+         // Count Normal bins that reached option.at_least on demand, so the hot
+         // path (incrementBin) stays a plain counter bump.
+         uint32_t numCovered = 0;
++        uint32_t numBins = 0;
+         for (const VlCovNamer& nm : m_namers) {
+             if (nm.set() != VlCovBinKind::KIND_NORMAL) continue;
+             for (uint32_t i = nm.base(); i < nm.base() + nm.count(); ++i) {
++                if (m_excl[i]) continue;  // (OCV)
++                ++numBins;
+                 if (m_counts[i] >= m_atLeast) ++numCovered;
+             }
+         }
+         covered = numCovered;
+-        total = m_normal;
++        total = numBins;
+     }
+ };
+ 
+@@ -224,12 +249,31 @@ class VlCoverCross final : public VlCoverpointIf {
+     std::vector<uint32_t> m_stride;  // [m_dims] Flat-index stride per dimension
+     std::vector<uint32_t> m_flatCounts;  // [m_numAutoBins] Per-bin hit counts
+     std::vector<VlCoverpoint*> m_cps;  // Feeding coverpoints (the only name source)
++    // OCV: explicit cross bins (IEEE 1800-2023 19.6.1), set up by the generated constructor
++    // (select(), then finalize()): per tuple KIND_AUTO, KIND_IGNORE, KIND_ILLEGAL or KIND_USER + k (the
++    // k-th named bin); a tuple with an excluded coverpoint bin is ignored
++public:
++    enum : uint32_t { KIND_AUTO = 0, KIND_IGNORE = 1, KIND_ILLEGAL = 2, KIND_USER = 3 };
++private:
++    std::vector<uint32_t> m_kind;  // empty: every tuple an automatic bin
++    std::vector<std::string> m_userNames;
++    std::vector<uint32_t> m_userCounts;
++    std::vector<uint32_t> m_userSize;  // tuples per named bin (an empty one is not a bin)
++    uint32_t m_autoTotal = 0;  // automatic tuples (coverage denominator part)
++    uint32_t m_autoCovered = 0;
++    uint32_t m_userCovered = 0;
++    void kindArrays();
+ 
+     // PRIVATE METHODS
+     void iterateProduct(VlCoverpoint* const* cps, uint32_t dim, uint32_t baseIdx);
+     void incrementTuple(uint32_t idx) {
+-        if (m_flatCounts[idx]++ == 0) ++m_numCovered;
++        if (VL_LIKELY(m_kind.empty())) {
++            if (m_flatCounts[idx]++ == 0) ++m_numCovered;
++            return;
++        }
++        incrementKind(idx);
+     }
++    void incrementKind(uint32_t idx);
+ 
+ public:
+     // CONSTRUCTORS
+@@ -240,6 +284,24 @@ public:
+     void init(const char* hier, uint32_t dims, VlCoverpoint* const* cps, const char* file,
+               int line, int col);
+     void registerBins(VerilatedCovContext* covcontextp, const char* page);
++    // OCV: explicit cross bins. A named bin (addUserBin), then the tuples a select expression takes
++    // (sel(tuple of coverpoint cross indexes)); finalize() once all are given
++    uint32_t addUserBin(const char* name);
++    template <typename T_Sel>
++    void select(uint32_t kind, T_Sel sel) {
++        kindArrays();
++        std::vector<uint32_t> t(m_dims);
++        for (uint32_t flat = 0; flat < m_numAutoBins; ++flat) {
++            for (uint32_t d = 0; d < m_dims; ++d) t[d] = (flat / m_stride[d]) % m_cpBinCounts[d];
++            if (!sel(t.data())) continue;
++            uint32_t& k = m_kind[flat];
++            // illegal over ignore over a named bin over automatic (19.6.1)
++            if (kind == KIND_ILLEGAL || (kind == KIND_IGNORE && k != KIND_ILLEGAL)
++                || (kind >= KIND_USER && k == KIND_AUTO))
++                k = kind;
++        }
++    }
++    void finalize();
+ 
+     // ---- hot path (from generated sample(), after all coverpoints sampled) ----
+     void sample(VlCoverpoint* const* cps);
+@@ -249,8 +311,15 @@ public:
+     uint32_t binCount() const override { return m_numAutoBins; }
+     std::string binName(uint32_t flat) const override;
+     void coverageParts(double& covered, double& total) const override {
+-        covered = m_numCovered;
+-        total = m_numAutoBins;
++        if (m_kind.empty()) {
++            covered = m_numCovered;
++            total = m_numAutoBins;
++            return;
++        }
++        uint32_t users = 0;
++        for (const uint32_t n : m_userSize) users += n != 0;
++        covered = m_autoCovered + m_userCovered;
++        total = m_autoTotal + users;
+     }
+ };
+ 
+diff --git a/include/verilated_types.h b/include/verilated_types.h
+index 76a24d01b..69e5eb579 100644
+--- a/include/verilated_types.h
++++ b/include/verilated_types.h
+@@ -1091,6 +1091,13 @@ public:
+     VlAssocArray& operator=(VlAssocArray&&) = default;
+     bool operator==(const VlAssocArray& rhs) const { return m_map == rhs.m_map; }
+     bool operator!=(const VlAssocArray& rhs) const { return m_map != rhs.m_map; }
++    // OCV: inside (set membership): the values, as for other unpacked arrays (IEEE 1800-2023 11.4.13
++    // leaves associative arrays unspecified; other tools take the elements)
++    bool inside(const T_Value& value) const {
++        for (const auto& kv : m_map)
++            if (kv.second == value) return true;
++        return false;
++    }
+     bool operator<(const VlAssocArray& rhs) const { return m_map < rhs.m_map; }
+     // METHODS
+     T_Value& atDefault() { return m_defaultValue; }
+diff --git a/src/V3AstNodeExpr.h b/src/V3AstNodeExpr.h
+index c2d0e708b..94f461556 100644
+--- a/src/V3AstNodeExpr.h
++++ b/src/V3AstNodeExpr.h
+@@ -1266,6 +1266,85 @@ public:
+     string emitC() final override { V3ERROR_NA_RETURN(""); }
+     bool cleanOut() const final override { V3ERROR_NA_RETURN(true); }
+ };
++class AstCoverBinGuard final : public AstNodeExpr {
++    // OCV: a coverpoint bin's own conditions (IEEE 1800-2023 19.5), in AstCoverBin::iffp:
++    //   iffp  - the bin's iff: the bin counts only samples for which it holds
++    //   withp - the bin's with (19.5.1.1): which of its values it has; 'item' is the coverpoint's
++    //           __Vcovitem_<coverpoint> member (V3LinkParse), set to the value tested
++    // wholeDomain: 'bins b = coverpoint_identifier with (...)' - every value of the coverpoint
++    // @astgen op1 := iffp : Optional[AstNodeExpr]
++    // @astgen op2 := withp : Optional[AstNodeExpr]
++    bool m_wholeDomain;
++    string m_itemName;  // the coverpoint's item member (set by V3LinkParse when withp)
++public:
++    AstCoverBinGuard(FileLine* fl, AstNodeExpr* iffp, AstNodeExpr* withp, bool wholeDomain)
++        : ASTGEN_SUPER_CoverBinGuard(fl)
++        , m_wholeDomain{wholeDomain} {
++        this->iffp(iffp);
++        this->withp(withp);
++        dtypeSetBit();
++    }
++    ASTGEN_MEMBERS_AstCoverBinGuard;
++    bool wholeDomain() const { return m_wholeDomain; }
++    const string& itemName() const { return m_itemName; }
++    void itemName(const string& name) { m_itemName = name; }
++    string emitVerilog() override { V3ERROR_NA_RETURN(""); }
++    string emitC() override { V3ERROR_NA_RETURN(""); }
++    bool cleanOut() const override { return true; }
++    bool sameNode(const AstNode* samep) const override {
++        const AstCoverBinGuard* const sp = VN_DBG_AS(samep, CoverBinGuard);
++        return m_wholeDomain == sp->m_wholeDomain && m_itemName == sp->m_itemName;
++    }
++};
++class AstCoverSelBinsof final : public AstNodeExpr {
++    // OCV: [!]binsof(<coverpoint>) [intersect {<values>}] in a cross select expression (IEEE 1800-2023
++    // 19.6.1): the coverpoint's bins whose values meet <values> (all its bins without intersect)
++    // @astgen op1 := rangesp : List[AstNode]
++    const string m_cpName;
++    const bool m_negate;
++    const bool m_intersect;
++public:
++    AstCoverSelBinsof(FileLine* fl, const string& cpName, AstNode* rangesp, bool negate, bool intersect)
++        : ASTGEN_SUPER_CoverSelBinsof(fl)
++        , m_cpName{cpName}
++        , m_negate{negate}
++        , m_intersect{intersect} {
++        addRangesp(rangesp);
++        dtypeSetBit();
++    }
++    ASTGEN_MEMBERS_AstCoverSelBinsof;
++    const string& cpName() const { return m_cpName; }
++    bool negate() const { return m_negate; }
++    bool intersect() const { return m_intersect; }
++    string emitVerilog() override { V3ERROR_NA_RETURN(""); }
++    string emitC() override { V3ERROR_NA_RETURN(""); }
++    bool cleanOut() const override { return true; }
++    bool sameNode(const AstNode* samep) const override {
++        const AstCoverSelBinsof* const sp = VN_DBG_AS(samep, CoverSelBinsof);
++        return m_cpName == sp->m_cpName && m_negate == sp->m_negate && m_intersect == sp->m_intersect;
++    }
++};
++class AstCoverSelWith final : public AstNodeExpr {
++    // OCV: [<cross>] with (<expr>) in a cross select expression: every tuple when <expr> holds (an
++    // expression of the covergroup's arguments, evaluated when it is constructed)
++    // @astgen op1 := exprp : AstNodeExpr
++    const bool m_negate;
++public:
++    AstCoverSelWith(FileLine* fl, AstNodeExpr* exprp, bool negate)
++        : ASTGEN_SUPER_CoverSelWith(fl)
++        , m_negate{negate} {
++        this->exprp(exprp);
++        dtypeSetBit();
++    }
++    ASTGEN_MEMBERS_AstCoverSelWith;
++    bool negate() const { return m_negate; }
++    string emitVerilog() override { V3ERROR_NA_RETURN(""); }
++    string emitC() override { V3ERROR_NA_RETURN(""); }
++    bool cleanOut() const override { return true; }
++    bool sameNode(const AstNode* samep) const override {
++        return m_negate == VN_DBG_AS(samep, CoverSelWith)->m_negate;
++    }
++};
+ class AstCvtArrayToArray final : public AstNodeExpr {
+     // Copy/Cast from dynamic/unpacked types to dynamic/unpacked types
+     // @astgen op1 := fromp : AstNodeExpr
+diff --git a/src/V3AstNodeOther.h b/src/V3AstNodeOther.h
+index 46c72718f..34758a288 100644
+--- a/src/V3AstNodeOther.h
++++ b/src/V3AstNodeOther.h
+@@ -1098,6 +1098,26 @@ public:
+     bool isArray() const { return m_isArray; }
+     void isArray(bool flag) { m_isArray = flag; }
+ };
++class AstCoverCrossBin final : public AstNode {
++    // OCV: a bins / ignore_bins / illegal_bins of a cross (IEEE 1800-2023 19.6.1), in the cross's
++    // rawBodyp until V3Covergroup
++    // @astgen op1 := selectp : AstNodeExpr
++    // @astgen op2 := iffp : Optional[AstNodeExpr]
++    const string m_name;
++    const VCoverBinsType m_binsType;
++public:
++    AstCoverCrossBin(FileLine* fl, const string& name, VCoverBinsType binsType, AstNodeExpr* selectp,
++                     AstNodeExpr* iffp)
++        : ASTGEN_SUPER_CoverCrossBin(fl)
++        , m_name{name}
++        , m_binsType{binsType} {
++        this->selectp(selectp);
++        this->iffp(iffp);
++    }
++    ASTGEN_MEMBERS_AstCoverCrossBin;
++    string name() const override VL_MT_STABLE { return m_name; }
++    VCoverBinsType binsType() const { return m_binsType; }
++};
+ class AstCoverOption final : public AstNode {
+     // Coverage-option assignment
+     // @astgen op1 := valuep : AstNodeExpr
+diff --git a/src/V3Covergroup.cpp b/src/V3Covergroup.cpp
+index dc9e05697..5c27650d9 100644
+--- a/src/V3Covergroup.cpp
++++ b/src/V3Covergroup.cpp
+@@ -160,6 +160,10 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         m_droppedCrosses;  // Crosses with a bare-variable item: drop (COVERIGN)
+     std::map<int, AstCDType*> m_vlCoverpointTypes;  // hit-list bound K -> "VlCoverpointT<K>" type
+     AstCDType* m_vlCoverCrossDTypep = nullptr;  // Shared "VlCoverCross" C++ member type
++    // OCV: per coverpoint, its Normal bins' values in cross-index order (cross bins' binsof ... intersect)
++    std::map<std::string, std::vector<std::vector<std::pair<uint64_t, uint64_t>>>> m_cpNormVals;
++    int m_crossSelNum = 0;  // unique names of select tables
++    std::map<std::string, uint32_t> m_cpMaps;  // OCV: value maps made per coverpoint (addValueMap order)
+ 
+     VMemberMap m_memberMap;  // Member names cached for fast lookup
+ 
+@@ -384,6 +388,8 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+             AstCoverBin* const cbinp = VN_AS(binp, CoverBin);
+             const VCoverBinsType btype = cbinp->binsType();
+             if (btype == VCoverBinsType::BINS_IGNORE || btype == VCoverBinsType::BINS_ILLEGAL) {
++                // (OCV: one with its own iff or with takes values only at run time: generateCoverpoint)
++                if (VN_IS(cbinp->iffp(), CoverBinGuard)) continue;
+                 if (AstNode* rangep = cbinp->rangesp()) {
+                     extractValuesFromRange(rangep, excludedOut, maxVal);
+                 }
+@@ -407,6 +413,27 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         // If already has regular bins, nothing to do
+         if (hasRegular) return;
+ 
++        // OCV: an enum coverpoint's automatic bins are its values (IEEE 1800-2023 19.5.3: N is the
++        // enumeration's cardinality), not the bit patterns of its width
++        if (const AstEnumDType* const enump = VN_CAST(exprp->dtypep()->skipRefp(), EnumDType)) {
++            int binCount = 0;
++            for (const AstEnumItem* itemp = enump->itemsp(); itemp;
++                 itemp = VN_AS(itemp->nextp(), EnumItem)) {
++                const AstConst* const vp = VN_CAST(itemp->valuep(), Const);
++                if (!vp) continue;
++                const uint64_t v = vp->toUQuad();
++                if (excluded.count(v)) continue;
++                AstInsideRange* const rangep = new AstInsideRange{
++                    coverpointp->fileline(), widthConst(coverpointp->fileline(), width, v),
++                    widthConst(coverpointp->fileline(), width, v)};
++                rangep->dtypeFrom(exprp);
++                coverpointp->addBinsp(new AstCoverBin{coverpointp->fileline(),
++                                                      "auto_" + std::to_string(binCount++), rangep,
++                                                      false, false});
++            }
++            return;
++        }
++
+         UINFO(4, "  Creating implicit automatic bins for coverpoint: " << coverpointp->name());
+ 
+         const uint64_t numTotalValues = (width >= 64) ? UINT64_MAX : (1ULL << width);
+@@ -914,6 +941,281 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         m_sampleFuncp->addStmtsp(new AstIf{fl, guardedp, actionp, nullptr});
+     }
+ 
++
++    // ---------------- OCV: a bin's own iff / with, values ignore/illegal bins take, sized and wide
++    // array bins (IEEE 1800-2023 19.5) ----------------
++    static AstCoverBinGuard* binGuard(AstCoverBin* binp) {
++        return VN_CAST(binp->iffp(), CoverBinGuard);
++    }
++    static AstNodeExpr* andCond(FileLine* fl, AstNodeExpr* ap, AstNodeExpr* bp) {
++        if (!ap) return bp;
++        if (!bp) return ap;
++        return new AstAnd{fl, ap, bp};
++    }
++    static AstNodeExpr* orCond(FileLine* fl, AstNodeExpr* ap, AstNodeExpr* bp) {
++        if (!ap) return bp;
++        if (!bp) return ap;
++        return new AstOr{fl, ap, bp};
++    }
++    // the bin's iff (sampled with it), or nullptr
++    static AstNodeExpr* guardIffCond(AstCoverBin* binp) {
++        AstCoverBinGuard* const gp = binGuard(binp);
++        return gp && gp->iffp() ? gp->iffp()->cloneTree(false) : nullptr;
++    }
++    // the bin's with (over the coverpoint's item member), or nullptr
++    static AstNodeExpr* guardWithCond(AstCoverBin* binp) {
++        AstCoverBinGuard* const gp = binGuard(binp);
++        return gp && gp->withp() ? gp->withp()->cloneTree(false) : nullptr;
++    }
++    // the coverpoint's item member (V3LinkParse made one when a bin has a with), or nullptr
++    AstVar* coverpointItemVar(AstCoverpoint* coverpointp) {
++        return VN_CAST(m_memberMap.findMember(m_covergroupp, "__Vcovitem_" + coverpointp->name()),
++                       Var);
++    }
++    // the domain of the coverpoint's values: [0:maxVal]
++    static uint64_t domainMax(AstNodeExpr* exprp) {
++        const int width = exprp->width();
++        return (width >= 64) ? UINT64_MAX : ((1ULL << width) - 1);
++    }
++    // a bin's values as [lo, hi] ranges (constants; '$' = the domain's end); false if not constant
++    bool binRanges(AstCoverBin* binp, AstNodeExpr* exprp, std::vector<std::pair<uint64_t, uint64_t>>& out) {
++        const uint64_t maxVal = domainMax(exprp);
++        AstCoverBinGuard* const gp = binGuard(binp);
++        if (gp && gp->wholeDomain()) {
++            out.emplace_back(0, maxVal);
++            return true;
++        }
++        for (AstNode* rangep = binp->rangesp(); rangep; rangep = rangep->nextp()) {
++            if (AstInsideRange* const irp = VN_CAST(rangep, InsideRange)) {
++                AstNodeExpr* const lhsp = V3Const::constifyEdit(irp->lhsp());
++                AstNodeExpr* const rhsp = V3Const::constifyEdit(irp->rhsp());
++                AstConst* const minp = VN_CAST(lhsp, Const);
++                AstConst* const maxp = VN_CAST(rhsp, Const);
++                const bool loUnb = VN_IS(lhsp, Unbounded);
++                const bool hiUnb = VN_IS(rhsp, Unbounded);
++                if ((!minp && !loUnb) || (!maxp && !hiUnb)) return false;
++                if ((minp && minp->num().isFourState()) || (maxp && maxp->num().isFourState()))
++                    return false;
++                const uint64_t lo = loUnb ? 0 : minp->toUQuad();
++                const uint64_t hi = hiUnb ? maxVal : maxp->toUQuad();
++                if (hi >= lo) out.emplace_back(lo, hi);
++            } else if (AstConst* const cp = VN_CAST(rangep, Const)) {
++                if (cp->num().isFourState()) return false;
++                out.emplace_back(cp->toUQuad(), cp->toUQuad());
++            } else {
++                return false;
++            }
++        }
++        return true;
++    }
++    // a constant of the coverpoint expression's width
++    static AstConst* widthConst(FileLine* fl, int width, uint64_t v) {
++        V3Number num{fl, width, 0};
++        num.setQuad(v);
++        return new AstConst{fl, num};
++    }
++    // a constant value of the item member (to fold a with that reads nothing else)
++    static AstConst* itemConst(FileLine* fl, uint64_t v) {
++        V3Number num{fl, 64, 0};
++        num.setQuad(v);
++        num.isSigned(true);
++        return new AstConst{fl, num};
++    }
++    // A with that reads only the item member (and constants): its value for item = v, as 0/1;
++    // -1 when it reads anything else (an argument of the covergroup: known only at construction)
++    int withConstValue(AstCoverBin* binp, AstVar* itemVarp, uint64_t v) {
++        AstCoverBinGuard* const gp = binGuard(binp);
++        if (!gp || !gp->withp()) return 1;
++        bool other = false;
++        gp->withp()->foreach([&](const AstVarRef* refp) {
++            if (refp->varp() != itemVarp) other = true;
++        });
++        if (other || gp->withp()->exists([](const AstNodeFTaskRef*) { return true; })) return -1;
++        AstNodeExpr* const clonep = gp->withp()->cloneTree(false);
++        AstNode* const holderp = new AstSFormatF{clonep->fileline(), "%d", false, clonep};
++        clonep->foreach([&](AstVarRef* refp) {
++            refp->replaceWith(itemConst(refp->fileline(), v));
++            VL_DO_DANGLING(pushDeletep(refp), refp);
++        });
++        AstNodeExpr* foldp = VN_AS(holderp, SFormatF)->exprsp();
++        foldp = V3Const::constifyEdit(foldp);
++        AstConst* const cp = VN_CAST(foldp, Const);
++        const int r = cp ? (cp->isZero() ? 0 : 1) : -1;
++        VL_DO_DANGLING(pushDeletep(holderp), holderp);
++        return r;
++    }
++    // " & <mask of width bits>" (nothing for 64)
++    static std::string cleanMask(int width) {
++        return width >= 64 ? std::string{} : " & " + std::to_string((1ULL << width) - 1) + "ULL";
++    }
++    // emit "item = <coverpoint expression>" (64 bits, signed if the expression is) into sample()
++    void emitItemAssign(FileLine* fl, AstVar* itemVarp, AstNodeExpr* exprp) {
++        if (exprp->width() > 64) {
++            exprp->v3warn(COVERIGN, "Unsupported: 'with' in a bin of a coverpoint wider than 64 bits");
++            return;
++        }
++        AstCStmt* const cs = new AstCStmt{fl};
++        cs->add(memberRef(fl, itemVarp));
++        // (an expression inside C text is not cleaned: its upper bits masked here)
++        const int w = exprp->width();
++        const std::string mask = cleanMask(w);
++        if (exprp->isSigned() && w < 64) {
++            cs->add(std::string{" = "} + (w > 32 ? "VL_EXTENDS_QQ(64, " : "VL_EXTENDS_QI(64, ")
++                    + std::to_string(w) + ", (static_cast<QData>(");
++            cs->add(exprp->cloneTree(false));
++            cs->add(")" + mask + "));");
++        } else {
++            cs->add(" = (static_cast<QData>(");
++            cs->add(exprp->cloneTree(false));
++            cs->add(")" + mask + ");");
++        }
++        m_sampleFuncp->addStmtsp(cs);
++    }
++    // a 1-bit temporary of sample(), set to condp
++    AstVar* sampleTemp(FileLine* fl, const string& name, AstNodeExpr* condp) {
++        AstVar* const varp = new AstVar{fl, VVarType::BLOCKTEMP, name, condp->findBitDType()};
++        varp->funcLocal(true);
++        m_sampleFuncp->addStmtsp(varp);
++        m_sampleFuncp->addStmtsp(new AstAssign{fl, new AstVarRef{fl, varp, VAccess::WRITE}, condp});
++        return varp;
++    }
++    // "for each value v in [lo:hi] { item = v; <bodyp> }" - bodyp sees the C variable __Vv
++    AstCStmt* itemLoop(FileLine* fl, AstVar* itemVarp, uint64_t lo, uint64_t hi, AstNode* bodyp) {
++        AstCStmt* const cs = new AstCStmt{fl};
++        cs->add("for (QData __Vv = " + std::to_string(lo) + "ULL; ; ++__Vv) { ");
++        cs->add(memberRef(fl, itemVarp));
++        cs->add(" = __Vv; ");
++        cs->add(bodyp);
++        cs->add(" if (__Vv == " + std::to_string(hi) + "ULL) break; }");
++        return cs;
++    }
++    // "this->m_cp.excludeBin(<idxText>);"
++    AstCStmt* excludeStmt(FileLine* fl, AstVar* cpVarp, const string& idxText) {
++        AstCStmt* const cs = new AstCStmt{fl};
++        cs->add(memberRef(fl, cpVarp));
++        cs->add(".excludeBin(" + idxText + ");");
++        return cs;
++    }
++    // one value bin of the coverpoint, as generateCoverpoint lays them out
++    struct OcvBin final {
++        AstCoverBin* binp;
++        int base;  // first runtime index
++        int count;  // runtime bins (1 unless an array)
++        // array bins: each runtime bin's values (one value each, or a sized array's share)
++        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> parts;
++        bool contiguous = false;  // array of [lo + i]: one bin per value of one range (computed index)
++        uint64_t lo = 0;
++    };
++
++
++    // OCV: bins with no values once the covergroup's arguments are known - every value filtered out
++    // by the bin's with, or taken by ignore_bins / illegal_bins (their with included) - are excluded
++    // from the coverpoint (IEEE 1800-2023 19.5): in the constructor, after the namers.
++    void emitExclusions(AstCoverpoint* coverpointp, AstNodeExpr* exprp, AstVar* cpVarp,
++                        AstVar* itemVarp, const std::vector<OcvBin>& ocvBins) {
++        FileLine* const fl = coverpointp->fileline();
++        // values ignore/illegal bins without a with or iff take: known now; those with a with: per value
++        std::set<uint64_t> fixedIgn;
++        AstNodeExpr* withIgnp = nullptr;  // over the item member
++        const uint64_t maxVal = domainMax(exprp);
++        for (AstNode* binp = coverpointp->binsp(); binp; binp = binp->nextp()) {
++            AstCoverBin* const cbinp = VN_AS(binp, CoverBin);
++            const VCoverBinsType bt = cbinp->binsType();
++            if ((bt != VCoverBinsType::BINS_IGNORE && bt != VCoverBinsType::BINS_ILLEGAL)
++                || cbinp->transp())
++                continue;
++            AstCoverBinGuard* const gp = binGuard(cbinp);
++            if (gp && gp->iffp()) continue;  // (iff: only when sampled)
++            std::vector<std::pair<uint64_t, uint64_t>> ranges;
++            if (!binRanges(cbinp, exprp, ranges)) continue;
++            if (!gp || !gp->withp()) {
++                for (const auto& r : ranges) {
++                    for (uint64_t v = r.first; fixedIgn.size() < (1u << 20); ++v) {
++                        fixedIgn.insert(v);
++                        if (v == r.second) break;
++                    }
++                }
++                continue;
++            }
++            if (!itemVarp) continue;
++            AstNodeExpr* inp = nullptr;
++            AstVarRef* const itemRefp = memberRef(fl, itemVarp);
++            for (const auto& r : ranges) {
++                AstConst* const lop = itemConst(fl, r.first);
++                AstConst* const hip = itemConst(fl, r.second);
++                inp = orCond(fl, inp, r.first == r.second && !gp->wholeDomain()
++                                          ? static_cast<AstNodeExpr*>(new AstEq{fl, itemRefp->cloneTree(false), lop->cloneTree(false)})
++                                          : makeRangeCondition(fl, itemRefp, lop, hip));
++                VL_DO_DANGLING(pushDeletep(lop), lop);
++                VL_DO_DANGLING(pushDeletep(hip), hip);
++            }
++            VL_DO_DANGLING(pushDeletep(itemRefp), itemRefp);
++            if (inp) withIgnp = orCond(fl, withIgnp, andCond(fl, inp, guardWithCond(cbinp)));
++        }
++        (void)maxVal;
++        for (const OcvBin& ob : ocvBins) {
++            const bool binWith = binGuard(ob.binp) && binGuard(ob.binp)->withp();
++            const bool runtime = itemVarp && (binWith || withIgnp);
++            if (ob.contiguous) {
++                // fixed: values ignored outright
++                for (auto it = fixedIgn.lower_bound(ob.lo);
++                     it != fixedIgn.end() && *it < ob.lo + static_cast<uint64_t>(ob.count); ++it)
++                    m_constructorp->addStmtsp(excludeStmt(fl, cpVarp, std::to_string(ob.base + (*it - ob.lo)) + "u"));
++                if (runtime) {
++                    AstNodeExpr* dropp = nullptr;
++                    if (binWith) dropp = new AstNot{fl, guardWithCond(ob.binp)};
++                    if (withIgnp) dropp = orCond(fl, dropp, withIgnp->cloneTree(false));
++                    AstIf* const ifp = new AstIf{fl, dropp,
++                        excludeStmt(fl, cpVarp, std::to_string(ob.base) + "u + static_cast<uint32_t>(__Vv - "
++                                                    + std::to_string(ob.lo) + "ULL)"), nullptr};
++                    m_constructorp->addStmtsp(itemLoop(fl, itemVarp, ob.lo,
++                                                       ob.lo + static_cast<uint64_t>(ob.count) - 1, ifp));
++                }
++                continue;
++            }
++            for (int k = 0; k < ob.count && k < static_cast<int>(ob.parts.size()); ++k) {
++                const auto& part = ob.parts[k];
++                if (part.empty()) continue;
++                // fixed: every value of the bin ignored outright
++                uint64_t n = 0;
++                bool allIgn = true;
++                for (const auto& r : part) {
++                    n += r.second - r.first + 1;
++                    for (uint64_t v = r.first; allIgn && n <= 65536; ++v) {
++                        if (!fixedIgn.count(v)) allIgn = false;
++                        if (v == r.second) break;
++                    }
++                }
++                if (n <= 65536 && allIgn) {
++                    m_constructorp->addStmtsp(excludeStmt(fl, cpVarp, std::to_string(ob.base + k) + "u"));
++                    continue;
++                }
++                if (!runtime || n > 65536) continue;
++                // per value: excluded unless some value passes the with and is not ignored
++                AstNodeExpr* keepp = nullptr;
++                if (binWith) keepp = guardWithCond(ob.binp);
++                if (withIgnp) keepp = andCond(fl, keepp, new AstNot{fl, withIgnp->cloneTree(false)});
++                const string any = "__Vany" + std::to_string(ob.base + k);
++                AstCStmt* const headp = new AstCStmt{fl, "{ bool " + any + " = false;"};
++                m_constructorp->addStmtsp(headp);
++                for (const auto& r : part) {
++                    AstCStmt* const setp = new AstCStmt{fl, any + " = true; break;"};
++                    std::set<uint64_t> fixedHere;
++                    AstNodeExpr* kp = keepp ? keepp->cloneTree(false) : new AstConst{fl, AstConst::BitTrue{}};
++                    // (a value ignored outright is not kept either)
++                    m_constructorp->addStmtsp(itemLoop(fl, itemVarp, r.first, r.second,
++                                                       new AstIf{fl, kp, setp, nullptr}));
++                }
++                AstCStmt* const tailp = new AstCStmt{fl, "if (!" + any + ") "};
++                tailp->add(excludeStmt(fl, cpVarp, std::to_string(ob.base + k) + "u"));
++                tailp->add(" }");
++                m_constructorp->addStmtsp(tailp);
++                if (keepp) VL_DO_DANGLING(pushDeletep(keepp), keepp);
++            }
++        }
++        if (withIgnp) VL_DO_DANGLING(pushDeletep(withIgnp), withIgnp);
++    }
++
+     // Route a coverpoint through a VlCoverpoint member: emit the member, its sample()
+     // increments, the constructor configuration (init + namers), and registration.
+     void generateCoverpoint(AstCoverpoint* coverpointp, AstNodeExpr* exprp, int atLeastValue) {
+@@ -947,6 +1249,46 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+             m_sampleFuncp->addStmtsp(clrp);
+         }
+ 
++        // OCV: a bin's with reads the coverpoint's item member: set it first. Values that an
++        // ignore_bins / illegal_bins takes (its own iff and with included) are in no other bin
++        // (IEEE 1800-2023 19.5.5, 19.5.6): one flag, before the bins
++        AstVar* const itemVarp = coverpointItemVar(coverpointp);
++        if (itemVarp) emitItemAssign(fl, itemVarp, exprp);
++        AstVar* ignVarp = nullptr;
++        {
++            AstNodeExpr* ignp = nullptr;
++            for (AstNode* binp = coverpointp->binsp(); binp; binp = binp->nextp()) {
++                AstCoverBin* const cbinp = VN_AS(binp, CoverBin);
++                const VCoverBinsType bt = cbinp->binsType();
++                if ((bt != VCoverBinsType::BINS_IGNORE && bt != VCoverBinsType::BINS_ILLEGAL)
++                    || cbinp->transp())
++                    continue;
++                AstCoverBinGuard* const gp = binGuard(cbinp);
++                AstNodeExpr* condp = (gp && gp->wholeDomain())
++                                         ? new AstConst{cbinp->fileline(), AstConst::BitTrue{}}
++                                         : buildBinCondition(cbinp, exprp);
++                if (!condp) continue;
++                condp = andCond(cbinp->fileline(), condp, guardIffCond(cbinp));
++                condp = andCond(cbinp->fileline(), condp, guardWithCond(cbinp));
++                ignp = orCond(cbinp->fileline(), ignp, condp);
++            }
++            if (ignp) ignVarp = sampleTemp(fl, "__Vcovign_" + sanitizeGeneratedName(coverpointp->name()), ignp);
++        }
++        // a normal bin's own conditions, and not a value an ignore/illegal bin takes
++        const auto normalGuard = [&](AstCoverBin* cbinp, AstNodeExpr* condp) -> AstNodeExpr* {
++            FileLine* const bfl = cbinp->fileline();
++            condp = andCond(bfl, condp, guardIffCond(cbinp));
++            condp = andCond(bfl, condp, guardWithCond(cbinp));
++            if (ignVarp && cbinp->binsType().binIsNormal())
++                condp = andCond(bfl, condp, new AstNot{bfl, new AstVarRef{bfl, ignVarp, VAccess::READ}});
++            return condp;
++        };
++        std::vector<OcvBin> ocvBins;  // value bins, for the constructor's exclusions below
++        // the Normal bins' values in cross-index order (binsof ... intersect of a cross)
++        std::vector<std::vector<std::pair<uint64_t, uint64_t>>>& normVals
++            = m_cpNormVals[coverpointp->name()];
++        normVals.clear();
++
+         // Walk bins (non-default, then default), assigning sequential indices that match the
+         // namer append order; emit sample increments and collect namer statements.
+         std::vector<AstCStmt*> namerStmts;
+@@ -966,6 +1308,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                 // matching is generated as a state machine, with the hit routed to this bin's
+                 // runtime slot.
+                 namerStmts.push_back(makeNamer(cpVarp, cbinp, -1));
++                if (cbinp->binsType().binIsNormal()) normVals.emplace_back();
+                 const ConvBinTarget tgt{cpVarp, idx, cbinp->binsType().binIsNormal()};
+                 for (AstNode* sp = cbinp->transp(); sp; sp = sp->nextp())
+                     generateSingleTransitionCode(coverpointp, cbinp, exprp, tgt,
+@@ -973,24 +1316,208 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                 ++idx;
+                 continue;
+             }
+-            if (cbinp->isArray()) {  // value array: bins b[N] = {...} -> b[0]..b[N-1]
++            AstCoverBinGuard* const gp = binGuard(cbinp);
++            const bool sized = cbinp->isArray() && cbinp->arraySizep();
++            const bool whole = gp && gp->wholeDomain();
++            std::vector<std::pair<uint64_t, uint64_t>> ranges;
++            const bool constRanges = binRanges(cbinp, exprp, ranges);
++            uint64_t nvalues = 0;  // (saturating: '[0:$]' of 64 bits)
++            for (const auto& r : ranges) {
++                const uint64_t n = r.second - r.first;
++                nvalues = (n == UINT64_MAX || nvalues > UINT64_MAX - n - 1) ? UINT64_MAX : nvalues + n + 1;
++            }
++            if (cbinp->isArray() && constRanges && (sized || whole || nvalues > 64)) {
++                // OCV: an array bin by its values: a fixed number of bins (19.5: the values that
++                // pass a constant with, spread evenly, the last bin taking the rest), or one per
++                // value of a wide range (computed index, not one comparison per value)
++                FileLine* const bfl = cbinp->fileline();
++                constexpr uint64_t OCV_ARRAY_LIMIT = 1ULL << 20;
++                if (!sized && nvalues > OCV_ARRAY_LIMIT) {
++                    cbinp->v3warn(COVERIGN, "Unsupported: array 'bins' over more than "
++                                                << OCV_ARRAY_LIMIT << " values; bin ignored");
++                    continue;
++                }
++                OcvBin ob{cbinp, idx, 0, {}};
++                if (sized) {
++                    AstConst* const np = VN_CAST(V3Const::constifyEdit(cbinp->arraySizep()), Const);
++                    if (!np || np->toSInt() <= 0) {
++                        cbinp->v3error("Array 'bins' size must be a positive constant");
++                        continue;
++                    }
++                    const uint64_t nbins = np->toUQuad();
++                    const bool binWith = gp && gp->withp();
++                    constexpr uint64_t OCV_MAP_LIMIT = 1ULL << 16;
++                    ob.count = static_cast<int>(nbins);
++                    namerStmts.push_back(makeNamer(cpVarp, cbinp, ob.count));
++                    if (binWith && itemVarp && nvalues <= OCV_MAP_LIMIT) {
++                        // the values that pass the with (known at construction: it may read the
++                        // covergroup's arguments) spread over the bins - a value -> bin table
++                        const string mapv = "__Vmap" + std::to_string(m_crossSelNum++);
++                        AstCStmt* const headp = new AstCStmt{bfl, "{ std::vector<QData> __Vvals; "};
++                        m_constructorp->addStmtsp(headp);
++                        for (const auto& r : ranges) {
++                            m_constructorp->addStmtsp(itemLoop(bfl, itemVarp, r.first, r.second,
++                                new AstIf{bfl, guardWithCond(cbinp), new AstCStmt{bfl, "__Vvals.push_back(__Vv);"},
++                                          nullptr}));
++                        }
++                        AstCStmt* const distp = new AstCStmt{bfl};
++                        distp->add("const uint32_t " + mapv + " = ");
++                        distp->add(memberRef(bfl, cpVarp));
++                        distp->add(".addValueMap(" + std::to_string(ranges.front().first) + "ULL, "
++                                   + std::to_string(ranges.back().second - ranges.front().first + 1)
++                                   + "u); const size_t __Vn = std::min<size_t>(" + std::to_string(nbins)
++                                   + "u, __Vvals.size()); const size_t __Vq = __Vn ? __Vvals.size() / __Vn : 0; "
++                                   "for (size_t __Vi = 0; __Vi < __Vvals.size(); ++__Vi) ");
++                        distp->add(memberRef(bfl, cpVarp));
++                        distp->add(".mapValue(" + mapv + ", __Vvals[__Vi], " + std::to_string(idx)
++                                   + "u + static_cast<uint32_t>(std::min<size_t>(__Vi / __Vq, __Vn - 1))); "
++                                   "for (size_t __Vk = __Vn; __Vk < " + std::to_string(nbins) + "u; ++__Vk) ");
++                        distp->add(memberRef(bfl, cpVarp));
++                        distp->add(".excludeBin(" + std::to_string(idx) + "u + static_cast<uint32_t>(__Vk)); }");
++                        m_constructorp->addStmtsp(distp);
++                        // sample: the table's bin; the map is the coverpoint's addValueMap-th
++                        // (mapv is local to the constructor: its number is the order of maps)
++                        AstNodeExpr* condp = normalGuard(cbinp, nullptr);
++                        if (!condp) condp = new AstConst{bfl, AstConst::BitTrue{}};
++                        AstCStmt* const hitp = new AstCStmt{bfl};
++                        hitp->add("{ const int32_t __Vb = ");
++                        hitp->add(memberRef(bfl, cpVarp));
++                        hitp->add(".mapped(" + std::to_string(m_cpMaps[coverpointp->name()]++)
++                                  + "u, (static_cast<QData>(");
++                        hitp->add(exprp->cloneTree(false));
++                        hitp->add(")" + cleanMask(exprp->width()) + ")); if (__Vb >= 0) ");
++                        hitp->add(memberRef(bfl, cpVarp));
++                        hitp->add(std::string{cbinp->binsType().binIsNormal() ? ".incrementBin(" : ".recordHit("}
++                                  + "static_cast<uint32_t>(__Vb)); }");
++                        AstNode* actionp = hitp;
++                        if (cbinp->binsType() == VCoverBinsType::BINS_ILLEGAL)
++                            actionp->addNext(makeIllegalBinAction(bfl, "Illegal bin " + cbinp->prettyNameQ()
++                                                                           + " hit in coverpoint "
++                                                                           + coverpointp->prettyNameQ()));
++                        m_sampleFuncp->addStmtsp(new AstIf{bfl, applyCoverpointIffCondition(coverpointp, bfl, condp),
++                                                           actionp, nullptr});
++                        // (cross: the table is known only at construction; each bin's values as
++                        // the unfiltered spread)
++                        ob.parts.assign(static_cast<size_t>(ob.count), {});
++                    } else {
++                        // the values spread by arithmetic over the ranges (19.5: evenly, the last bin
++                        // taking the rest); a with is then applied when sampling
++                        if (binWith)
++                            cbinp->v3warn(COVERIGN, "Unsupported: the 'with' of a fixed-size array bin"
++                                                    " over more than " << OCV_MAP_LIMIT << " values:"
++                                                    " values spread before it is applied");
++                        const uint64_t q = nbins ? (nvalues / nbins) : 0;
++                        if (!q) {
++                            cbinp->v3warn(COVERIGN, "Unsupported: a fixed-size array bin with more"
++                                                    " bins than values");
++                            continue;
++                        }
++                        for (uint64_t k = 0; k < nbins; ++k) {
++                            // offsets [a, b) into the concatenated ranges
++                            const uint64_t a = k * q;
++                            const uint64_t b = (k == nbins - 1) ? nvalues : (k + 1) * q;
++                            std::vector<std::pair<uint64_t, uint64_t>> part;
++                            uint64_t off = 0;
++                            for (const auto& r : ranges) {
++                                const uint64_t len = r.second - r.first + 1;
++                                const uint64_t lo = std::max(a, off), hi = std::min(b, off + len);
++                                if (lo < hi) part.emplace_back(r.first + (lo - off), r.first + (hi - off) - 1);
++                                off += len;
++                            }
++                            ob.parts.push_back(part);
++                        }
++                        for (int k = 0; k < ob.count; ++k) {
++                            AstNodeExpr* condp = nullptr;
++                            for (const auto& r : ob.parts[k]) {
++                                AstConst* const lop = widthConst(bfl, exprp->width(), r.first);
++                                AstConst* const hip = widthConst(bfl, exprp->width(), r.second);
++                                condp = orCond(bfl, condp,
++                                               r.first == r.second
++                                                   ? static_cast<AstNodeExpr*>(new AstEq{bfl, exprp->cloneTree(false), lop})
++                                                   : makeRangeCondition(bfl, exprp, lop, hip));
++                                if (r.first == r.second) VL_DO_DANGLING(pushDeletep(hip), hip);
++                                else { VL_DO_DANGLING(pushDeletep(lop), lop); VL_DO_DANGLING(pushDeletep(hip), hip); }
++                            }
++                            emitConvHitIf(coverpointp, cbinp, cpVarp, idx + k, normalGuard(cbinp, condp));
++                        }
++                    }
++                } else if (ranges.size() == 1) {
++                    // one bin per value of [lo:hi]: index = base + (value - lo)
++                    ob.count = static_cast<int>(nvalues);
++                    ob.contiguous = true;
++                    ob.lo = ranges[0].first;
++                    namerStmts.push_back(makeNamer(cpVarp, cbinp, ob.count));
++                    AstConst* const lop = widthConst(bfl, exprp->width(), ranges[0].first);
++                    AstConst* const hip = widthConst(bfl, exprp->width(), ranges[0].second);
++                    AstNodeExpr* const condp = normalGuard(cbinp, makeRangeCondition(bfl, exprp, lop, hip));
++                    VL_DO_DANGLING(pushDeletep(lop), lop);
++                    VL_DO_DANGLING(pushDeletep(hip), hip);
++                    AstCStmt* const hitp = new AstCStmt{bfl};
++                    hitp->add(memberRef(bfl, cpVarp));
++                    hitp->add(std::string{cbinp->binsType().binIsNormal() ? ".incrementBin(" : ".recordHit("}
++                              + std::to_string(idx) + "u + static_cast<uint32_t>((static_cast<QData>(");
++                    hitp->add(exprp->cloneTree(false));
++                    hitp->add(")" + cleanMask(exprp->width()) + ") - " + std::to_string(ranges[0].first) + "ULL));");
++                    AstNode* actionp = hitp;
++                    if (cbinp->binsType() == VCoverBinsType::BINS_ILLEGAL)
++                        actionp->addNext(makeIllegalBinAction(bfl, "Illegal bin " + cbinp->prettyNameQ()
++                                                                       + " hit in coverpoint "
++                                                                       + coverpointp->prettyNameQ()));
++                    m_sampleFuncp->addStmtsp(new AstIf{bfl, applyCoverpointIffCondition(coverpointp, bfl, condp),
++                                                       actionp, nullptr});
++                } else {
++                    cbinp->v3warn(COVERIGN, "Unsupported: array 'bins' of more than 64 values in"
++                                            " several ranges; bin ignored");
++                    continue;
++                }
++                if (cbinp->binsType().binIsNormal()) {
++                    ocvBins.push_back(ob);
++                    if (ob.contiguous) {
++                        for (int k = 0; k < ob.count; ++k)
++                            normVals.push_back({{ob.lo + k, ob.lo + k}});
++                    } else {
++                        for (const auto& part : ob.parts) normVals.push_back(part);
++                    }
++                }
++                idx += ob.count;
++            } else if (cbinp->isArray()) {  // value array: bins b[N] = {...} -> b[0]..b[N-1]
+                 bool unsupported = false;
+                 std::vector<AstNodeExpr*> values = extractArrayValues(cbinp, exprp, unsupported);
+                 if (unsupported) continue;  // bin ignored (COVERIGN emitted); reserve no slot
+                 namerStmts.push_back(makeNamer(cpVarp, cbinp, static_cast<int>(values.size())));
++                OcvBin ob{cbinp, idx, static_cast<int>(values.size()), {}};
+                 for (AstNodeExpr* valuep : values) {
++                    AstConst* const vcp = VN_CAST(valuep, Const);
++                    if (vcp && !vcp->num().isFourState())
++                        ob.parts.push_back({{vcp->toUQuad(), vcp->toUQuad()}});
++                    else
++                        ob.parts.push_back({});
+                     // TODO: A 4-state bin value (e.g. bins b[] = {2'b0x}) must match with ===
+                     // (AstEqCase) per IEEE 1800-2023 19.5.4. == is equivalent under 2-state sim
+                     // (x/z collapse to 0); switch to AstEqCase when 4-state sim support lands.
+                     emitConvHitIf(coverpointp, cbinp, cpVarp, idx++,
+-                                  new AstEq{cbinp->fileline(), exprp->cloneTree(false), valuep});
++                                  normalGuard(cbinp, new AstEq{cbinp->fileline(),
++                                                               exprp->cloneTree(false), valuep}));
++                }
++                if (cbinp->binsType().binIsNormal()) {
++                    ocvBins.push_back(ob);
++                    for (const auto& part : ob.parts) normVals.push_back(part);
+                 }
+             } else {
+                 namerStmts.push_back(makeNamer(cpVarp, cbinp, -1));
+                 // buildBinCondition is null for 'ignore_bins = default' (no ranges); the bin
+                 // still gets a reserved slot (recorded, never incremented).
+-                if (AstNodeExpr* const condp = buildBinCondition(cbinp, exprp))
+-                    emitConvHitIf(coverpointp, cbinp, cpVarp, idx, condp);
++                AstNodeExpr* condp = whole ? new AstConst{cbinp->fileline(), AstConst::BitTrue{}}
++                                           : buildBinCondition(cbinp, exprp);
++                if (condp) emitConvHitIf(coverpointp, cbinp, cpVarp, idx, normalGuard(cbinp, condp));
++                if (cbinp->binsType().binIsNormal() && constRanges) {
++                    OcvBin ob{cbinp, idx, 1, {ranges}};
++                    ocvBins.push_back(ob);
++                }
++                if (cbinp->binsType().binIsNormal()) {
++                    normVals.push_back(constRanges ? ranges
++                                                   : std::vector<std::pair<uint64_t, uint64_t>>{});
++                }
+                 ++idx;
+             }
+         }
+@@ -1024,6 +1551,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                    + std::to_string(idx) + ");");
+         m_constructorp->addStmtsp(initp);
+         for (AstCStmt* const ns : namerStmts) m_constructorp->addStmtsp(ns);
++        emitExclusions(coverpointp, exprp, cpVarp, itemVarp, ocvBins);
+         if (v3Global.opt.coverage()) {
+             const std::string page
+                 = VIdProtect::protectIf("v_covergroup/" + m_covergroupp->name(), prot);
+@@ -1213,6 +1741,26 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+     // Build a one-sided comparison for an open-ended bin range whose other bound is '$'.
+     // '$' denotes the coverpoint domain extreme, so {[lo:$]} == (expr >= lo) and
+     // {[$:hi]} == (expr <= hi).
++    // OCV: exprp >= boundp (isLowerBound) or exprp <= boundp, a bound that is an expression (a
++    // covergroup argument), compared when sampling. Both sides the same width (as the arguments
++    // CVA6 uses: int); signed if exprp is.  Non-owning; nullptr after an error.
++    AstNodeExpr* makeExprBoundCondition(FileLine* fl, AstNodeExpr* exprp, AstNodeExpr* boundp,
++                                        bool isLowerBound) {
++        if (boundp->widthMin() != exprp->widthMin() && boundp->width() != exprp->width()) {
++            boundp->v3warn(E_UNSUPPORTED, "Unsupported: a non-constant bin range bound of another"
++                                          " width than the coverpoint expression");
++            return nullptr;
++        }
++        AstNodeExpr* const ap = exprp->cloneTree(false);
++        AstNodeExpr* const bp = boundp->cloneTree(false);
++        if (exprp->isSigned()) {
++            if (isLowerBound) return new AstGteS{fl, ap, bp};
++            return new AstLteS{fl, ap, bp};
++        }
++        if (isLowerBound) return new AstGte{fl, ap, bp};
++        return new AstLte{fl, ap, bp};
++    }
++
+     AstNodeExpr* makeOpenRangeCondition(FileLine* fl, AstNodeExpr* exprp, AstConst* boundp,
+                                         bool isLowerBound) {
+         AstConst* const widep = widenConst(fl, boundp, exprp->widthMin());
+@@ -1242,9 +1790,41 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         for (AstNode* valp = itemp->valuesp(); valp; valp = valp->nextp()) {
+             AstNodeExpr* singleCondp = nullptr;
+ 
+-            AstConst* const constp = VN_AS(valp, Const);
+-            singleCondp
+-                = new AstEq{constp->fileline(), exprp->cloneTree(false), constp->cloneTree(false)};
++            if (AstInsideRange* const irp = VN_CAST(valp, InsideRange)) {
++                // OCV: a range in a transition item ([a:b], [a:$], [$:b]: e.g. CVA6's
++                // bins overflow = ([32'hFFFFFBFF:$] => [0:10000])) - as in a value bin
++                AstConst* const minConstp = VN_CAST(irp->lhsp(), Const);
++                AstConst* const maxConstp = VN_CAST(irp->rhsp(), Const);
++                const bool loUnbounded = VN_IS(irp->lhsp(), Unbounded);
++                const bool hiUnbounded = VN_IS(irp->rhsp(), Unbounded);
++                if (loUnbounded && hiUnbounded) {
++                    singleCondp = new AstConst{irp->fileline(), AstConst::BitTrue{}};
++                } else if (loUnbounded || hiUnbounded) {
++                    AstConst* const boundp = hiUnbounded ? minConstp : maxConstp;
++                    if (!boundp || boundp->num().isFourState()) {
++                        irp->v3error("Transition range bounds must be two-state constants");
++                        continue;
++                    }
++                    singleCondp = makeOpenRangeCondition(irp->fileline(), exprp, boundp,
++                                                         /*isLowerBound=*/hiUnbounded);
++                } else if (minConstp && maxConstp && !minConstp->num().isFourState()
++                           && !maxConstp->num().isFourState()) {
++                    singleCondp
++                        = makeRangeCondition(irp->fileline(), exprp, minConstp, maxConstp);
++                } else {
++                    irp->v3error("Transition range bounds must be two-state constants");
++                    continue;
++                }
++            } else if (AstConst* const constp = VN_CAST(valp, Const)) {
++                singleCondp = new AstEq{constp->fileline(), exprp->cloneTree(false),
++                                        constp->cloneTree(false)};
++            } else {
++                // OCV: an expression item (an enum value: CVA6's reset covergroup
++                // (DEASSERTED => ASSERTED => DEASSERTED))
++                AstNodeExpr* const valExprp = VN_AS(valp, NodeExpr);
++                singleCondp = new AstEq{valExprp->fileline(), exprp->cloneTree(false),
++                                        valExprp->cloneTree(false)};
++            }
+ 
+             if (condp) {
+                 condp = new AstOr{itemp->fileline(), condp, singleCondp};
+@@ -1333,9 +1913,11 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         // Resolve and unlink the coverpoint refs, in dimension order.  Every ref resolves to a
+         // known coverpoint (a cross with an unresolvable item was dropped earlier).
+         std::vector<AstVar*> cpVars;
++        std::vector<std::string> cpNames;  // (OCV: binsof of the cross bins)
+         for (AstNode* itemp = crossp->itemsp(); itemp;) {
+             AstNode* const nextp = itemp->nextp();
+             AstCoverpointRef* const refp = VN_AS(itemp, CoverpointRef);
++            cpNames.push_back(refp->name());
+             const auto it = m_cpVarMap.find(refp->name());
+             UASSERT_OBJ(it != m_cpVarMap.end(), crossp, "Cross references an unknown coverpoint");
+             cpVars.push_back(it->second);
+@@ -1364,6 +1946,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+               + VIdProtect::protectIf(fl->filename(), prot) + "\", " + std::to_string(fl->lineno())
+               + ", " + std::to_string(fl->firstColumn()) + ");";
+         m_constructorp->addStmtsp(makeCrossCpsCall(fl, cpVars, cxVarp, initCall));
++        generateCrossBins(crossp, cxVarp, cpNames);
+         if (v3Global.opt.coverage()) {
+             const std::string page
+                 = VIdProtect::protectIf("v_covergroup/" + m_covergroupp->name(), prot);
+@@ -1383,6 +1966,129 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         }
+     }
+ 
++
++    // OCV: a cross select expression as C++ (select(kind, lambda over the tuple __Vt of coverpoint
++    // cross indexes)); tables of binsof ... intersect go to prep. False if a part is not supported.
++    bool emitCrossSelect(AstCStmt* cs, std::string& prep, AstNode* nodep, AstCoverCross* crossp,
++                         const std::vector<std::string>& cpNames) {
++        if (AstLogAnd* const ap = VN_CAST(nodep, LogAnd)) {
++            cs->add("(");
++            if (!emitCrossSelect(cs, prep, ap->lhsp(), crossp, cpNames)) return false;
++            cs->add(" && ");
++            if (!emitCrossSelect(cs, prep, ap->rhsp(), crossp, cpNames)) return false;
++            cs->add(")");
++            return true;
++        }
++        if (AstLogOr* const op = VN_CAST(nodep, LogOr)) {
++            cs->add("(");
++            if (!emitCrossSelect(cs, prep, op->lhsp(), crossp, cpNames)) return false;
++            cs->add(" || ");
++            if (!emitCrossSelect(cs, prep, op->rhsp(), crossp, cpNames)) return false;
++            cs->add(")");
++            return true;
++        }
++        if (AstLogNot* const np = VN_CAST(nodep, LogNot)) {
++            cs->add("!(");
++            if (!emitCrossSelect(cs, prep, np->lhsp(), crossp, cpNames)) return false;
++            cs->add(")");
++            return true;
++        }
++        if (AstCoverSelWith* const wp = VN_CAST(nodep, CoverSelWith)) {
++            // (an expression inside C text is not cleaned: only its low bit is the condition)
++            cs->add(wp->negate() ? "!(1U & (" : "(1U & (");
++            cs->add(wp->exprp()->cloneTree(false));
++            cs->add("))");
++            return true;
++        }
++        if (AstCoverSelBinsof* const bp = VN_CAST(nodep, CoverSelBinsof)) {
++            int dim = -1;
++            for (size_t d = 0; d < cpNames.size(); ++d)
++                if (cpNames[d] == bp->cpName()) dim = static_cast<int>(d);
++            if (dim < 0) {
++                bp->v3error("binsof of " << bp->cpName() << ": not a coverpoint of cross "
++                                         << crossp->prettyNameQ());
++                return false;
++            }
++            const auto it = m_cpNormVals.find(bp->cpName());
++            if (it == m_cpNormVals.end()) return false;
++            // the intersect values
++            std::vector<std::pair<uint64_t, uint64_t>> want;
++            for (AstNode* rp = bp->rangesp(); rp; rp = rp->nextp()) {
++                if (AstConst* const cp = VN_CAST(rp, Const)) {
++                    want.emplace_back(cp->toUQuad(), cp->toUQuad());
++                } else if (AstInsideRange* const irp = VN_CAST(rp, InsideRange)) {
++                    AstConst* const lop = VN_CAST(V3Const::constifyEdit(irp->lhsp()), Const);
++                    AstConst* const hip = VN_CAST(V3Const::constifyEdit(irp->rhsp()), Const);
++                    if (!lop || !hip) {
++                        bp->v3warn(COVERIGN, "Unsupported: non-constant intersect values");
++                        return false;
++                    }
++                    want.emplace_back(lop->toUQuad(), hip->toUQuad());
++                } else {
++                    bp->v3warn(COVERIGN, "Unsupported: intersect value form");
++                    return false;
++                }
++            }
++            const string tab = "__Vsel" + std::to_string(m_crossSelNum++);
++            prep += "static const uint8_t " + tab + "[] = {";
++            const auto& bins = it->second;
++            for (size_t j = 0; j < bins.size(); ++j) {
++                bool m = !bp->intersect();
++                for (const auto& r : bins[j])
++                    for (const auto& w : want)
++                        if (r.first <= w.second && w.first <= r.second) m = true;
++                prep += std::string{j ? "," : ""} + (m ? "1" : "0");
++            }
++            if (bins.empty()) prep += "0";
++            prep += "};";
++            cs->add(std::string{bp->negate() ? "!" : ""} + "(" + tab + "[__Vt[" + std::to_string(dim)
++                    + "]] != 0)");
++            return true;
++        }
++        nodep->v3warn(COVERIGN, "Unsupported: coverage select expression form");
++        return false;
++    }
++    void generateCrossBins(AstCoverCross* crossp, AstVar* cxVarp,
++                           const std::vector<std::string>& cpNames) {
++        FileLine* const fl = crossp->fileline();
++        for (AstNode* itemp = crossp->rawBodyp(); itemp; itemp = itemp->nextp()) {
++            AstCoverCrossBin* const binp = VN_CAST(itemp, CoverCrossBin);
++            if (!binp) continue;
++            if (binp->iffp()) binp->v3warn(COVERIGN, "Unsupported: iff of a cross bin (ignored)");
++            const VCoverBinsType bt = binp->binsType();
++            AstCStmt* const cs = new AstCStmt{fl};
++            std::string prep;
++            std::string kind;
++            AstCStmt* const headp = new AstCStmt{fl, "{ "};
++            if (bt == VCoverBinsType::BINS_IGNORE) {
++                kind = "VlCoverCross::KIND_IGNORE";
++            } else if (bt == VCoverBinsType::BINS_ILLEGAL) {
++                kind = "VlCoverCross::KIND_ILLEGAL";
++            } else {
++                kind = "__Vk";
++                headp->add("const uint32_t __Vk = ");
++                headp->add(memberRef(fl, cxVarp));
++                headp->add(".addUserBin(\"" + binp->name() + "\"); ");
++            }
++            cs->add(memberRef(fl, cxVarp));
++            cs->add(".select(" + kind + ", [&](const uint32_t* __Vt) -> bool { (void)__Vt; return ");
++            if (!emitCrossSelect(cs, prep, binp->selectp(), crossp, cpNames)) {
++                VL_DO_DANGLING(pushDeletep(cs), cs);
++                VL_DO_DANGLING(pushDeletep(headp), headp);
++                continue;
++            }
++            cs->add("; }); }");
++            headp->add(prep);
++            m_constructorp->addStmtsp(headp);
++            m_constructorp->addStmtsp(cs);
++        }
++        // the excluded coverpoint bins leave their tuples; the kinds' totals
++        AstCStmt* const finp = new AstCStmt{fl};
++        finp->add(memberRef(fl, cxVarp));
++        finp->add(".finalize();");
++        m_constructorp->addStmtsp(finp);
++    }
++
+     void generateCrossCode(AstCoverCross* crossp) {
+         UINFO(4, "  Generating code for cross: " << crossp->name());
+ 
+@@ -1451,10 +2157,16 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                     if (loUnbounded && hiUnbounded) {
+                         rangeCondp = new AstConst{irp->fileline(), AstConst::BitTrue{}};
+                     } else if (!boundp) {
+-                        irp->v3error("Non-constant expression in bin range; "
+-                                     "range bounds must be constants");
+-                        if (fullCondp) VL_DO_DANGLING(pushDeletep(fullCondp), fullCondp);
+-                        return nullptr;
++                        // OCV: a bound from the covergroup's arguments (IEEE 1800-2023 19.5:
++                        // evaluated when the covergroup is constructed; CVA6's
++                        // {[clock_period_ps+1:$]}): compared when sampling
++                        AstNodeExpr* const bexprp = hiUnbounded ? minExprp : maxExprp;
++                        rangeCondp = makeExprBoundCondition(irp->fileline(), exprp, bexprp,
++                                                            /*isLowerBound=*/hiUnbounded);
++                        if (!rangeCondp) {
++                            if (fullCondp) VL_DO_DANGLING(pushDeletep(fullCondp), fullCondp);
++                            return nullptr;
++                        }
+                     } else if (boundp->num().isFourState()) {
+                         irp->v3error("Four-state (x/z) value in bin range bound; "
+                                      "range bounds must be two-state constants");
+@@ -1465,10 +2177,18 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                                                             /*isLowerBound=*/hiUnbounded);
+                     }
+                 } else if (!minConstp || !maxConstp) {
+-                    irp->v3error("Non-constant expression in bin range; "
+-                                 "range bounds must be constants");
+-                    if (fullCondp) VL_DO_DANGLING(pushDeletep(fullCondp), fullCondp);
+-                    return nullptr;
++                    // OCV: bounds from the covergroup's arguments (CVA6's {[0:clock_period_ps]})
++                    AstNodeExpr* const locp = makeExprBoundCondition(irp->fileline(), exprp,
++                                                                     minExprp, true);
++                    AstNodeExpr* const hicp = locp ? makeExprBoundCondition(irp->fileline(), exprp,
++                                                                            maxExprp, false)
++                                                   : nullptr;
++                    if (!locp || !hicp) {
++                        if (locp) VL_DO_DANGLING(pushDeletep(locp), locp);
++                        if (fullCondp) VL_DO_DANGLING(pushDeletep(fullCondp), fullCondp);
++                        return nullptr;
++                    }
++                    rangeCondp = new AstAnd{irp->fileline(), locp, hicp};
+                 } else if (minConstp->num().isFourState() || maxConstp->num().isFourState()) {
+                     irp->v3error("Four-state (x/z) value in bin range bound; "
+                                  "range bounds must be two-state constants");
+@@ -1578,7 +2298,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         AstVar* const returnVarp = VN_AS(funcp->fvarp(), Var);
+ 
+         // Every coverpoint and cross holds its bins in the runtime (VlCoverpoint/VlCoverCross).
+-        // Sum their covered/total contributions via coverageParts (Normal bins only; ignore,
++        // Average their coverage (each from coverageParts: Normal bins only; ignore,
+         // illegal, and default are excluded per LRM 19.5).  A covergroup with no coverpoints
+         // (and hence no crosses) has nothing to cover and reports 100%.
+         if (m_cpVars.empty()) {
+@@ -1593,7 +2313,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+             AstCStmt* const cs = new AstCStmt{fl};
+             cs->add("{ double __Vc = 0.0; double __Vt = 0.0; ");
+             cs->add(memberRef(fl, cpVarp));
+-            cs->add(".coverageParts(__Vc, __Vt); __Vcov += __Vc; __Vtot += __Vt; }");
++            cs->add(".coverageParts(__Vc, __Vt); if (__Vt != 0.0) { __Vcov += 100.0 * __Vc / __Vt; __Vtot += 1.0; } }");
+             funcp->addStmtsp(cs);
+         }
+         // Crosses contribute the same covered/total ratio as their per-tuple bins.
+@@ -1601,12 +2321,14 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+             AstCStmt* const cs = new AstCStmt{fl};
+             cs->add("{ double __Vc = 0.0; double __Vt = 0.0; ");
+             cs->add(memberRef(fl, cxVarp));
+-            cs->add(".coverageParts(__Vc, __Vt); __Vcov += __Vc; __Vtot += __Vt; }");
++            cs->add(".coverageParts(__Vc, __Vt); if (__Vt != 0.0) { __Vcov += 100.0 * __Vc / __Vt; __Vtot += 1.0; } }");
+             funcp->addStmtsp(cs);
+         }
+         AstCStmt* const retp = new AstCStmt{fl};
+         retp->add(new AstVarRef{fl, returnVarp, VAccess::WRITE});
+-        retp->add(" = (__Vtot != 0.0) ? (100.0 * __Vcov / __Vtot) : 100.0;");
++        // OCV: IEEE 1800-2023 19.11 - the covergroup's coverage is the (weighted, here each weight 1)
++        // average of its coverpoints' and crosses' coverage, not the share of all their bins
++        retp->add(" = (__Vtot != 0.0) ? (__Vcov / __Vtot) : 100.0;");
+         funcp->addStmtsp(retp);
+     }
+ 
+diff --git a/src/V3LinkParse.cpp b/src/V3LinkParse.cpp
+index 67290dd7e..74c8f5f22 100644
+--- a/src/V3LinkParse.cpp
++++ b/src/V3LinkParse.cpp
+@@ -1412,6 +1412,28 @@ class LinkParseVisitor final : public VNVisitor {
+                 VL_DO_DANGLING(optp->deleteTree(), optp);
+             }
+         }
++        // OCV: a bin's with (AstCoverBinGuard, IEEE 1800-2023 19.5.1.1): its 'item' becomes a member of the
++        // covergroup class, one per coverpoint, which V3Covergroup sets to the value tested before
++        // evaluating the with
++        string itemName;
++        for (AstNode* binp = nodep->binsp(); binp; binp = binp->nextp()) {
++            AstCoverBin* const cbinp = VN_CAST(binp, CoverBin);
++            AstCoverBinGuard* const gp = cbinp ? VN_CAST(cbinp->iffp(), CoverBinGuard) : nullptr;
++            if (!gp || !gp->withp()) continue;
++            if (itemName.empty()) {
++                itemName = "__Vcovitem_" + nodep->name();
++                AstClass* const classp = VN_CAST(m_modp, Class);
++                UASSERT_OBJ(classp && classp->isCovergroup(), nodep,
++                            "Coverpoint with a bin 'with' outside a covergroup class");
++                classp->addMembersp(new AstVar{
++                    nodep->fileline(), VVarType::MEMBER, itemName, VFlagChildDType{},
++                    new AstBasicDType{nodep->fileline(), VBasicDTypeKwd::LONGINT}});
++            }
++            gp->withp()->foreach([&](AstParseRef* refp) {
++                if (refp->name() == "item") refp->name(itemName);
++            });
++            gp->itemName(itemName);
++        }
+         iterateChildren(nodep);
+     }
+ 
+@@ -1421,9 +1443,14 @@ class LinkParseVisitor final : public VNVisitor {
+         // typed optionsp slot.  The grammar produces AstCgOptionAssign nodes for
+         // option.* items; convert them to AstCoverOption exactly as visit(AstCoverpoint*)
+         // does.  Other items (functions, unsupported bin selectors) are discarded.
++        std::vector<AstNode*> crossBins;  // (OCV: explicit cross bins stay, for V3Covergroup)
+         for (AstNode *itemp = nodep->rawBodyp(), *nextp; itemp; itemp = nextp) {
+             nextp = itemp->nextp();
+             itemp->unlinkFrBack();
++            if (VN_IS(itemp, CoverCrossBin)) {
++                crossBins.push_back(itemp);
++                continue;
++            }
+             AstCgOptionAssign* const optp = VN_AS(itemp, CgOptionAssign);
+             const VCoverOptionType optType = optp->optType();
+             optp->v3warn(COVERIGN,
+@@ -1434,6 +1461,7 @@ class LinkParseVisitor final : public VNVisitor {
+                 new AstCoverOption{optp->fileline(), optType, optp->valuep()->cloneTree(false)});
+             VL_DO_DANGLING(optp->deleteTree(), optp);
+         }
++        for (AstNode* const binp : crossBins) nodep->addRawBodyp(binp);
+         iterateChildren(nodep);
+     }
+ 
+diff --git a/src/V3Number.cpp b/src/V3Number.cpp
+index 17eaac079..82d7633f5 100644
+--- a/src/V3Number.cpp
++++ b/src/V3Number.cpp
+@@ -296,7 +296,14 @@ void V3Number::create(const char* sourcep) {
+         for (const char* cp = value_startp + std::strlen(value_startp) - 1; cp >= value_startp;
+              cp--) {
+             if (*cp != '_' && *cp != '0' && obit >= width()) {
+-                warnTooMany(sourcep);
++                // OCV: IEEE 1800-2023 5.7.1 truncates a sized constant's extra digits on the left: a
++                // warning, as other tools (core-v-verif: 31'b with 32 wildcard digits)
++                if (m_fileline) {
++                    m_fileline->v3warn(WIDTHTRUNC, "Too many digits for " << width() << " bit number: '"
++                                                       << sourcep << "' (the extra digits are dropped)");
++                } else {
++                    warnTooMany(sourcep);
++                }
+                 break;
+             }
+             switch (std::tolower(base)) {
+diff --git a/src/V3Param.cpp b/src/V3Param.cpp
+index 3515d25cd..0e5b314d9 100644
+--- a/src/V3Param.cpp
++++ b/src/V3Param.cpp
+@@ -1467,7 +1467,49 @@ class ParamProcessor final {
+                     convertToStringp(modvarp->valuep());
+                 }
+                 AstConst* const exprp = VN_CAST(pinp->exprp(), Const);
+-                AstConst* const origp = VN_CAST(modvarp->valuep(), Const);
++                AstConst* origp = VN_CAST(modvarp->valuep(), Const);
++                // OCV: a default that is not a constant yet (a package localparam, e.g.
++                // core-v-verif's ILEN = DEFAULT_ILEN): evaluate a copy, its parameter references
++                // replaced by this instance's pins or their own defaults, so a pin equal to the
++                // default is the default specialization (IEEE 1800-2023 8.25), not a new class
++                AstConst* origEvalp = nullptr;
++                if (!origp && modvarp->valuep() && exprp) {
++                    AstVar* const dvarp = modvarp->cloneTree(false);
++                    constexpr int maxSubstIters = 1000;
++                    bool unresolved = false;
++                    for (int it = 0; it < maxSubstIters; ++it) {
++                        bool any = false;
++                        dvarp->foreach([&](AstVarRef* varrefp) {
++                            AstVar* const targetp = varrefp->varp();
++                            AstNode* replacep = nullptr;
++                            for (AstPin* pp = paramsp; pp; pp = VN_AS(pp->nextp(), Pin)) {
++                                if (pp->modVarp() == targetp) {
++                                    if (AstConst* const constp = VN_CAST(pp->exprp(), Const))
++                                        replacep = constp->cloneTree(false);
++                                    break;
++                                }
++                            }
++                            if (!replacep && targetp && targetp->valuep())
++                                replacep = targetp->valuep()->cloneTree(false);
++                            if (replacep) {
++                                varrefp->replaceWith(replacep);
++                                VL_DO_DANGLING(varrefp->deleteTree(), varrefp);
++                                any = true;
++                            }
++                        });
++                        if (!any) break;
++                    }
++                    dvarp->foreach([&](AstVarRef*) { unresolved = true; });
++                    dvarp->foreach([&](AstRefDType*) { unresolved = true; });
++                    if (!unresolved && dvarp->valuep()) {
++                        V3Const::constifyParamsEdit(dvarp->valuep());
++                        if (AstConst* const cp = VN_CAST(dvarp->valuep(), Const)) {
++                            origEvalp = cp->cloneTree(false);
++                            origp = origEvalp;
++                        }
++                    }
++                    VL_DO_DANGLING(dvarp->deleteTree(), dvarp);
++                }
+                 // Width the pin to the port's type so equal values hash the same (#5479).
+                 AstConst* normedNamep = nullptr;
+                 if (exprp && !exprp->num().isDouble() && !exprp->num().isString()) {
+@@ -1598,6 +1640,7 @@ class ParamProcessor final {
+                     any_overridesr = true;
+                 }
+                 if (normedNamep) VL_DO_DANGLING(normedNamep->deleteTree(), normedNamep);
++                if (origEvalp) VL_DO_DANGLING(origEvalp->deleteTree(), origEvalp);
+             }
+         } else if (AstParamTypeDType* const modvarp = pinp->modPTypep()) {
+             // Handle DOT with ParseRef RHS (e.g., p_class#(8)::p_type)
+diff --git a/src/V3Task.cpp b/src/V3Task.cpp
+index 7ef30f56a..36876890e 100644
+--- a/src/V3Task.cpp
++++ b/src/V3Task.cpp
+@@ -1166,12 +1166,41 @@ class TaskVisitor final : public VNVisitor {
+ 
+                     if (args != "") args += ", ";
+ 
+-                    if (portp->isDpiOpenArray()) {
+-                        AstNodeDType* const dtypep = portp->dtypep()->skipRefp();
+-                        UASSERT_OBJ(!VN_IS(dtypep, DynArrayDType) && !VN_IS(dtypep, QueueDType),
+-                                    portp,
+-                                    "Passing dynamic array or queue as actual argument to DPI "
+-                                    "open array is not yet supported");
++                    AstNodeDType* const odtypep
++                        = portp->isDpiOpenArray() ? portp->dtypep()->skipRefp() : nullptr;
++                    if (odtypep && (VN_IS(odtypep, DynArrayDType) || VN_IS(odtypep, QueueDType))) {
++                        // OCV: a dynamic array or queue (core-v-verif: inout byte buffer[]) - its
++                        // elements copied into a contiguous buffer, an open array of the run-time
++                        // size over it, copied back after the call when written
++                        AstNodeDType* const edtypep = odtypep->subDTypep()->skipRefp();
++                        const AstBasicDType* const ebasicp = edtypep->basicp();
++                        UASSERT_OBJ(ebasicp && edtypep->widthMin() <= 64 && !VN_IS(edtypep, NodeArrayDType),
++                                    portp, "Passing a dynamic array or queue of other than up to 64-bit"
++                                           " elements to a DPI open array is not supported");
++                        const int ew = edtypep->widthMin();
++                        const string ctype = ew <= 8 ? "CData" : ew <= 16 ? "SData" : ew <= 32 ? "IData" : "QData";
++                        const string bufName = portp->name() + "__Vdynbuf";
++                        const string propName = portp->name() + "__Vopenprops";
++                        const string name = portp->name() + "__Vopenarray";
++                        string code = "std::vector<" + ctype + "> " + bufName + "(" + portp->name() + ".size());\n";
++                        if (portp->isNonOutput()) {
++                            code += "for (size_t __Vi = 0; __Vi < " + bufName + ".size(); ++__Vi) " + bufName
++                                    + "[__Vi] = " + portp->name() + ".at(__Vi);\n";
++                        }
++                        code += "const int " + propName + "__ulims[2] = {0, static_cast<int>(" + bufName + ".size()) - 1};\n";
++                        string packed;
++                        if (ebasicp->isRanged()) {
++                            code += "static const int " + propName + "__plims[2] = {" + cvtToStr(ebasicp->left())
++                                    + ", " + cvtToStr(ebasicp->right()) + "};\n";
++                            packed = ", VerilatedVarProps::Packed{}, 1, " + propName + "__plims";
++                        }
++                        code += "const VerilatedVarProps " + propName + "(" + edtypep->vlEnumType() + ", "
++                                + portp->vlEnumDir() + ", VerilatedVarProps::Unpacked{}, 1, " + propName
++                                + "__ulims" + packed + ");\n";
++                        code += "VerilatedDpiOpenVar " + name + " (&" + propName + ", " + bufName + ".data());\n";
++                        cfuncp->addStmtsp(new AstCStmt{portp->fileline(), code});
++                        args += "&" + name;
++                    } else if (portp->isDpiOpenArray()) {
+                         // Ideally we'd make a table of variable
+                         // characteristics, and reuse it wherever we can
+                         // At least put them into the module's CTOR as static?
+@@ -1236,6 +1265,16 @@ class TaskVisitor final : public VNVisitor {
+         for (AstNode* stmtp = cfuncp->argsp(); stmtp; stmtp = stmtp->nextp()) {
+             if (AstVar* const portp = VN_CAST(stmtp, Var)) {
+                 portp->protect(false);  // No additional exposure - already part of shown proto
++                // OCV: a dynamic array / queue passed as an open array: its buffer back
++                AstNodeDType* const odtypep
++                    = portp->isDpiOpenArray() ? portp->dtypep()->skipRefp() : nullptr;
++                if (odtypep && (VN_IS(odtypep, DynArrayDType) || VN_IS(odtypep, QueueDType))
++                    && portp->isIO() && portp->isWritable()) {
++                    const string bufName = portp->name() + "__Vdynbuf";
++                    cfuncp->addStmtsp(new AstCStmt{
++                        portp->fileline(), "for (size_t __Vi = 0; __Vi < " + bufName + ".size(); ++__Vi) "
++                                               + portp->name() + ".at(__Vi) = " + bufName + "[__Vi];\n"});
++                }
+                 if (portp->isIO() && (portp->isWritable() || portp->isFuncReturn())
+                     && !portp->isDpiOpenArray()) {
+                     AstVarScope* const portvscp = VN_AS(
+diff --git a/src/V3Unknown.cpp b/src/V3Unknown.cpp
+index 57e12e478..e320be685 100644
+--- a/src/V3Unknown.cpp
++++ b/src/V3Unknown.cpp
+@@ -255,12 +255,14 @@ class UnknownVisitor final : public VNVisitor {
+             AstNodeExpr* const rhsp = nodep->rhsp()->unlinkFrBack();
+             AstNodeExpr* newp;
+             if (!VN_IS(rhsp, Const)) {
+-                if (rhsp->dtypep()->isFourstate()) {
+-                    nodep->v3warn(
+-                        E_UNSUPPORTED,
+-                        "Unsupported: RHS of ==? or !=? is fourstate but not a constant");
++                // OCV: a variable holds no X/Z at run time in a two-state model: its wildcard bits
++                // never occur, so ==? is == and !=? is != (CVA6's scoreboard: rvfi ==? reference
++                // model values; the !=? was lowered to == before)
++                if (VN_IS(nodep, EqWild)) {
++                    newp = new AstEq{nodep->fileline(), lhsp, rhsp};
++                } else {
++                    newp = new AstNeq{nodep->fileline(), lhsp, rhsp};
+                 }
+-                newp = new AstEq{nodep->fileline(), lhsp, rhsp};
+             } else {
+                 // X or Z's become mask, ala case statements.
+                 V3Number nummask{rhsp, rhsp->width()};
+diff --git a/src/V3Width.cpp b/src/V3Width.cpp
+index 2d5ba513c..041417321 100644
+--- a/src/V3Width.cpp
++++ b/src/V3Width.cpp
+@@ -2077,6 +2077,40 @@ class WidthVisitor final : public VNVisitor {
+         if (nodep->iffp()) iterateCheckBool(nodep, "iff condition", nodep->iffp(), BOTH);
+         userIterateAndNext(nodep->optionsp(), nullptr);
+     }
++    void visit(AstCoverSelBinsof* nodep) override {
++        // OCV: the intersect values are constants, as a bin's
++        for (AstNode *nextp, *itemp = nodep->rangesp(); itemp; itemp = nextp) {
++            nextp = itemp->nextp();
++            if (VN_IS(itemp, InsideRange)) {
++                userIterate(itemp, nullptr);
++            } else {
++                userIterate(itemp, WidthVP{SELF, BOTH}.p());
++                V3Const::constifyEdit(itemp);  // itemp may change
++            }
++        }
++        nodep->dtypeSetBit();
++    }
++    void visit(AstCoverSelWith* nodep) override {
++        iterateCoverCond(nodep->exprp());
++        nodep->dtypeSetBit();
++    }
++    void visit(AstCoverCrossBin* nodep) override {
++        iterateCheckBool(nodep, "cross select", nodep->selectp(), BOTH);
++        if (nodep->iffp()) iterateCheckBool(nodep, "cross bin iff", nodep->iffp(), BOTH);
++    }
++    // OCV: a covergroup condition (a bin's iff and with, a cross select's with): true when nonzero,
++    // reduced to one bit without a width warning (IEEE 1800-2023 19.5.1.1: a boolean context)
++    void iterateCoverCond(AstNode* underp) {
++        underp = userIterateSubtreeReturnEdits(underp, WidthVP{SELF, BOTH}.p());
++        AstNodeExpr* const exprp = VN_CAST(underp, NodeExpr);
++        if (exprp && exprp->dtypep() && exprp->width() != 1) fixWidthReduce(exprp);
++    }
++    void visit(AstCoverBinGuard* nodep) override {
++        // OCV: a bin's own iff and with (IEEE 1800-2023 19.5): conditions
++        if (nodep->iffp()) iterateCoverCond(nodep->iffp());
++        if (nodep->withp()) iterateCoverCond(nodep->withp());
++        nodep->dtypeSetBit();
++    }
+     void visit(AstCoverBin* nodep) override {
+         // Bin range/value entries are self-determined constant expressions (IEEE 1800-2023
+         // 19.5).  Width each plain single-value entry self-determined so a referenced
+@@ -3736,7 +3770,8 @@ class WidthVisitor final : public VNVisitor {
+             return irangep->newAndFromInside(exprp, irangep->lhsp()->unlinkFrBack(),
+                                              irangep->rhsp()->unlinkFrBack());
+         } else if (VN_IS(itemDtp, UnpackArrayDType) || VN_IS(itemDtp, DynArrayDType)
+-                   || VN_IS(itemDtp, QueueDType)) {
++                   || VN_IS(itemDtp, QueueDType) || VN_IS(itemDtp, AssocArrayDType)) {
++            // (OCV: an associative array's values too - VlAssocArray::inside)
+             // Unsupported in parameters
+             AstNodeExpr* const inewp = new AstCMethodHard{nodep->fileline(), itemp->unlinkFrBack(),
+                                                           VCMethod::ARRAY_INSIDE, exprp};
+@@ -3744,11 +3779,6 @@ class WidthVisitor final : public VNVisitor {
+             inewp->dtypeSetBit();
+             inewp->didWidth(true);
+             return inewp;
+-        } else if (VN_IS(itemDtp, AssocArrayDType)) {
+-            nodep->v3error("Inside operator not specified on associative arrays "
+-                           "(IEEE 1800-2023 11.4.13)");
+-            VL_DO_DANGLING(exprp->deleteTree(), exprp);
+-            return nullptr;
+         }
+         return AstEqWild::newTyped(itemp->fileline(), exprp, itemp->unlinkFrBack());
+     }
+diff --git a/src/verilog.y b/src/verilog.y
+index 2238b08ab..6696c9c07 100644
+--- a/src/verilog.y
++++ b/src/verilog.y
+@@ -172,6 +172,33 @@ static T_Node* addNextNull(T_Node* nodep, T_Next* nextp) {
+ 
+ class AstSenTree;
+ // clang-format off
++// OCV: a bin's own iff / with (AstCoverBinGuard in AstCoverBin::iffp), or nullptr when it has neither
++static AstNodeExpr* cgBinGuard(FileLine* fl, AstNodeExpr* iffp, AstNodeExpr* withp, bool wholeDomain) {
++    if (!iffp && !withp && !wholeDomain) return nullptr;
++    return new AstCoverBinGuard{fl, iffp, withp, wholeDomain};
++}
++// OCV: binsof(<coverpoint>) of a cross select (AstCoverSelBinsof); the bins_expression's name
++static AstNodeExpr* cgSelBinsof(FileLine* fl, AstNode* exprp, AstNode* rangesp, bool negate, bool intersect) {
++    AstParseRef* const refp = VN_CAST(exprp, ParseRef);
++    if (!refp) {
++        fl->v3warn(COVERIGN, "Unsupported: 'binsof' of other than a coverpoint name");
++        if (exprp) exprp->deleteTree();
++        if (rangesp) rangesp->deleteTree();
++        return nullptr;
++    }
++    const string name = refp->name();
++    refp->deleteTree();
++    return new AstCoverSelBinsof{fl, name, rangesp, negate, intersect};
++}
++// OCV: 'bins b[N] = ...' - the N of bins_orBraE, taken by the bin it belongs to (cgBinArray)
++static AstNodeExpr* s_cgBinsSizep = nullptr;
++static void cgBinArray(AstCoverBin* binp, FileLine* isArrayp) {
++    if (isArrayp) binp->isArray(true);
++    if (s_cgBinsSizep) {
++        binp->arraySizep(s_cgBinsSizep);
++        s_cgBinsSizep = nullptr;
++    }
++}
+ %}
+ 
+ // Bison 3.0 and newer
+@@ -3962,8 +3989,10 @@ value_range<nodeExprp>:         // ==IEEE: value_range/open_value_range
+ 
+ covergroup_value_range<nodeExprp>:  // ==IEEE-2012: covergroup_value_range
+                 cgexpr                                  { $$ = $1; }
++        //                      // OCV: a range (also '$' bounds), as in a value bin: transition items use it
++        //                      // (CVA6: bins overflow = ([32'hFFFFFBFF:$] => [0:10000]))
+         |       '[' cgexpr ':' cgexpr ']'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: covergroup value range '[...]'"); DEL($2, $4); }
++                        { $$ = new AstInsideRange{$1, $2, $4}; }
+         //                      // IEEE-2023: added all four:
+         //                      // Skipped as '$' is part of our expr
+         //                      // IEEE-2023: '[' '$' ':' cgexpr ']'
+@@ -4647,6 +4676,12 @@ task_prototype<nodeFTaskp>:             // ==IEEE: task_prototype
+                         { $$ = $3; $$->addStmtsp($5); $$->prototype(true); }
+         |       yTASK dynamic_override_specifiersE taskId
+                         { $$ = $3; $$->prototype(true); }
++        //                      // OCV: 'automatic' in a prototype (core-v-verif: extern virtual task automatic ...):
++        //                      // not in IEEE's task_prototype, accepted by other tools; class methods are automatic
++        |       yTASK dynamic_override_specifiersE yAUTOMATIC taskId '(' tf_port_listE ')'
++                        { $$ = $4; $$->addStmtsp($6); $$->prototype(true); }
++        |       yTASK dynamic_override_specifiersE yAUTOMATIC taskId
++                        { $$ = $4; $$->prototype(true); }
+         ;
+ 
+ function_declaration<nodeFTaskp>:       // IEEE: function_declaration + function_body_declaration
+@@ -4667,6 +4702,11 @@ function_prototype<nodeFTaskp>: // IEEE: function_prototype
+                         { $$ = $3; $$->addStmtsp($5); $$->prototype(true); }
+         |       yFUNCTION dynamic_override_specifiersE funcId
+                         { $$ = $3; $$->prototype(true); }
++        //                      // OCV: 'automatic' in a prototype (as task_prototype)
++        |       yFUNCTION dynamic_override_specifiersE yAUTOMATIC funcId '(' tf_port_listE ')'
++                        { $$ = $4; $$->addStmtsp($6); $$->prototype(true); }
++        |       yFUNCTION dynamic_override_specifiersE yAUTOMATIC funcId
++                        { $$ = $4; $$->prototype(true); }
+         ;
+ 
+ class_constructor_prototype<nodeFTaskp>:        // ==IEEE: class_constructor_prototype
+@@ -7170,8 +7210,9 @@ bins_or_options<nodep>:  // ==IEEE: bins_or_options
+         //                      // Can't use wildcardE as results in conflicts
+         |       yBINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' iffE
+                         { AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, $6, false, false};
+-                          if ($3) binp->isArray(true);
+-                          $$ = binp; DEL($8); }
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $8, nullptr, false));  // (OCV: the bin's iff)
++                          $$ = binp; }
+         |       yBINS idAny/*bin_identifier*/ '[' cgexpr ']' iffE
+                         { // Check for automatic bins: bins auto[N]
+                           if (*$2 == "auto") {
+@@ -7185,39 +7226,62 @@ bins_or_options<nodep>:  // ==IEEE: bins_or_options
+                         }
+         |       yIGNORE_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' iffE
+                         { AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, $6, true, false};
+-                          if ($3) binp->isArray(true);
+-                          $$ = binp; DEL($8); }
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $8, nullptr, false));  // (OCV: the bin's iff)
++                          $$ = binp; }
+         |       yILLEGAL_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' iffE
+                         { AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, $6, false, true};
+-                          if ($3) binp->isArray(true);
+-                          $$ = binp; DEL($8); }
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $8, nullptr, false));  // (OCV: the bin's iff)
++                          $$ = binp; }
+         |       yBINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' yWITH__PAREN '(' cgexpr ')' iffE
+                         { AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, $6, false, false};
+-                          BBCOVERIGN($<fl>8, "Unsupported: 'with' in cover bin (bin created without filter)");
+-                          DEL($10, $12); $$ = binp; }
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $12, $10, false));  // (OCV: with, iff)
++                          $$ = binp; }
+         |       yIGNORE_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' yWITH__PAREN '(' cgexpr ')' iffE
+                         { AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, $6, true, false};
+-                          BBCOVERIGN($<fl>8, "Unsupported: 'with' in cover bin (bin created without filter)");
+-                          DEL($10, $12); $$ = binp; }
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $12, $10, false));  // (OCV: with, iff)
++                          $$ = binp; }
+         |       yILLEGAL_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' yWITH__PAREN '(' cgexpr ')' iffE
+                         { AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, $6, false, true};
+-                          BBCOVERIGN($<fl>8, "Unsupported: 'with' in cover bin (bin created without filter)");
+-                          DEL($10, $12); $$ = binp; }
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $12, $10, false));  // (OCV: with, iff)
++                          $$ = binp; }
+         |       yBINS idAny/*bin_identifier*/ bins_orBraE '=' id/*cover_point_id*/ yWITH__PAREN '(' cgexpr ')' iffE
+-                        { $$ = nullptr; BBCOVERIGN($<fl>6, "Unsupported: 'with' in cover bin"); DEL($8, $10); }
++                        { // OCV: the values of the coverpoint (its own name) that pass the with
++                          AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, nullptr, false, false};
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $10, $8, true));
++                          $$ = binp; }
+         |       yIGNORE_BINS idAny/*bin_identifier*/ bins_orBraE '=' id/*cover_point_id*/ yWITH__PAREN '(' cgexpr ')' iffE
+-                        { $$ = nullptr; BBCOVERIGN($<fl>6, "Unsupported: 'with' in cover bin"); DEL($8, $10); }
++                        { // OCV: the values of the coverpoint (its own name) that pass the with
++                          AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, nullptr, true, false};
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $10, $8, true));
++                          $$ = binp; }
+         |       yILLEGAL_BINS idAny/*bin_identifier*/ bins_orBraE '=' id/*cover_point_id*/ yWITH__PAREN '(' cgexpr ')' iffE
+-                        { $$ = nullptr; BBCOVERIGN($<fl>6, "Unsupported: 'with' in cover bin"); DEL($8, $10); }
++                        { // OCV: the values of the coverpoint (its own name) that pass the with
++                          AstCoverBin* const binp = new AstCoverBin{$<fl>2, *$2, nullptr, false, true};
++                          cgBinArray(binp, $3);
++                          binp->iffp(cgBinGuard($<fl>2, $10, $8, true));
++                          $$ = binp; }
+         |       yWILDCARD yBINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' iffE
+-                        { $$ = new AstCoverBin{$<fl>3, *$3, $7, false, false, true};
+-                          DEL($9); }
++                        { AstCoverBin* const binp = new AstCoverBin{$<fl>3, *$3, $7, false, false, true};
++                          cgBinArray(binp, $4);
++                          binp->iffp(cgBinGuard($<fl>3, $9, nullptr, false));  // (OCV: the bin's iff)
++                          $$ = binp; }
+         |       yWILDCARD yIGNORE_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' iffE
+-                        { $$ = new AstCoverBin{$<fl>3, *$3, $7, true, false, true};
+-                          DEL($9); }
++                        { AstCoverBin* const binp = new AstCoverBin{$<fl>3, *$3, $7, true, false, true};
++                          cgBinArray(binp, $4);
++                          binp->iffp(cgBinGuard($<fl>3, $9, nullptr, false));  // (OCV: the bin's iff)
++                          $$ = binp; }
+         |       yWILDCARD yILLEGAL_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' iffE
+-                        { $$ = new AstCoverBin{$<fl>3, *$3, $7, false, true, true};
+-                          DEL($9); }
++                        { AstCoverBin* const binp = new AstCoverBin{$<fl>3, *$3, $7, false, true, true};
++                          cgBinArray(binp, $4);
++                          binp->iffp(cgBinGuard($<fl>3, $9, nullptr, false));  // (OCV: the bin's iff)
++                          $$ = binp; }
+         |       yWILDCARD yBINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' yWITH__PAREN '(' cgexpr ')' iffE
+                         { $$ = nullptr; BBCOVERIGN($<fl>9, "Unsupported: 'with' in wildcard cover bin"); DEL($7, $11, $13); }
+         |       yWILDCARD yIGNORE_BINS idAny/*bin_identifier*/ bins_orBraE '=' '{' range_list '}' yWITH__PAREN '(' cgexpr ')' iffE
+@@ -7228,14 +7292,17 @@ bins_or_options<nodep>:  // ==IEEE: bins_or_options
+         //                      // cgexpr part of trans_list
+         |       yBINS idAny/*bin_identifier*/ bins_orBraE '=' trans_list iffE
+                         { FileLine* isArray = $<fl>3;
++                          if (s_cgBinsSizep) { BBCOVERIGN($<fl>3, "Unsupported: an array size of transition bins"); DEL(s_cgBinsSizep); s_cgBinsSizep = nullptr; }
+                           $$ = new AstCoverBin{$<fl>2, *$2, static_cast<AstCoverTransSet*>($5), VCoverBinsType{VCoverBinsType::BINS_TRANSITION}, isArray != nullptr};
+                           DEL($6); }
+         |       yIGNORE_BINS idAny/*bin_identifier*/ bins_orBraE '=' trans_list iffE
+                         { FileLine* isArray = $<fl>3;
++                          if (s_cgBinsSizep) { BBCOVERIGN($<fl>3, "Unsupported: an array size of transition bins"); DEL(s_cgBinsSizep); s_cgBinsSizep = nullptr; }
+                           $$ = new AstCoverBin{$<fl>2, *$2, static_cast<AstCoverTransSet*>($5), VCoverBinsType{VCoverBinsType::BINS_IGNORE}, isArray != nullptr};
+                           DEL($6); }
+         |       yILLEGAL_BINS idAny/*bin_identifier*/ bins_orBraE '=' trans_list iffE
+                         { FileLine* isArray = $<fl>3;
++                          if (s_cgBinsSizep) { BBCOVERIGN($<fl>3, "Unsupported: an array size of transition bins"); DEL(s_cgBinsSizep); s_cgBinsSizep = nullptr; }
+                           $$ = new AstCoverBin{$<fl>2, *$2, static_cast<AstCoverTransSet*>($5), VCoverBinsType{VCoverBinsType::BINS_ILLEGAL}, isArray != nullptr};
+                           DEL($6); }
+         |       yWILDCARD yBINS idAny/*bin_identifier*/ bins_orBraE '=' trans_list iffE
+@@ -7265,7 +7332,7 @@ bins_or_options<nodep>:  // ==IEEE: bins_or_options
+ bins_orBraE<fl>:  // IEEE: part of bins_or_options: returns fileline (abuse for boolean flag)
+                 /* empty */                             { $$ = nullptr; }
+         |       '[' ']'                                 { $$ = $<fl>1; /* Mark as array */ }
+-        |       '[' cgexpr ']'                          { BBCOVERIGN($<fl>1, "Unsupported: 'bins' explicit array size (treated as '[]')"); DEL($2); $$ = $<fl>1; }
++        |       '[' cgexpr ']'                          { s_cgBinsSizep = $2; $$ = $<fl>1; }  // (OCV: cgBinArray)
+         ;
+ 
+ trans_list<nodep>:  // ==IEEE: trans_list
+@@ -7394,41 +7461,45 @@ cross_body_item<nodep>:  // ==IEEE: cross_body_item
+         //                      // IEEE: bins_selection_or_option
+         |       coverage_option ';'                     { $$ = $1; }
+         //                      // IEEE: bins_selection - for now, we ignore explicit cross bins
++        //                      // OCV: explicit cross bins (V3Covergroup)
+         |       yBINS idAny/*new-bin_identifier*/ '=' select_expression iffE ';'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: explicit coverage cross bins"); DEL($4, $5); }
++                        { $$ = $4 ? new AstCoverCrossBin{$<fl>2, *$2, VCoverBinsType::BINS_USER, $4, $5} : nullptr; }
+         |       yIGNORE_BINS idAny/*new-bin_identifier*/ '=' select_expression iffE ';'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: explicit coverage cross bins"); DEL($4, $5); }
++                        { $$ = $4 ? new AstCoverCrossBin{$<fl>2, *$2, VCoverBinsType::BINS_IGNORE, $4, $5} : nullptr; }
+         |       yILLEGAL_BINS idAny/*new-bin_identifier*/ '=' select_expression iffE ';'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: explicit coverage cross bins"); DEL($4, $5); }
++                        { $$ = $4 ? new AstCoverCrossBin{$<fl>2, *$2, VCoverBinsType::BINS_ILLEGAL, $4, $5} : nullptr; }
+         |       error ';'                               { $$ = nullptr; }  // LCOV_EXCL_LINE
+         ;
+ 
+-select_expression<nodep>:  // ==IEEE: select_expression
++select_expression<nodeExprp>:  // ==IEEE: select_expression
+                 select_expression_r
+                         { $$ = $1; }
+         |       select_expression yP_ANDAND select_expression
+-                        { $$ = nullptr; BBCOVERIGN($2, "Unsupported: '&&' in coverage select expression"); DEL($1, $3); }
++                        { $$ = ($1 && $3) ? new AstLogAnd{$2, $1, $3} : nullptr; if (!$$) DEL($1, $3); }
+         |       select_expression yP_OROR   select_expression
+-                        { $$ = nullptr; BBCOVERIGN($2, "Unsupported: '||' in coverage select expression"); DEL($1, $3); }
++                        { $$ = ($1 && $3) ? new AstLogOr{$2, $1, $3} : nullptr; if (!$$) DEL($1, $3); }
+         ;
+ 
+ // This non-terminal exists to disambiguate select_expression and make "with" bind tighter
+-select_expression_r<nodep>:
++select_expression_r<nodeExprp>:
+         //                      // IEEE: select_condition expanded here
++        //                      // OCV: kept (AstCoverSelBinsof / AstCoverSelWith) for V3Covergroup
+                 yBINSOF '(' bins_expression ')'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: 'binsof' in coverage select expression"); DEL($3); }
++                        { $$ = cgSelBinsof($1, $3, nullptr, false, false); }
+         |       '!' yBINSOF '(' bins_expression ')'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: 'binsof' in coverage select expression"); DEL($4); }
++                        { $$ = cgSelBinsof($2, $4, nullptr, true, false); }
+         |       yBINSOF '(' bins_expression ')' yINTERSECT '{' covergroup_range_list '}'
+-                        { $$ = nullptr; BBCOVERIGN($5, "Unsupported: 'intersect' in coverage select expression"); DEL($7); }
+-        |       '!' yBINSOF '(' bins_expression ')' yINTERSECT '{' covergroup_range_list '}'    { }
+-                        { $$ = nullptr; BBCOVERIGN($5, "Unsupported: 'intersect' in coverage select expression"); DEL($4, $8); }
++                        { $$ = cgSelBinsof($1, $3, $7, false, true); }
++        |       '!' yBINSOF '(' bins_expression ')' yINTERSECT '{' covergroup_range_list '}'
++                        { $$ = cgSelBinsof($2, $4, $8, true, true); }
+         |       yWITH__PAREN '(' cgexpr ')'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: 'with' in coverage select expression"); DEL($3); }
++                        { $$ = new AstCoverSelWith{$1, $3, false}; }
+         |       '!' yWITH__PAREN '(' cgexpr ')'
+-                        { $$ = nullptr; BBCOVERIGN($1, "Unsupported: 'with' in coverage select expression"); DEL($4); }
++                        { $$ = new AstCoverSelWith{$2, $4, true}; }
++        |       idAny/*cross_identifier*/ yWITH__PAREN '(' cgexpr ')'
++                        { $$ = new AstCoverSelWith{$2, $4, false}; }
+         |       select_expression_r yWITH__PAREN '(' cgexpr ')'
+-                        { $$ = nullptr; BBCOVERIGN($2, "Unsupported: 'with' in coverage select expression"); DEL($1, $4); }
++                        { $$ = nullptr; BBCOVERIGN($2, "Unsupported: 'with' after a selection in coverage select expression"); DEL($1, $4); }
+         //                      // IEEE-2012: Need clarification as to precedence
+         //UNSUP yWITH__PAREN '(' cgexpr ')' yMATCHES cgexpr    { }
+         //                      // IEEE-2012: Need clarification as to precedence
+@@ -7459,7 +7530,7 @@ bins_expression<nodep>:  // ==IEEE: bins_expression
+         // Verilator supports hierarchical reference in a place of variable identifier.
+         // This is an extension based on other simulators.
+                idDotted
+-                        { $$ = nullptr; /*UNSUP*/ DEL($1); }
++                        { $$ = $1; }  // (OCV: cgSelBinsof takes the name)
+         ;
+ 
+ coverage_eventE<nodep>:  // IEEE: [ coverage_event ]
