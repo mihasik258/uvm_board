@@ -1,0 +1,28 @@
+--- uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-20 15:23:48.277855450 +0300
++++ uvm_pkg_all_v2020_3_2_nodpi.svh	2026-10-20 15:23:48.307432317 +0300
+@@ -3928,6 +3928,9 @@
+   `uvm_do(UVM_SEQ, SEQR_CONS_IF.consumer_seqr, -1, CONSTRAINTS) \
+ 
+ package uvm_pkg;
++  // OCV: the report server's error and fatal counts at the end of the run, for the program's exit code
++  // (uvm/vlt/ocv_main.cpp: nonzero when the test reported an error)
++  import "DPI-C" function void ocv_uvm_result(int errors, int fatals);
+ `define UVM_DPI_SVH
+ `define UVM_HDL_NO_DPI
+ `define UVM_REGEX_NO_DPI
+@@ -5066,6 +5069,7 @@
+     rs = uvm_report_server::get_server();
+     top.m_do_cmdline_checks();
+     rs.report_summarize();
++    ocv_uvm_result(rs.get_severity_count(UVM_ERROR), rs.get_severity_count(UVM_FATAL));
+     cs.set_core_state(UVM_CORE_FINISHED);
+     if (top.get_finish_on_completion()) begin
+         $finish;
+@@ -5084,6 +5088,7 @@
+   cs.set_core_state(UVM_CORE_PRE_ABORT);
+   top.m_do_pre_abort();
+   rs.report_summarize();
++  ocv_uvm_result(rs.get_severity_count(UVM_ERROR), rs.get_severity_count(UVM_FATAL));
+   cs.set_core_state(UVM_CORE_ABORTED);
+   $finish;
+ endfunction

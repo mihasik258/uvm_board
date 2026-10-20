@@ -102,6 +102,9 @@ typedef struct {
     int         errata_mie;
     uint32_t    mie_prev;
     uint64_t    mie_wr;
+    /* cva6: minstret(h) = order + instret_off - the instructions committed without an exception (a trap does
+     * not count, csr_regfile.sv); a write replaces its half of the count that includes the writing instruction */
+    int64_t     instret_off;
 } fast_t;
 
 #define ERRATA_MIE_WINDOW 4   /* instructions after a write of mie that #3175 may still use the old value */
@@ -324,7 +327,7 @@ enum { CVA6_LD_MISALIGNED = 4, CVA6_ST_MISALIGNED = 6 };
 
 static int cva6_timing(uint32_t c)
 {
-    return c == 0x344 || c == 0xB00 || c == 0xB02 || c == 0xB80 || c == 0xB82 || c == 0x320 ||
+    return c == 0x344 || c == 0xB00 || c == 0xB80 || c == 0x320 ||
            (c >= 0xB03 && c <= 0xB1F) || (c >= 0xB83 && c <= 0xB9F) || (c >= 0x323 && c <= 0x33F) ||
            (c >= 0x3A0 && c <= 0x3AF) || (c >= 0x3B0 && c <= 0x3EF) || c == 0x7C0 || c == 0x7C1;
 }
@@ -346,6 +349,8 @@ static int cva6_csr_read(fast_t *m, uint32_t c, int write, uint32_t *value, int 
     case 0xF11: *value = 0x602; return 1;                         /* mvendorid */
     case 0xF12: *value = 3; return 1;                             /* marchid */
     case 0xF13: case 0xF14: case 0xF15: *value = 0; return 1;     /* mimpid, mhartid, mconfigptr */
+    case 0xB02: *value = (uint32_t)(m->order + (uint64_t)m->instret_off); return 1;          /* minstret */
+    case 0xB82: *value = (uint32_t)((m->order + (uint64_t)m->instret_off) >> 32); return 1;  /* minstreth */
     default: break;
     }
     if (cva6_timing(c)) { *value = 0; *timing = (c >= 0xB80 && c <= 0xB9F) ? 2 : 1; return 1; }
@@ -361,6 +366,12 @@ static void cva6_csr_write(fast_t *m, uint32_t c, uint32_t v)
     case 0x340: m->mscratch = v; break;
     case 0x341: m->mepc = v & ~1u; break;
     case 0x342: m->mcause = (v >> 31) << 5 | (v & 0x1f); break;
+    case 0xB02: case 0xB82: {                                     /* minstret(h): from the next instruction on */
+        uint64_t n = m->order + (uint64_t)m->instret_off + 1;    /* (counted, then the half replaced) */
+        n = c == 0xB02 ? (n & ~0xFFFFFFFFull) | v : (n & 0xFFFFFFFFull) | (uint64_t)v << 32;
+        m->instret_off = (int64_t)(n - (m->order + 1));
+        break;
+    }
     default: break;                                               /* WARL, read-only bits, the core's values */
     }
 }
@@ -521,6 +532,7 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
     r->csr_we = cwe; r->csr_wcmd = ccmd; r->csr_waddr = caddr; r->csr_wdata = cdata;
     if (wen) x[d->rd] = wv;
     x[0] = 0;
+    if (trap) m->instret_off--;                                   /* (minstret: a trap is not counted) */
     m->order++;
     m->pc = next;
 }

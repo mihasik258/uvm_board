@@ -3,7 +3,7 @@
 # core's RTL; the test (cv32e40p.bind through hw/cpu/run.sh, directed generation, N programs) must fail
 # on every one, and pass on the unchanged core.
 #
-#   examples/cv32e40p/gen/faults.sh [programs]      (default 4)
+#   examples/cv32e40p/gen/faults.sh [programs]      (default 4; RUN_EXTRA="..." adds runner options)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OCV=$(cd "$HERE/../../.." && pwd)
@@ -25,7 +25,7 @@ FAULTS=(
 
 run() {   # $1 = core copy, $2 = build dir
     (CV32E40P=$1 OUT=$2 "$OCV/hw/cpu/run.sh" "$HERE/../cv32e40p.bind" cosim gen:directed -- --batches "$N" \
-        --reset-each-batch 2>&1 || true) \
+        --reset-each-batch ${RUN_EXTRA:-} 2>&1 || true) \
         | grep -E "PASS|FAIL|MISMATCH" | head -2 || true
 }
 

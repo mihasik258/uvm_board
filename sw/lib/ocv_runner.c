@@ -8,7 +8,9 @@
  *   3. model: feed the stimulus to the reference model, which may look at the DUT's actual
  *      records (observed()) for values the specification leaves open;
  *   4. check: no lost records, same number of records, then record by record, field by field
- *      under the descriptor's rules; the first difference is reported with context.
+ *      under the descriptor's rules; the first difference is reported with context. When the model runs
+ *      while the DUT runs (interleaved), records are compared as both sides make them, the first
+ *      difference is reported at once, and what matched is dropped (stream_compare).
  * Reactive DUTs (the model has react(), or a source is a "stream"): during step 2 every new record
  * of an output channel is read as soon as it appears and handed to react(), whose send() answers go
  * straight into stream sources (a ring the DUT reads; with freeze_when_starved the DUT is held
@@ -64,6 +66,11 @@ typedef struct {
     uint64_t  stream;   /* records of this channel in earlier batches */
     uint64_t  compared;
     uint64_t  drains;   /* times a full lossless buffer was emptied while the DUT waited */
+    /* interleaved: got and exp are compared as they grow (stream_compare) and what matched is dropped
+     * from both - a long run with --squash 1 holds only what is not compared yet. base: records of this
+     * batch dropped (got and exp index from it); cmp: the next one to compare */
+    uint64_t  base;
+    uint32_t  cmp;
     /* --overlap: got as the model thread sees it, published without a lock. The buffer is never
      * moved while the thread runs: when it grows, a new one is published and the old one is kept
      * until the end of the batch. Readers load pub_n (acquire), then pub_w. */
@@ -118,6 +125,9 @@ typedef struct {
     uint32_t       *il_prev;    /* per channel: count at the last pass (what "moved" compares) */
     uint64_t       *taken_hi;   /* per channel: TAKEN's wraps (a 64-bit count of a squashed channel) */
     uint32_t       *taken_lo;
+    int             context;    /* --context: matched records printed before a mismatch */
+    int             in_react;   /* react() holds pointers into got: stream_compare does not drop meanwhile */
+    uint64_t        cur_batch;
 } run_t;
 
 static int    exec_argc;          /* the main's command line, to run again for a squash replay */
@@ -303,6 +313,8 @@ static void squash_close(ocv_model_io_t *io, int ch)
  * stimulus taken (or after --max-polls passes: then the wait loop after the model reports it) */
 static uint32_t react_new(run_t *r, int ch);
 static void collect(run_t *r, int ch, int restart);
+static void stream_compare(run_t *r);
+static int report_mismatch(run_t *r, int ch, uint32_t i, int field, int context, uint64_t batch);
 static void il_poll(run_t *r)
 {
     const ocv_dut_t *dut = r->env.dut;
@@ -332,6 +344,43 @@ static void il_poll(run_t *r)
     }
     r->il_settled = quiet ? r->il_settled + 1 : 0;
     if (r->il_settled >= r->settle || ++r->il_polls >= r->max_polls) r->il_quiet = 1;
+    stream_compare(r);
+}
+
+/* interleaved: compare the records both the DUT and the model have made so far; a mismatch is reported at
+ * once (a long test does not run on to its end first) and what matched is dropped from got and exp, so
+ * memory holds only what is not compared yet. Channels whose buffer count the end of the batch checks
+ * (neither lossless nor a DMA ring) are left to that check. */
+#ifndef OCV_STREAM_DROP                 /* (smaller in a test: -DOCV_STREAM_DROP=64 -DOCV_STREAM_KEEP=8) */
+#define OCV_STREAM_DROP (1u << 16)      /* compared entries that trigger a drop */
+#define OCV_STREAM_KEEP 64u             /* kept below the next one to compare: the context of a mismatch */
+#endif
+static void stream_compare(run_t *r)
+{
+    const ocv_dut_t *dut = r->env.dut;
+    for (int ch = 0; ch < dut->n_channels; ch++) {
+        const ocv_channel_t *c = &dut->channels[ch];
+        if (c->kind == OCV_CH_SOURCE || !(c->lossless || ocv_ring_on(&r->env, ch))) continue;
+        queue_t *q = &r->q[ch];
+        const uint32_t n = q->got.n < q->exp.n ? q->got.n : q->exp.n;
+        for (uint32_t i = q->cmp; i < n; i++) {
+            const int f = rec_diff(r, ch, q->got.w + (size_t)i * q->qw, q->exp.w + (size_t)i * q->qw);
+            if (f >= 0) {
+                const int rc = report_mismatch(r, ch, i, f, r->context, r->cur_batch);
+                fflush(stdout);
+                ocv_env_close(&r->env);
+                exit(rc);
+            }
+            q->compared += c->squash ? q->got.w[(size_t)i * q->qw + c->rec_words] : 1;
+        }
+        q->cmp = n;
+        if (n >= OCV_STREAM_DROP && !r->in_react) {
+            const uint32_t d = n - OCV_STREAM_KEEP;
+            memmove(q->got.w, q->got.w + (size_t)d * q->qw, (size_t)(q->got.n - d) * q->qw * 4u);
+            memmove(q->exp.w, q->exp.w + (size_t)d * q->qw, (size_t)(q->exp.n - d) * q->qw * 4u);
+            q->got.n -= d; q->exp.n -= d; q->cmp -= d; q->base += d;
+        }
+    }
 }
 static void idle(ocv_model_io_t *io)
 {
@@ -345,7 +394,7 @@ static uint64_t progress(ocv_model_io_t *io, int ch)
     run_t *r = io->priv;
     const ocv_channel_t *c = &r->env.dut->channels[ch];
     if (!r->il_active || r->il_quiet) return UINT64_MAX;
-    if (!c->squash) return r->q[ch].got.n;
+    if (!c->squash) return r->q[ch].base + r->q[ch].got.n;
     const uint32_t t = ocv_ep_rd(&r->env, ch, OCV_EP_REG_TAKEN);
     if (t < r->taken_lo[ch]) r->taken_hi[ch] += 1ull << 32;
     r->taken_lo[ch] = t;
@@ -367,9 +416,10 @@ static int observed_at(run_t *r, int ch, uint32_t index, uint32_t *rec, int wait
         memcpy(rec, g, c->rec_words * 4u);
         return 1;
     }
-    if (wait) while (index >= r->q[ch].got.n && r->il_active && !r->il_quiet) il_poll(r);   /* (interleaved) */
-    if (index >= r->q[ch].got.n) return 0;
-    memcpy(rec, r->q[ch].got.w + (size_t)index * r->q[ch].qw, c->rec_words * 4u);
+    queue_t *q = &r->q[ch];
+    if (wait) while (index >= q->base + q->got.n && r->il_active && !r->il_quiet) il_poll(r);   /* (interleaved) */
+    if (index >= q->base + q->got.n || index < q->base) return 0;   /* (below base: compared, dropped) */
+    memcpy(rec, q->got.w + (size_t)(index - q->base) * q->qw, c->rec_words * 4u);
     return 1;
 }
 
@@ -594,8 +644,10 @@ static uint32_t react_new(run_t *r, int ch)
         k = q->got.n - first;
         if (k && ocv_model.react) {
             phase(PH_REACT);
+            r->in_react++;
             for (uint32_t i = 0; i < k; i++)
                 ocv_model.react(ch, q->got.w + (size_t)(first + i) * q->qw, r->io);
+            r->in_react--;
             flush_streams(r);
         }
         phase(prev);
@@ -612,8 +664,10 @@ static uint32_t react_new(run_t *r, int ch)
         r->seen[ch] = n;
         if (ocv_model.react) {
             phase(PH_REACT);
+            r->in_react++;
             for (uint32_t i = 0; i < k; i++)
                 ocv_model.react(ch, q->got.w + (size_t)(first + i) * q->qw, r->io);
+            r->in_react--;
             flush_streams(r);
         }
         phase(prev);
@@ -702,7 +756,7 @@ static int report_mismatch(run_t *r, int ch, uint32_t i, int field, int context,
         return 2;
     }
     printf("MISMATCH channel '%s' record %llu (batch %llu, slot %u): field '%s'\n", c->name,
-           (unsigned long long)(c->squash ? q->compared : q->stream + i), (unsigned long long)batch, i,
+           (unsigned long long)(c->squash ? q->compared : q->stream + q->base + i), (unsigned long long)batch, i,
            c->fields[field].name);
     ocv_rec_format(c, dut, a, sizeof a);
     ocv_rec_format(c, exp, b, sizeof b);
@@ -711,7 +765,7 @@ static int report_mismatch(run_t *r, int ch, uint32_t i, int field, int context,
         printf("  preceding records (dut, all matched):\n");
         for (uint32_t k = (i > (uint32_t)context) ? i - context : 0; k < i; k++) {
             ocv_rec_format(c, q->got.w + (size_t)k * q->qw, a, sizeof a);
-            printf("    [%llu] %s\n", (unsigned long long)(q->stream + k), a);
+            printf("    [%llu] %s\n", (unsigned long long)(q->stream + q->base + k), a);
         }
     }
     return 2;
@@ -811,6 +865,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
         r.by_mask[ch] = !slow_compare && maskable;
     }
     r.window = window;
+    r.context = context;
 #if defined(OCV_SQ_DUMP)
     sq_dump_window = window;
 #endif
@@ -910,6 +965,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
     for (uint64_t b = 0; b < batches; b++) {
         int in_reset = (b == 0 || reset_each);
         io.batch = b;
+        r.cur_batch = b;
 
         /* 1. stimulus */
         phase(PH_STIM);
@@ -978,9 +1034,11 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
         for (int ch = 0; ch < dut->n_channels; ch++) {
             queue_t *q = &r.q[ch];
             if (in_reset) q->stream = 0;
-            else          q->stream += q->exp.n;
+            else          q->stream += q->base + q->exp.n;
             q->exp.n = 0;
             q->got.n = 0;
+            q->base = 0;
+            q->cmp = 0;
         }
         r.in_reset = in_reset;
         r.n_order = n_order;
@@ -1057,7 +1115,8 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                     if (dut->channels[ch].kind == OCV_CH_SOURCE)
                         printf("  source '%s': %u taken\n", dut->channels[ch].name, ocv_ep_rd(&r.env, ch, OCV_EP_REG_COUNT));
                     else
-                        printf("  output '%s': %u records so far\n", dut->channels[ch].name, r.q[ch].got.n);
+                        printf("  output '%s': %llu records so far\n", dut->channels[ch].name,
+                               (unsigned long long)(r.q[ch].base + r.q[ch].got.n));
                 RUN_END(2);
             }
             /* a DUT that never ends: what it did so far is compared (the first wrong record says
@@ -1157,7 +1216,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
             if (r.overlap) {                     /* already compared by the model thread */
                 if (r.mm_ch == ch) RUN_END(report_mismatch(&r, ch, r.mm_i, r.mm_field, context, b));
             } else {
-                for (uint32_t i = 0; i < n; i++) {
+                for (uint32_t i = q->cmp; i < n; i++) {
                     int f = rec_diff(&r, ch, q->got.w + (size_t)i * q->qw, q->exp.w + (size_t)i * q->qw);
                     if (f >= 0) RUN_END(report_mismatch(&r, ch, i, f, context, b));
                     q->compared += c->squash ? q->got.w[(size_t)i * q->qw + c->rec_words] : 1;
@@ -1173,9 +1232,9 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                 RUN_END(2);
             }
             if (q->got.n != q->exp.n) {
-                printf("FAIL channel '%s': DUT produced %u %srecords, model expects %u (batch %llu, first %u match)\n",
-                       c->name, q->got.n, (c->squash && window > 1) ? "fused " : "", q->exp.n,
-                       (unsigned long long)b, n);
+                printf("FAIL channel '%s': DUT produced %llu %srecords, model expects %llu (batch %llu, first %llu match)\n",
+                       c->name, (unsigned long long)(q->base + q->got.n), (c->squash && window > 1) ? "fused " : "",
+                       (unsigned long long)(q->base + q->exp.n), (unsigned long long)b, (unsigned long long)(q->base + n));
                 if (c->squash) {
                     if (r.obs_squash)
                         printf("  note: the model asked for DUT records it cannot see in squash mode (observed())\n");
@@ -1189,8 +1248,8 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                    " every record it made until then matches\n", (unsigned long long)max_cycles, (unsigned long long)b);
             for (int ch = 0; ch < dut->n_channels; ch++)
                 if (dut->channels[ch].kind != OCV_CH_SOURCE)
-                    printf("  output '%s': DUT %u records, model %u\n", dut->channels[ch].name, r.q[ch].got.n,
-                           r.q[ch].exp.n);
+                    printf("  output '%s': DUT %llu records, model %llu\n", dut->channels[ch].name,
+                           (unsigned long long)(r.q[ch].base + r.q[ch].got.n), (unsigned long long)(r.q[ch].base + r.q[ch].exp.n));
             RUN_END(2);
         }
         phase(PH_OTHER);

@@ -160,7 +160,7 @@ if [ "${BRIDGE:-0}" = 1 ]; then
     ok "${PIPESTATUS[0]}"
 fi
 
-step "10a. CVA6 (hw/cpu wrapper, PC reference): generated programs, and the directed test of erratum #3175"
+step "10a. CVA6 (hw/cpu wrapper, PC reference): generated programs, the directed tests of erratum #3175 and of minstret"
 if [ -d "$OCV/ext/cva6" ]; then
     for sd in 1 2 4; do                                  # 2: an interrupt within the #3175 window; 4: mstatus.MPP
         OUT=$B/cpu_cva6 "$OCV/hw/cpu/run.sh" "$OCV/examples/cva6/cva6.bind" pc gen:directed -- --batches 2 \
@@ -169,6 +169,9 @@ if [ -d "$OCV/ext/cva6" ]; then
     done
     "$OCV/examples/cva6/repro/run.sh" mie_disable > "$B/repro_mie.log" 2>&1
     grep -E "tb_pc: cva6 PASS" "$B/repro_mie.log" && grep -q "ERRATUM: 7 " "$OCV/build/repro/cva6/mie_disable.log"; ok $?
+    # minstret(h) checked by the model: around traps, both halves written, the carry into minstreth
+    "$OCV/examples/cva6/repro/run.sh" minstret 0 > "$B/repro_minstret.log" 2>&1
+    grep -E "tb_pc: cva6 PASS" "$B/repro_minstret.log"; ok $?
 else
     echo "  (no ext/cva6: tools/get_cores.sh)"
 fi

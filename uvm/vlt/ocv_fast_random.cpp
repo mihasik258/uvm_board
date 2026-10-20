@@ -932,3 +932,9 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
     }
     return fallback("no solution found (OCV_FAST_RANDOM_TRIES rounds)");
 }
+
+// ---- the test's result, for the exit code (tools/verilator/uvm_z_exit_status.patch, uvm/vlt/ocv_main.cpp) ----
+// UVM's run_test (and die) report the server's UVM_ERROR and UVM_FATAL counts here after the summary.
+// (It lives in this file because every OCV build of the patched UVM compiles this file.)
+int ocv_uvm_errors = -1;                       // -1: run_test did not end (no summary)
+extern "C" void ocv_uvm_result(int errors, int fatals) { ocv_uvm_errors = errors + fatals; }

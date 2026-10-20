@@ -3,7 +3,7 @@
 # and UVM): can it be built at all? That decides both the PC baseline and the board form.
 #
 #   examples/cv32e40p/vlt.sh lint       parse + elaborate only (--lint-only)
-#   examples/cv32e40p/vlt.sh build      the simulation (Verilator --binary): build/obj/Vtb
+#   examples/cv32e40p/vlt.sh build      the simulation (Verilator, main uvm/vlt/ocv_main.cpp): build/obj/Vtb
 #   examples/cv32e40p/vlt.sh run +firmware=<hex> [plusargs]   the firmware test (prog.sh makes hex)
 #   examples/cv32e40p/vlt.sh host|aarch64|vd100   the board form, lockstep (uvm/lockstep.py): host = the
 #                                           FPGA simulated in the program, aarch64 = for the board, vd100 = its
@@ -43,6 +43,7 @@ cc -O2 -fno-pie -c "$OCV/uvm/vlt/ocv_prof.c" -o "$OUT/ocv_prof.o"
 python3 "$HERE/no_iss/gen_no_iss.py" "$CORE_V_VERIF" "$OUT/no_iss"
 ARGS=(--timing --timescale 1ns/1ps -Wno-fatal -Wno-lint -Wno-style -Wno-BADSTDPRAGMA -Wno-SUPERNFIRST --error-limit 100000 +define+UVM
       +define+ISS +define+CV32E40P_TRACE_EXECUTION +incdir+"$OCV/uvm/vlt" "$OCV/uvm/vlt/ocv_fast_random.cpp" "$UVM"
+      "$OCV/uvm/vlt/ocv_main.cpp" -CFLAGS -DOCV_VTOP=Vuvmt_cv32e40p_tb   # main: the exit code says if UVM reported an error
       -f "$DESIGN_RTL_DIR/../cv32e40p_manifest.flist" -f "$DV_UVMT_PATH/uvmt_cv32e40p.flist" -f "$OUT/no_iss/no_iss.flist"
       --vpi -LDFLAGS "$OUT/svlib_dpi.o $OUT/ocv_prof.o -no-pie"   # svlib's DPI side (core-v-verif:
       # SVLIB_SRC); OCV's sampling profiler, idle unless OCV_PROF=<file> (tools/prof_report.py)
@@ -52,10 +53,10 @@ case ${1:-lint} in
           echo "lint rc=$rc, $(grep -c '^%Error' "$OUT/lint.log") errors, $(grep -c '^%Warning' "$OUT/lint.log") warnings ($OUT/lint.log)"
           grep -m15 '^%Error' "$OUT/lint.log" || true; exit $rc ;;
     build) rm -rf "$OUT/obj.new"
-          "$V" --binary -j "${OCV_MAKE_J:-6}" "${ARGS[@]}" --Mdir "$OUT/obj" -o Vtb > "$OUT/build.log" 2>&1 \
+          "$V" --cc --exe --build --timing -j "${OCV_MAKE_J:-6}" "${ARGS[@]}" --Mdir "$OUT/obj" -o Vtb > "$OUT/build.log" 2>&1 \
               || { grep -m20 '%Error\|error:' "$OUT/build.log"; exit 1; }
           echo "build: $OUT/obj/Vtb" ;;
-    debug) "$V" --binary -j "${OCV_MAKE_J:-6}" --decorations node -CFLAGS "-g -O0" "${ARGS[@]}" --Mdir "$OUT/obj_dbg" \
+    debug) "$V" --cc --exe --build --timing -j "${OCV_MAKE_J:-6}" --decorations node -CFLAGS "-g -O0" "${ARGS[@]}" --Mdir "$OUT/obj_dbg" \
               -o Vtb > "$OUT/build_dbg.log" 2>&1 || { grep -m20 '%Error\|error:' "$OUT/build_dbg.log"; exit 1; }
           echo "debug build: $OUT/obj_dbg/Vtb (C++ annotated with the SystemVerilog source lines)" ;;
     host|aarch64|vd100)

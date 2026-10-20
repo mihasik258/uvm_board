@@ -167,8 +167,10 @@ if [ "$TARGET" = pc ] || [ "$TARGET" = wave ]; then VDUT=(${RTL_DEFINES:-} "${RT
 else VDUT=(+define+OCV_BOARD --converge-limit 2000000000); fi
 OCVSV=("$OCV/uvm/ocv_uvm_pkg.sv" "$UVMGEN/${NAME}_ocv_uvm_pkg.sv" "$UVMGEN/${NAME}_ocv_uvm_harness.sv")
 [ "$DESC" = - ] && OCVSV=()
-"$VERILATOR" --cc --exe --main --timing --timescale 1ns/1ps -Wno-fatal -Wno-lint -Wno-style \
+# (main: uvm/vlt/ocv_main.cpp - the exit code says whether UVM reported an error)
+"$VERILATOR" --cc --exe --timing --timescale 1ns/1ps -Wno-fatal -Wno-lint -Wno-style \
     "${VTRACE[@]}" "${VDUT[@]}" +incdir+"$OCV/uvm/vlt" "$OCV/uvm/vlt/ocv_fast_random.cpp" \
+    "$OCV/uvm/vlt/ocv_main.cpp" -CFLAGS "-DOCV_VTOP=V$TOP" \
     "$UVM" "${OCVSV[@]}" \
     "${TB[@]}" ${TB_VFLAGS:-} --top-module "$TOP" --Mdir "$OUT/tb.new" -o "$TOP" > "$OUT/tb.log" 2>&1 \
     || { grep -E "^%Error" -A3 "$OUT/tb.log" | head -30; exit 1; }

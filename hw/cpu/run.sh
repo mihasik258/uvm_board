@@ -25,6 +25,7 @@ mkdir -p "$OUT"
 python3 "$OCV/gen/cpu_wrap.py" "$BIND" -o "$OUT/wrap" > "$OUT/wrap.log" || { cat "$OUT/wrap.log"; exit 1; }
 # shellcheck disable=SC1091
 source "$OUT/wrap/wrap.env"
+MODEL_CFLAGS="$MODEL_CFLAGS ${OCV_CFLAGS_EXTRA:-}"   # (OCV_CFLAGS_EXTRA: e.g. a test setting of the runner)
 export RTL_DEFINES MODEL_SRCS MODEL_CFLAGS
 case $MODE in
     cosim)

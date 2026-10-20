@@ -9,6 +9,8 @@
 # Each program checks its own result (verify_benchmark) and returns it from main: the BSP's exit writes it
 # to the status device (0 = correct). The board support is Embench's generic one (nothing timed, nothing
 # printed: tools/embench_board): core-v-verif's corev32 board exits before the check.
+# EMBENCH_BOARD=embench_board_instret: the triggers read minstret/minstreth (as Embench's RISC-V boards read
+# the cycle counter); the programs are named <name>_s<scale>_instret.
 set -euo pipefail
 OCV=$(cd "$(dirname "$0")/.." && pwd)
 EB=$OCV/ext/embench-iot; BSP=$OCV/ext/core-v-verif/cv32e40p/bsp
@@ -22,8 +24,8 @@ for f in crt0.S handlers.S syscalls.c vectors.S; do "${P}gcc" "${CF[@]}" -c "$BS
 "${P}ar" rcs "$OUT/bsp/libcv-verif.a" "$OUT"/bsp/*.o
 LIST=("$@"); [ ${#LIST[@]} -gt 0 ] || mapfile -t LIST < <(ls "$EB/src")
 for b in "${LIST[@]}"; do
-    n=${b}_s$SCALE
-    if "${P}gcc" "${CF[@]}" -DGLOBAL_SCALE_FACTOR="$SCALE" -DWARMUP_HEAT=0 -I "$EB/support" -I "$OCV/tools/embench_board" -I "$BSP" \
+    n=${b}_s$SCALE${EMBENCH_BOARD:+_${EMBENCH_BOARD#embench_board_}}
+    if "${P}gcc" "${CF[@]}" -DGLOBAL_SCALE_FACTOR="$SCALE" -DWARMUP_HEAT=0 -I "$EB/support" -I "$OCV/tools/${EMBENCH_BOARD:-embench_board}" -I "$BSP" \
         "$EB"/src/"$b"/*.c "$EB/support/main.c" "$EB/support/beebsc.c" "$EB/support/board.c" "$EB/support/chip.c" \
         -nostartfiles -T "$BSP/link.ld" -L "$OUT/bsp" -lcv-verif -lm -Wl,--gc-sections -o "$OUT/$n.elf" 2> "$OUT/$n.log"; then
         "${P}objcopy" -O verilog "$OUT/$n.elf" "$OUT/$n.hex"
