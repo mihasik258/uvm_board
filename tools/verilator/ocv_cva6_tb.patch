@@ -47,7 +47,7 @@ index f47289f74..89b320d8a 100644
      void clear() VL_MT_SAFE;
      /// Clear items not matching the provided string
 diff --git a/include/verilated_covergroup.cpp b/include/verilated_covergroup.cpp
-index f7cb3b6ae..62d9c3dfb 100644
+index f7cb3b6ae..05814060c 100644
 --- a/include/verilated_covergroup.cpp
 +++ b/include/verilated_covergroup.cpp
 @@ -23,6 +23,8 @@
@@ -75,7 +75,7 @@ index f7cb3b6ae..62d9c3dfb 100644
          const VlCovNamer& nm = namerFor(i);
          const VlCovBinKind kind = binKind(i);
          const std::string binp = binName(i);
-@@ -134,6 +138,54 @@ void VlCoverCross::init(const char* hier, uint32_t dims, VlCoverpoint* const* cp
+@@ -134,6 +138,60 @@ void VlCoverCross::init(const char* hier, uint32_t dims, VlCoverpoint* const* cp
      m_flatCounts.assign(m_numAutoBins, 0);
  }
  
@@ -117,9 +117,15 @@ index f7cb3b6ae..62d9c3dfb 100644
 +    const uint32_t k = m_kind[idx];
 +    const bool first = m_flatCounts[idx]++ == 0;
 +    if (k == KIND_AUTO) {
-+        if (first) ++m_autoCovered;
++        if (first) {
++            ++m_autoCovered;
++            ++vl_cov_first_hits;
++        }
 +    } else if (k >= KIND_USER) {
-+        if (m_userCounts[k - KIND_USER]++ == 0) ++m_userCovered;
++        if (m_userCounts[k - KIND_USER]++ == 0) {
++            ++m_userCovered;
++            ++vl_cov_first_hits;
++        }
 +    } else if (k == KIND_ILLEGAL) {
 +        VL_PRINTF_MT("%%Error: %s:%d: Illegal cross bin hit in cross %s: %s\n", m_file, m_line,
 +                     m_hier.c_str(), binName(idx).c_str());
@@ -130,7 +136,7 @@ index f7cb3b6ae..62d9c3dfb 100644
  void VlCoverCross::iterateProduct(VlCoverpoint* const* cps, uint32_t dim, uint32_t baseIdx) {
      const uint32_t hits = cps[dim]->hitCount();
      const uint32_t* const list = cps[dim]->hitList();
-@@ -170,11 +222,25 @@ std::string VlCoverCross::binName(uint32_t flat) const {
+@@ -170,11 +228,25 @@ std::string VlCoverCross::binName(uint32_t flat) const {
  
  #if VM_COVERAGE
  void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* page) {
@@ -156,7 +162,7 @@ index f7cb3b6ae..62d9c3dfb 100644
          const std::string bin = binName(flat);  // "b1_x_b2_x_..."
          // cross_bins metadata: the same components joined by ',' (not read by the report)
          std::string crossBins;
-@@ -188,5 +254,77 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
+@@ -188,5 +260,82 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
                          m_file, "lineno", lineStr.c_str(), "column", colStr.c_str(), "bin",
                          bin.c_str(), "cross", "1", "cross_bins", crossBins.c_str());
      }
@@ -173,6 +179,11 @@ index f7cb3b6ae..62d9c3dfb 100644
 +
 +//=============================================================================
 +// VlCovergroupInst (OCV)
++
++uint64_t vl_cov_first_hits = 0;
++int vl_cov_sampling = 1;
++extern "C" void vl_covergroup_enable(int on) { vl_cov_sampling = on != 0; }
++extern "C" uint64_t vl_covergroup_first_hits() { return vl_cov_first_hits; }
 +
 +namespace {
 +std::vector<VlCovergroupInst*>& covergroupInsts() {
@@ -235,7 +246,7 @@ index f7cb3b6ae..62d9c3dfb 100644
 +    VlCovergroupInst::report(os, parts != 0);
 +}
 diff --git a/include/verilated_covergroup.h b/include/verilated_covergroup.h
-index 9c1825daf..66648d11b 100644
+index 9c1825daf..54a7cbe30 100644
 --- a/include/verilated_covergroup.h
 +++ b/include/verilated_covergroup.h
 @@ -35,7 +35,10 @@
@@ -249,7 +260,20 @@ index 9c1825daf..66648d11b 100644
  #include <vector>
  
  class VerilatedCovContext;
-@@ -109,6 +112,10 @@ protected:
+@@ -93,6 +96,12 @@ public:
+ // Base coverpoint runtime (read side + collection logic, no hit-list storage).
+ // VlCoverpointT<MaxHits> adds the inline hit-list array and the incrementBin write
+ // path; the cross holds VlCoverpoint* and reads via hitCount()/hitList().
++// OCV: bins hit for the first time, all covergroups (vl_covergroup_first_hits): which records gave
++// new coverage - the measure of a record filter (docs/COVERAGE.md)
++extern uint64_t vl_cov_first_hits;
++// OCV: 0 - no covergroup samples (vl_covergroup_enable)
++extern int vl_cov_sampling;
++
+ class VlCoverpoint VL_NOT_FINAL : public VlCoverpointIf {
+ protected:
+     // MEMBERS (protected so VlCoverpointT::incrementBin can update them)
+@@ -109,6 +118,10 @@ protected:
      // [m_normal] inverse of m_crossIdx: cross idx -> full bin idx, appended in cross-index order
      std::vector<uint32_t> m_crossToBin;
      uint32_t m_hitCount = 0;  // entries valid in the hit list this sample
@@ -260,7 +284,7 @@ index 9c1825daf..66648d11b 100644
  
  private:
      // PRIVATE METHODS
-@@ -131,6 +138,24 @@ public:
+@@ -131,6 +144,24 @@ public:
          addNamer(set, count, VlCovBinNaming::Array, name, file, line, col);
      }
      void registerBins(VerilatedCovContext* covcontextp, const char* page);
@@ -285,7 +309,7 @@ index 9c1825daf..66648d11b 100644
  
      // ---- hot path (from generated sample()) ----
      // Clear the hit list at the start of each sample() for a cross-fed coverpoint.
-@@ -157,14 +182,17 @@ public:
+@@ -157,14 +188,17 @@ public:
          // Count Normal bins that reached option.at_least on demand, so the hot
          // path (incrementBin) stays a plain counter bump.
          uint32_t numCovered = 0;
@@ -304,7 +328,16 @@ index 9c1825daf..66648d11b 100644
      }
  };
  
-@@ -224,12 +252,31 @@ class VlCoverCross final : public VlCoverpointIf {
+@@ -191,7 +225,7 @@ public:
+     // m_hitCount can never exceed MaxHits (the gen-time overlap bound), so no hit
+     // is ever dropped; the bound check is a compile-time-folded safety net.
+     void incrementBin(uint32_t i) {
+-        ++m_counts[i];
++        if (m_counts[i]++ == 0) ++vl_cov_first_hits;
+         // m_crossIdx is signed only to carry the -1 "not a Normal bin" marker;
+         // the >= 0 test below is what makes every stored hit index unsigned-safe.
+         const int cx = m_crossIdx[i];
+@@ -224,12 +258,34 @@ class VlCoverCross final : public VlCoverpointIf {
      std::vector<uint32_t> m_stride;  // [m_dims] Flat-index stride per dimension
      std::vector<uint32_t> m_flatCounts;  // [m_numAutoBins] Per-bin hit counts
      std::vector<VlCoverpoint*> m_cps;  // Feeding coverpoints (the only name source)
@@ -328,7 +361,10 @@ index 9c1825daf..66648d11b 100644
      void incrementTuple(uint32_t idx) {
 -        if (m_flatCounts[idx]++ == 0) ++m_numCovered;
 +        if (VL_LIKELY(m_kind.empty())) {
-+            if (m_flatCounts[idx]++ == 0) ++m_numCovered;
++            if (m_flatCounts[idx]++ == 0) {
++                ++m_numCovered;
++                ++vl_cov_first_hits;
++            }
 +            return;
 +        }
 +        incrementKind(idx);
@@ -337,7 +373,7 @@ index 9c1825daf..66648d11b 100644
  
  public:
      // CONSTRUCTORS
-@@ -240,6 +287,25 @@ public:
+@@ -240,6 +296,25 @@ public:
      void init(const char* hier, uint32_t dims, VlCoverpoint* const* cps, const char* file,
                int line, int col);
      void registerBins(VerilatedCovContext* covcontextp, const char* page);
@@ -363,7 +399,7 @@ index 9c1825daf..66648d11b 100644
  
      // ---- hot path (from generated sample(), after all coverpoints sampled) ----
      void sample(VlCoverpoint* const* cps);
-@@ -249,9 +315,44 @@ public:
+@@ -249,9 +324,44 @@ public:
      uint32_t binCount() const override { return m_numAutoBins; }
      std::string binName(uint32_t flat) const override;
      void coverageParts(double& covered, double& total) const override {
@@ -550,7 +586,7 @@ index 46c72718f..34758a288 100644
      // Coverage-option assignment
      // @astgen op1 := valuep : AstNodeExpr
 diff --git a/src/V3Covergroup.cpp b/src/V3Covergroup.cpp
-index dc9e05697..1ef289f23 100644
+index dc9e05697..8eae68d35 100644
 --- a/src/V3Covergroup.cpp
 +++ b/src/V3Covergroup.cpp
 @@ -160,6 +160,10 @@ class FunctionalCoverageVisitor final : public VNVisitor {
@@ -1484,15 +1520,27 @@ index dc9e05697..1ef289f23 100644
                  }
              } else {
                  currRangep->v3error(
-@@ -1558,6 +2286,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1558,6 +2286,19 @@ class FunctionalCoverageVisitor final : public VNVisitor {
  
          // Generate code for get_inst_coverage() (an empty covergroup returns 100%).
          generateCoverageMethodBody(getInstCoveragep);
 +        generateInstanceRegistration();
++        // OCV: sampling switched off for all covergroups (vl_covergroup_enable(0)): sample() does nothing -
++        // the testbench's own code still runs (its state, e.g. the history of instructions), no bin moves.
++        // A coverage-keeping record filter replays the records before a kept one this way (docs/COVERAGE.md)
++        {
++            AstCStmt* const offp = new AstCStmt{m_covergroupp->fileline()};
++            offp->add("if (VL_UNLIKELY(!vl_cov_sampling)) return;");
++            if (AstNode* const firstp = m_sampleFuncp->stmtsp()) {
++                firstp->addHereThisAsNext(offp);
++            } else {
++                m_sampleFuncp->addStmtsp(offp);
++            }
++        }
  
          // Generate code for get_coverage() (type-level)
          // NOTE: Full type-level coverage requires instance tracking infrastructure
-@@ -1573,12 +2302,67 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1573,12 +2314,67 @@ class FunctionalCoverageVisitor final : public VNVisitor {
          UINFO(4, "    Added placeholder get_coverage() (returns 0.0)");
      }
  
@@ -1561,7 +1609,7 @@ index dc9e05697..1ef289f23 100644
          // illegal, and default are excluded per LRM 19.5).  A covergroup with no coverpoints
          // (and hence no crosses) has nothing to cover and reports 100%.
          if (m_cpVars.empty()) {
-@@ -1593,7 +2377,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1593,7 +2389,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
              AstCStmt* const cs = new AstCStmt{fl};
              cs->add("{ double __Vc = 0.0; double __Vt = 0.0; ");
              cs->add(memberRef(fl, cpVarp));
@@ -1570,7 +1618,7 @@ index dc9e05697..1ef289f23 100644
              funcp->addStmtsp(cs);
          }
          // Crosses contribute the same covered/total ratio as their per-tuple bins.
-@@ -1601,12 +2385,14 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1601,12 +2397,14 @@ class FunctionalCoverageVisitor final : public VNVisitor {
              AstCStmt* const cs = new AstCStmt{fl};
              cs->add("{ double __Vc = 0.0; double __Vt = 0.0; ");
              cs->add(memberRef(fl, cxVarp));

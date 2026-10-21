@@ -4,6 +4,8 @@
 // randomized and set from the core's configuration as its base test does), its agent and models, connected
 // as uvme_cva6_env_c::connect_coverage_model connects them.
 //   +OCV_RVFI=<file>     the records
+//   +OCV_FIRST=<file>    also the records that hit a bin for the first time: "<record> <new bins>" (each record
+//                        sampled before the next: slower) - how few records a filter has to keep
 `include "uvm_macros.svh"
 module ocv_cva6_cov_top;
     import uvm_pkg::*;
@@ -15,7 +17,9 @@ module ocv_cva6_cov_top;
     import uvml_hrtbt_pkg::*;
 
     import "DPI-C" function int ocv_cov_open(string file);
-    import "DPI-C" function int ocv_cov_next(output longint unsigned f[15]);
+    import "DPI-C" function int ocv_cov_next(output longint unsigned f[16]);
+    import "DPI-C" function longint unsigned vl_covergroup_first_hits();
+    import "DPI-C" function void vl_covergroup_enable(int on);
 
     class ocv_cva6_cov_test extends uvm_test;
         `uvm_component_utils(ocv_cva6_cov_test)
@@ -66,11 +70,15 @@ module ocv_cva6_cov_top;
         endfunction
 
         task run_phase(uvm_phase phase);
-            longint unsigned f[15];
-            string file;
+            longint unsigned f[16], hits, h;
+            longint unsigned contexts = 0;
+            string file, first;
+            int fd = 0;
             phase.raise_objection(this);
             if (!$value$plusargs("OCV_RVFI=%s", file)) `uvm_fatal("OCV", "+OCV_RVFI=<records> missing")
             if (ocv_cov_open(file) != 0) `uvm_fatal("OCV", {"cannot open ", file})
+            if ($value$plusargs("OCV_FIRST=%s", first)) fd = $fopen(first, "w");
+            hits = vl_covergroup_first_hits();
             while (ocv_cov_next(f)) begin
                 uvma_rvfi_instr_seq_item_c#(ILEN, XLEN) it = new("rvfi");
                 it.insn = f[0]; it.pc_rdata = f[1]; it.trap = f[2];
@@ -81,12 +89,28 @@ module ocv_cva6_cov_top;
                 it.name_csrs["mstatus"] = csr(f[12]);
                 it.name_csrs["mie"] = csr(f[13]);
                 it.name_csrs["mip"] = csr(f[14]);
+                if (f[15] != 0) begin
+                    // a context record: the models take it (their state) with no covergroup sampling
+                    #1;                               // (the records before it sampled first)
+                    vl_covergroup_enable(0);
+                    isacov_agent.monitor.write_rvfi_instr(it);
+                    #1;
+                    vl_covergroup_enable(1);
+                    contexts++;
+                    continue;
+                end
                 isacov_agent.monitor.write_rvfi_instr(it);
                 records++;
-                if (records % 4096 == 0) #1;      // (the models take their fifos' items)
+                if (fd != 0) begin
+                    #1;                           // every model has sampled this record
+                    h = vl_covergroup_first_hits();
+                    if (h != hits) $fwrite(fd, "%0d %0d\n", records - 1, h - hits);
+                    hits = h;
+                end else if (records % 4096 == 0) #1;   // (the models take their fifos' items)
             end
             #10;
-            `uvm_info("OCV", $sformatf("%0d RVFI records sampled", records), UVM_LOW)
+            if (fd != 0) $fclose(fd);
+            `uvm_info("OCV", $sformatf("%0d RVFI records sampled, %0d context records", records, contexts), UVM_LOW)
             phase.drop_objection(this);
         endtask
     endclass

@@ -79,11 +79,13 @@ $CVA6_CORET_DIR/uvma_cva6pkg_utils_pkg.sv
 $HERE/ocv_cva6_cov_top.sv
 EOT
         D=$OUT/dasm
+        # OCV's sampling profiler, idle unless OCV_PROF=<file> (tools/prof_report.py)
+        cc -O2 -fno-pie -c "$OCV/uvm/vlt/ocv_prof.c" -o "$OUT/ocv_prof.o"
         "$V" --cc --exe --build --timing --coverage-user -j "${OCV_MAKE_J:-6}" -Wno-fatal -Wno-lint -Wno-style \
             -Wno-BADSTDPRAGMA -Wno-SUPERNFIRST -Wno-ENUMVALUE +define+UVM -f "$OUT/files.f" --top-module ocv_cva6_cov_top \
             --Mdir "$OUT/obj" -o Vcov "$OCV/uvm/vlt/ocv_fast_random.cpp" "$OCV/uvm/vlt/ocv_main.cpp" \
             "$OCV/uvm/cov/ocv_cov_feed.c" "$HERE/ocv_cva6_cov_stubs.cpp" -CFLAGS "-DOCV_VTOP=Vocv_cva6_cov_top -O1" \
-            -LDFLAGS "$D/dpi_dasm.o $D/disasm.o $D/regnames.o $D/isa_parser.o" > "$OUT/build.log" 2>&1 \
+            -LDFLAGS "$D/dpi_dasm.o $D/disasm.o $D/regnames.o $D/isa_parser.o $OUT/ocv_prof.o -no-pie" > "$OUT/build.log" 2>&1 \
             || { grep -m20 '%Error\|error:' "$OUT/build.log"; exit 1; }
         echo "build: $OUT/obj/Vcov" ;;
     run)
