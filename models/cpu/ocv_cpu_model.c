@@ -95,6 +95,30 @@ static void images_clear(void) { rams_alloc(); for (int r = 0; r < CPU_N_RAMS; r
 static uint8_t *extra_mem[CPU_N_REGIONS_EXTRA + 1];
 static int      have_image;
 static uint64_t max_steps = 100000000;
+/* rvfi_out=<file>: every retired instruction as an RVFI record (docs/COVERAGE.md: the verifier's own coverage
+ * fed from the model) - one line, hex: insn pc trap rs1 rs1_rdata rs2 rs2_rdata rd rd_wdata mem_addr intr
+ * mcause mstatus mie mip. insn is the instruction's own encoding (16 bits for a compressed one), trap
+ * CVA6's packing (bit 0, the cause above it), mem_addr also for loads */
+static FILE *rvfi_f;
+static int   rvfi_intr;                         /* an interrupt was taken: the next record is its handler's first */
+static void rvfi_write(cpu_model_t *cpu, const cpu_retire_t *rp, uint32_t raw, int c, uint32_t insn,
+                       uint32_t a, uint32_t b)
+{
+    uint32_t csr[16], val[16], mcause = 0, mstatus = 0, mie = 0;
+    const int nc = cpu_arch_csrs(cpu, csr, val, 16);
+    for (int k = 0; k < nc; k++) {
+        if (csr[k] == 0x342) mcause = val[k];
+        if (csr[k] == 0x300) mstatus = val[k];
+        if (csr[k] == 0x304) mie = val[k];
+    }
+    uint32_t maddr = rp->mem_addr;
+    if ((insn & 0x7f) == 0x03) maddr = a + (uint32_t)((int32_t)insn >> 20);   /* a load: rs1 + imm */
+    const uint32_t trap = rp->trap ? (1u | ((mcause & 0x7fffffffu) << 1)) : 0;
+    fprintf(rvfi_f, "%x %x %x %x %x %x %x %x %x %x %x %x %x %x 0\n", c ? raw & 0xFFFFu : insn, rp->pc, trap,
+            (insn >> 15) & 31, a, (insn >> 20) & 31, b, rp->rd_addr, rp->rd_wdata, maddr, rvfi_intr, mcause,
+            mstatus, mie);
+    rvfi_intr = 0;
+}
 /* checkpoint (ckpt_write): the channel and record of a failing window, the margin before it, the files */
 static char     ckpt_name[32], ckpt_file[256] = "ckpt";
 static uint64_t ckpt_rec, ckpt_margin = 2048, ckpt_order;   /* ckpt_order: at that instruction instead */
@@ -231,6 +255,12 @@ static int configure(const char *key, const char *value)
     }
     if (!strcmp(key, "ckpt_margin")) { ckpt_margin = strtoull(value, 0, 0); return 0; }
     if (!strcmp(key, "ckpt_order"))  { ckpt_order = strtoull(value, 0, 0); return ckpt_order == 0; }
+    if (!strcmp(key, "rvfi_out")) {
+        if (rvfi_f) fclose(rvfi_f);
+        rvfi_f = fopen(value, "w");
+        if (!rvfi_f) { perror(value); return 1; }
+        return 0;
+    }
     if (!strcmp(key, "ckpt_file"))   { snprintf(ckpt_file, sizeof ckpt_file, "%s", value); return 0; }
     if (!strcmp(key, "lat"))   return sscanf(value, "%u,%u", &lat_g, &lat_r) != 2 || lat_g > 255 || lat_r > 255;
     return -1;
@@ -981,7 +1011,7 @@ static void run_program(ocv_model_io_t *io)
 #if defined(CPU_FOR_STREAMS)
     static int no_blocks = -1, no_plan;        /* OCV_NO_BLOCKS=1 / OCV_NO_PLAN=1: off (to compare) */
     if (no_blocks < 0) { no_blocks = getenv("OCV_NO_BLOCKS") != NULL; no_plan = getenv("OCV_NO_PLAN") != NULL; }
-    by_blocks = gives_src && cpu->impl->block && !trace && !no_blocks;
+    by_blocks = gives_src && cpu->impl->block && !trace && !no_blocks && !rvfi_f;   /* (rvfi_out: one by one) */
     /* stream by stream with s a constant: kind, filter and field positions known when compiling */
 #define CPU_FLD(s, j) (cpu_stream_field[s][j] < 0 ? NULL : &CPU_DUT.channels[cpu_streams[s].channel].fields[cpu_stream_field[s][j]])
 #define CPU_STREAM_DO(s) do { \
@@ -1106,6 +1136,7 @@ static void run_program(ocv_model_io_t *io)
                 fprintf(trace, ok == 2 ? "  (known erratum: allowed only by mie before a recent write)\n"
                                        : "  (the model's state does not allow it: %d)\n", ok);
             if (ok == 2) { irq_errata++; ok = errata_strict ? 0 : 1; }
+            if (ok == 1) rvfi_intr = 1;         /* (taken: the next record is the handler's first) */
 #if defined(CPU_GEN_CV32)
             cov_irq(irq_cause);
 #endif
@@ -1289,6 +1320,7 @@ static void run_program(ocv_model_io_t *io)
         }
         const int c = (raw & 3) != 3;
         if (!cov_skip) COV(raw, c, insn, op_a, op_b, (int)rp->trap);
+        if (rvfi_f) rvfi_write(cpu, rp, raw, c, insn, op_a, op_b);
         if (trace) fprintf(trace, "%llu %08x %08x x%u=%08x%s%s\n", (unsigned long long)issued, rp->pc, rp->insn, rp->rd_addr,
                            rp->rd_wdata, rp->trap ? " trap" : "", rp->mem_we ? " store" : "");
         executed++;

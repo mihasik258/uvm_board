@@ -32,7 +32,10 @@ git -C "$TOP/src" checkout --quiet "$VREV"
 # a dynamic array as a DPI open array, ==? / !=? against a variable; functional coverage as IEEE 1800-2023 19.5-19.11
 # (test: tools/verilator/test/t_cg_ieee.sv): a bin's iff and with, ignore/illegal values left out of every bin,
 # fixed-size and wide array bins, enum automatic bins, explicit cross bins (binsof, intersect, with, && || !),
-# transition ranges and enum items, bin bounds from covergroup arguments, coverage averaged over the items
+# transition ranges and enum items, bin bounds from covergroup arguments, coverage averaged over the items, a
+# coverpoint's expression read only when its iff holds, option.name; the coverage of every covergroup instance
+# (VlCovergroupInst, +ocv_cov_report= in uvm/vlt/ocv_main.cpp); a cross of millions of tuples written to
+# coverage.dat by its hit tuples only; a soft constraint under if/else kept soft (core-v-verif's cfg)
 for PATCH in "$OCV"/tools/verilator/ocv_fast_random.patch "$OCV"/tools/verilator/ocv_tb_compat.patch \
              "$OCV"/tools/verilator/ocv_lazy_constraint_lines.patch "$OCV"/tools/verilator/ocv_cva6_tb.patch; do
     if ! git -C "$TOP/src" apply --reverse --check "$PATCH" 2>/dev/null; then

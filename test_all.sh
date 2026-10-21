@@ -16,6 +16,8 @@
 #      through the board's code path (the FPGA image simulated); the SCR1 UVM test translated by
 #      uvm2board.py on the simulated board (engine A); the verifier-style testbenches (uvm_v) of SCR1
 #      and mac16 without a description file, in their board form
+#  12. the verifier's own coverage: Verilator's covergroups against IEEE 1800-2023 (t_cg_ieee.sv); CVA6's
+#      covergroups (core-v-verif) over the reference model's RVFI records (examples/cva6/cov/cov.sh)
 # FAST=1 skips steps 6 and 8.
 set -uo pipefail
 OCV=$(cd "$(dirname "$0")" && pwd)
@@ -212,6 +214,26 @@ if [ -n "${VIVADO_SETTINGS:-}" ]; then
     done
 else
     echo "  (VIVADO_SETTINGS not set - skipping the xsim runs of the mac16 UVM test)"
+fi
+
+step "12. coverage: Verilator's covergroups as IEEE 1800-2023, CVA6's own covergroups over the model's records"
+V=$OCV/build/verilator/install/bin/verilator
+rm -rf "$B/cg_ieee" && (ulimit -v 4000000; "$V" --binary --coverage-user -Wno-fatal --Mdir "$B/cg_ieee" \
+    "$OCV/tools/verilator/test/t_cg_ieee.sv" --top-module t > "$B/cg_ieee_build.log" 2>&1) && \
+    "$B/cg_ieee/Vt" > "$B/cg_ieee.log" 2>&1
+grep -E "DIFFERS|RESULT" "$B/cg_ieee.log" | sed 's/^/  /'
+grep -q "RESULT ok" "$B/cg_ieee.log"; ok $?
+if [ -d "$OCV/ext/cva6" ]; then
+    # the harness takes 16 GB to build (Verilator, about 7 min); the records: a generated program, the model alone
+    (ulimit -v 16000000; OUT=$B/cov_cva6 "$OCV/examples/cva6/cov/cov.sh" build) > "$B/cov_cva6_build.log" 2>&1
+    OUT=$B/cpu_cva6 "$OCV/hw/cpu/run.sh" "$OCV/examples/cva6/cva6.bind" bench -- --model-opt gen=directed \
+        --model-opt cpu=fast --model-opt rvfi_out="$B/cov_cva6_rec.rvfi" --batches 1 > "$B/cov_cva6_rec.log" 2>&1
+    (ulimit -v 8000000; OUT=$B/cov_cva6 "$OCV/examples/cva6/cov/cov.sh" run "$B/cov_cva6_rec.rvfi" rec) | tee "$B/cov_cva6.log"
+    # every covergroup instance of cv32a60x's configuration (isacov's and the CVA6 models'), no UVM error
+    grep -q "UVM_ERROR :    0" "$B/cov_cva6.log" && grep -q "UVM_FATAL :    0" "$B/cov_cva6.log" && \
+        grep -q "cov: 148 covergroup instances" "$B/cov_cva6.log"; ok $?
+else
+    echo "  (no ext/cva6: tools/get_cores.sh)"
 fi
 
 printf '\nTEST_ALL: %s\n' "$([ $fails -eq 0 ] && echo PASS || echo "$fails FAILED")"

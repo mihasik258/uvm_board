@@ -1,0 +1,95 @@
+// ocv_cva6_cov_top.sv - CVA6's own functional coverage (core-v-verif: the isacov agent's covergroups and
+// uvme_cva6_cov_model_c's), fed with RVFI records the reference model wrote (uvm/cov/ocv_cov_feed.c) in
+// place of a simulated core. The testbench's classes as they are: its configuration (uvme_cva6_cfg_c,
+// randomized and set from the core's configuration as its base test does), its agent and models, connected
+// as uvme_cva6_env_c::connect_coverage_model connects them.
+//   +OCV_RVFI=<file>     the records
+`include "uvm_macros.svh"
+module ocv_cva6_cov_top;
+    import uvm_pkg::*;
+    import uvma_rvfi_pkg::*;
+    import uvma_core_cntrl_pkg::*;
+    import uvma_isacov_pkg::*;
+    import uvme_cva6_pkg::*;
+    import uvma_cva6pkg_utils_pkg::*;
+    import uvml_hrtbt_pkg::*;
+
+    import "DPI-C" function int ocv_cov_open(string file);
+    import "DPI-C" function int ocv_cov_next(output longint unsigned f[15]);
+
+    class ocv_cva6_cov_test extends uvm_test;
+        `uvm_component_utils(ocv_cva6_cov_test)
+        uvme_cva6_cfg_c                  cfg;
+        uvme_cva6_cntxt_c                cntxt;
+        uvma_isacov_agent_c#(ILEN, XLEN) isacov_agent;
+        uvme_cva6_cov_model_c            cov_model;
+        longint unsigned                 records;
+
+        function new(string name = "ocv_cva6_cov_test", uvm_component parent = null);
+            super.new(name, parent);
+        endfunction
+
+        function void build_phase(uvm_phase phase);
+            st_core_cntrl_cfg st;
+            super.build_phase(phase);
+            cfg = uvme_cva6_cfg_c::type_id::create("cfg");
+            if (!cfg.randomize()) `uvm_fatal("OCV", "cannot randomize the configuration")
+            // as uvmt_cva6_base_test_c::pkg_to_cfg
+            st = cfg.to_struct();
+            st = cva6pkg_to_core_cntrl_cfg(st);
+            cfg.from_struct(st);
+            cfg.post_randomize();
+            uvml_default_hrtbt.enabled = 0;     // as uvmt_cva6_base_test_c::cfg_hrtbt_monitor
+            cntxt = uvme_cva6_cntxt_c::type_id::create("cntxt");
+            uvm_config_db#(uvma_isacov_cfg_c)::set(this, "*isacov_agent", "cfg", cfg.isacov_cfg);
+            uvm_config_db#(uvme_cva6_cfg_c)::set(this, "cov_model", "cfg", cfg);
+            uvm_config_db#(uvme_cva6_cntxt_c)::set(this, "cov_model", "cntxt", cntxt);
+            isacov_agent = uvma_isacov_agent_c#(ILEN, XLEN)::type_id::create("isacov_agent", this);
+            cov_model = uvme_cva6_cov_model_c::type_id::create("cov_model", this);
+        endfunction
+
+        function void connect_phase(uvm_phase phase);
+            // as uvme_cva6_env_c::connect_coverage_model (the RVFI agent's port is this test)
+            if (cfg.isacov_cfg.cov_model_enabled) begin
+                isacov_agent.monitor.ap.connect(cov_model.isa_covg.mon_trn_fifo.analysis_export);
+                isacov_agent.monitor.ap.connect(cov_model.illegal_covg.mon_trn_fifo.analysis_export);
+                isacov_agent.monitor.ap.connect(cov_model.exception_covg.mon_trn_fifo.analysis_export);
+            end
+            if (cfg.interrupt_cfg.cov_model_enabled)
+                isacov_agent.monitor.ap.connect(cov_model.interrupt_covg.mon_trn_fifo.analysis_export);
+        endfunction
+
+        function uvma_rvfi_csr_seq_item_c#(XLEN) csr(longint unsigned v);
+            csr = new("csr");
+            csr.wdata = v;
+            csr.rdata = v;
+        endfunction
+
+        task run_phase(uvm_phase phase);
+            longint unsigned f[15];
+            string file;
+            phase.raise_objection(this);
+            if (!$value$plusargs("OCV_RVFI=%s", file)) `uvm_fatal("OCV", "+OCV_RVFI=<records> missing")
+            if (ocv_cov_open(file) != 0) `uvm_fatal("OCV", {"cannot open ", file})
+            while (ocv_cov_next(f)) begin
+                uvma_rvfi_instr_seq_item_c#(ILEN, XLEN) it = new("rvfi");
+                it.insn = f[0]; it.pc_rdata = f[1]; it.trap = f[2];
+                it.rs1_addr = f[3]; it.rs1_rdata = f[4]; it.rs2_addr = f[5]; it.rs2_rdata = f[6];
+                it.rd1_addr = f[7]; it.rd1_wdata = f[8]; it.mem_addr = f[9]; it.intr = f[10];
+                it.mode = UVMA_RVFI_M_MODE;
+                it.name_csrs["mcause"] = csr(f[11]);
+                it.name_csrs["mstatus"] = csr(f[12]);
+                it.name_csrs["mie"] = csr(f[13]);
+                it.name_csrs["mip"] = csr(f[14]);
+                isacov_agent.monitor.write_rvfi_instr(it);
+                records++;
+                if (records % 4096 == 0) #1;      // (the models take their fifos' items)
+            end
+            #10;
+            `uvm_info("OCV", $sformatf("%0d RVFI records sampled", records), UVM_LOW)
+            phase.drop_objection(this);
+        endtask
+    endclass
+
+    initial run_test("ocv_cva6_cov_test");
+endmodule

@@ -3,6 +3,8 @@
 // "CASE <name> got <coverage> want <coverage>"; RESULT ok when all agree. Coverage of a covergroup is the
 // average of its coverpoints and crosses (19.11, every weight 1).
 typedef enum logic [1:0] {ZERO, POS, NEG, NONZERO} vt_t;
+class item; bit [1:0] v; endclass
+typedef enum {I_UNKNOWN, I_ADD, I_SUB, I_MUL, I_DIV, I_LW, I_SW, I_BEQ, I_JAL, I_C_ADD} iname_t;   // int-based
 
 class cases;
     bit flag;
@@ -87,13 +89,39 @@ class cases;
         cx: cross cpa, cpb { bins ZB = binsof(cpb) intersect {0}; }
     endgroup
 
+    // two covergroups with a coverpoint of the same name, each with value tables (CVA6's cg_illegal_*:
+    // cp_illegal_opcode with bins ILLEGAL_OPCODE[2] = {[0:$]} with (...)) - each its own tables
+    covergroup cg_same_a with function sample(bit [2:0] v);
+        cp: coverpoint v { bins A[2] = {[0:7]} with (item != 1); bins B[2] = {[0:7]} with (item != 2); }
+    endgroup
+    covergroup cg_same_b with function sample(bit [2:0] v);
+        cp: coverpoint v { bins C[2] = {[0:7]} with (item != 3); }
+    endgroup
+
+    // the coverpoint's expression is read only when its iff holds (isacov cg_sequential:
+    // coverpoint (instr_prev.name) iff (instr_prev != null) - the first instruction has none)
+    // an enum coverpoint (int-based: 32 bits) has a bin per enum value (19.5.3), not auto_bin_max ranges
+    // of its width (isacov cp_instr: coverpoint (instr.name) { `ISACOV_IGN_BINS })
+    covergroup cg_enum(bit m_on) with function sample(iname_t n);
+        cp: coverpoint n { ignore_bins IGN_UNKNOWN = {I_UNKNOWN}; ignore_bins IGN_M = {I_MUL, I_DIV} with (!m_on); }
+    endgroup
+    // option.name from a constructor argument (isacov: option.name = name): the instance's name
+    covergroup cg_named(string nm) with function sample(bit v);
+        option.per_instance = 1;
+        option.name = nm;
+        cp: coverpoint v;
+    endgroup
+    covergroup cg_iff_null with function sample(item it);
+        cp: coverpoint it.v iff (it != null);
+    endgroup
+
     function new(bit signedv, int lim, bit en);
         cg_ign_with = new(signedv);
         cg_ign_auto = new; cg_ign_array = new; cg_bin_iff = new; cg_with_item = new;
         cg_with_wide = new(lim); cg_sized = new; cg_sized_uneven = new; cg_sized_arg = new(lim);
         cg_sized_huge = new;
         cg_cross_off = new(en); cg_binsof = new; cg_not_binsof = new; cg_binsof_and = new; cg_binsof_or = new;
-        cg_cross_bins = new;
+        cg_cross_bins = new; cg_same_a = new; cg_same_b = new; cg_iff_null = new; cg_enum = new(signedv); cg_named = new(signedv ? "named_s" : "named_u");
     endfunction
 endclass
 
@@ -143,6 +171,22 @@ module t;
         check("binsof_or", u.cg_binsof_or.get_inst_coverage(), (25 + 50 + 100.0 / 3) / 3);
         u.cg_cross_bins.sample(3, 0);  // the cross: ZB (the 4 tuples with b == 0) + 4 automatic (b == 1): 1 of 5
         check("cross_bins", u.cg_cross_bins.get_inst_coverage(), (25 + 50 + 20) / 3.0);
+        u.cg_same_a.sample(0); u.cg_same_b.sample(0);    // a: A {0,2,3} {4..7}, B {0,1,3} {4..7}: 2 of 4; b: 1 of 2
+        check("same_name a", u.cg_same_a.get_inst_coverage(), 50.0);
+        check("same_name b", u.cg_same_b.get_inst_coverage(), 50.0);
+        begin
+            item it = new;
+            it.v = 3;
+            u.cg_iff_null.sample(null); u.cg_iff_null.sample(it);   // 1 of 4, no null dereference
+            check("iff_null", u.cg_iff_null.get_inst_coverage(), 25.0);
+        end
+        u.cg_enum.sample(I_ADD); u.cg_enum.sample(I_SW); s.cg_enum.sample(I_ADD);   // u: 2 of 7; s: 1 of 9
+        check("enum u", u.cg_enum.get_inst_coverage(), 200.0 / 7);
+        check("enum s", s.cg_enum.get_inst_coverage(), 100.0 / 9);
+        if (u.cg_named.option.name != "named_u" || s.cg_named.option.name != "named_s") begin
+            $display("CASE option.name got %s %s want named_u named_s  <- DIFFERS", u.cg_named.option.name, s.cg_named.option.name);
+            bad++;
+        end
         if (bad == 0) $display("RESULT ok"); else $display("RESULT bad %0d", bad);
         $finish;
     end

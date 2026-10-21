@@ -104,25 +104,71 @@ struct Ctx {
     std::vector<int> width;
 };
 
+// Variables wider than 64 bits (up to 128: core-v-verif's MAX_XLEN addresses) are solved as 64-bit ones
+// whose upper bits are 0 - a constant wider than 64 bits is taken when its upper bits are 0 (it then has
+// the width 64), otherwise the call goes to the SMT solver. A drawn value of such a variable is therefore
+// below 2^64 (a valid solution; the distribution narrower than the SMT solver's).
+static int solverWidth(int w) { return w > 64 ? 64 : w; }
+
 bool parseConst(const std::string& t, uint64_t& v, int& w)
 {
     if (t.size() > 2 && t[0] == '#' && t[1] == 'b') {
         w = (int)t.size() - 2;
-        if (w > 64) return false;
+        size_t first = 2;
+        if (w > 64) {
+            if (w > 128) return false;
+            for (size_t i = 2; i < t.size() - 64; i++) if (t[i] != '0') return false;
+            first = t.size() - 64;
+            w = 64;
+        }
         v = 0;
-        for (size_t i = 2; i < t.size(); i++) v = (v << 1) | (t[i] == '1');
+        for (size_t i = first; i < t.size(); i++) v = (v << 1) | (t[i] == '1');
         return true;
     }
     if (t.size() > 2 && t[0] == '#' && t[1] == 'x') {
         w = 4 * ((int)t.size() - 2);
-        if (w > 64) return false;
-        v = std::strtoull(t.c_str() + 2, nullptr, 16);
+        size_t first = 2;
+        if (w > 64) {
+            if (w > 128) return false;
+            for (size_t i = 2; i < t.size() - 16; i++) if (t[i] != '0') return false;
+            first = t.size() - 16;
+            w = 64;
+        }
+        v = std::strtoull(t.c_str() + first, nullptr, 16);
         return true;
     }
     return false;
 }
 
 std::unique_ptr<Expr> compile(const Sx& s, const Ctx& cx);
+
+// a variable's value (up to 128 bits: then false if it has bits above 64) / setting it (upper words 0)
+static bool loadVar(const void* p, int w, uint64_t& v)
+{
+    if (w <= 8) v = *static_cast<const CData*>(p);
+    else if (w <= 16) v = *static_cast<const SData*>(p);
+    else if (w <= 32) v = *static_cast<const IData*>(p);
+    else if (w <= 64) v = *static_cast<const QData*>(p);
+    else {
+        const EData* const wp = static_cast<const EData*>(p);
+        v = static_cast<uint64_t>(wp[0]) | (static_cast<uint64_t>(wp[1]) << 32);
+        for (int i = 2; i < (w + 31) / 32; i++) if (wp[i]) return false;
+    }
+    return true;
+}
+static void storeVar(void* p, int w, uint64_t v)
+{
+    if (w <= 8) *static_cast<CData*>(p) = (CData)v;
+    else if (w <= 16) *static_cast<SData*>(p) = (SData)v;
+    else if (w <= 32) *static_cast<IData*>(p) = (IData)v;
+    else if (w <= 64) *static_cast<QData*>(p) = v;
+    else {
+        EData* const wp = static_cast<EData*>(p);
+        wp[0] = static_cast<EData>(v);
+        wp[1] = static_cast<EData>(v >> 32);
+        for (int i = 2; i < (w + 31) / 32; i++) wp[i] = 0;
+    }
+}
 
 std::unique_ptr<Expr> mk(Op op, int w) { std::unique_ptr<Expr> e{new Expr}; e->op = op; e->w = w; return e; }
 
@@ -148,12 +194,23 @@ std::unique_ptr<Expr> compile(const Sx& s, const Ctx& cx)
         const std::string& f = h.kids[1].atom;
         if (f == "extract" && h.kids.size() == 4) {
             int hi = std::atoi(h.kids[2].atom.c_str()), lo = std::atoi(h.kids[3].atom.c_str());
+            if (hi >= x->w && x->w == 64 && hi < 128 && lo <= hi) {
+                // a wide value solved as 64 bits (solverWidth): its bits from 64 up are 0
+                const int rw = solverWidth(hi - lo + 1);
+                if (lo >= 64) { auto e = mk(CONST, rw); e->c = 0; return e; }
+                auto xe = mk(EXTRACT, 64 - lo); xe->p1 = 63; xe->p2 = lo; xe->a.push_back(std::move(x));
+                if (xe->w == rw) return xe;
+                auto e = mk(ZEXT, rw); e->p1 = rw - xe->w; e->a.push_back(std::move(xe)); return e;
+            }
             if (hi < lo || hi >= x->w) return nullptr;
             auto e = mk(EXTRACT, hi - lo + 1); e->p1 = hi; e->p2 = lo; e->a.push_back(std::move(x)); return e;
         }
         if ((f == "zero_extend" || f == "sign_extend") && h.kids.size() == 3) {
             int k = std::atoi(h.kids[2].atom.c_str());
-            if (x->w + k > 64) return nullptr;
+            if (x->w + k > 64) {
+                if (f != "zero_extend" || x->w + k > 128) return nullptr;
+                k = 64 - x->w;                 // (to a wide one, solved as 64 bits: see solverWidth)
+            }
             auto e = mk(f == "zero_extend" ? ZEXT : SEXT, x->w + k); e->p1 = k; e->a.push_back(std::move(x)); return e;
         }
         return nullptr;
@@ -161,7 +218,8 @@ std::unique_ptr<Expr> compile(const Sx& s, const Ctx& cx)
     const std::string& f = h.atom;
     if (f == "_" && s.kids.size() == 3 && s.kids[1].atom.compare(0, 2, "bv") == 0) {
         int w = std::atoi(s.kids[2].atom.c_str());
-        if (w < 1 || w > 64) return nullptr;
+        if (w < 1 || w > 128 || s.kids[1].atom.size() > 2 + 19) return nullptr;
+        w = solverWidth(w);
         auto e = mk(CONST, w); e->c = std::strtoull(s.kids[1].atom.c_str() + 2, nullptr, 10) & mask(w); return e;
     }
     std::vector<std::unique_ptr<Expr>> a;
@@ -431,6 +489,16 @@ bool preimage(const Expr* t, int var, const Set& S, Set& out)
         const Set neg = setShift(setAnd(S, Set::range((0 - half) & mask(W), mask(W))), 1ULL << w0, W);
         return preimage(t->a[0].get(), var, setAnd(setOr(pos, neg), Set::range(0, mask(w0))), out);
     }
+    case EXTRACT: {
+        // the upper bits of a value (v >> lo in S): the ranges of S widened by every low part
+        const Expr* x = t->a[0].get();
+        if (t->p1 != x->w - 1 || t->p2 <= 0 || t->p2 >= 64) return false;
+        const uint64_t lowm = mask(t->p2);
+        Set r;
+        for (const auto& q : setAnd(S, Set::range(0, mask(W))).iv)
+            r = setOr(r, Set::range(q.first << t->p2, (q.second << t->p2) | lowm));
+        return preimage(x, var, r, out);
+    }
     case ADD: case SUB: {
         if (t->a.size() != 2) return false;
         const bool k0 = isConst(t->a[0].get()), k1 = isConst(t->a[1].get());
@@ -548,6 +616,38 @@ bool boolSet(const Expr* e, int var, int w, Set& out)
     }
 }
 
+// A constraint as the parts that must all hold, with the known values in place: an and splits, an if
+// (ite, ->) whose condition is known gives its branch. bit: the part is a 1-bit vector that must be 1.
+struct Part { const Expr* e; bool bit; };
+void parts(const Expr* e, bool bit, std::vector<Part>& out)
+{
+    if (!bit) {
+        if (e->op == AND) { for (const auto& k : e->a) parts(k.get(), false, out); return; }
+        if (e->op == BV2B) { parts(e->a[0].get(), true, out); return; }
+        if (e->op == IMPLIES && isConst(e->a[0].get())) {
+            if (eval(e->a[0].get(), g_val)) parts(e->a[1].get(), false, out);
+            return;
+        }
+    } else {
+        if (e->op == BAND) { for (const auto& k : e->a) parts(k.get(), true, out); return; }
+        if (e->op == B2BV) { parts(e->a[0].get(), false, out); return; }
+    }
+    if (e->op == ITE && isConst(e->a[0].get())) {
+        parts(e->a[eval(e->a[0].get(), g_val) ? 1 : 2].get(), bit, out);
+        return;
+    }
+    out.push_back({e, bit});
+}
+
+void freeVars(const Expr* e, std::vector<int>& out)
+{
+    if (e->op == VAR) {
+        if (!(g_known && g_known[e->var]) && std::find(out.begin(), out.end(), e->var) == out.end()) out.push_back(e->var);
+        return;
+    }
+    for (const auto& x : e->a) freeVars(x.get(), out);
+}
+
 uint64_t draw(const Set& s, VlRNG& rng)
 {
     const u128 n = s.size();
@@ -629,7 +729,7 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
         if (const char* t = std::getenv("OCV_FAST_RANDOM_TRIES")) g_tries = std::max(1, std::atoi(t));
         if (const char* t = std::getenv("OCV_FAST_RANDOM_ENUM")) g_enum = std::strtoull(t, nullptr, 0);
         const char* d = std::getenv("OCV_FAST_RANDOM_DEBUG");
-        g_debug = d && d[0] == '1';
+        g_debug = d ? std::atoi(d) : 0;
     }
     g_unsat = false;
     if (!g_on) return fallback("off (OCV_FAST_RANDOM=0)");
@@ -707,12 +807,7 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
                 if (ok) {
                     size_t i = 0;
                     for (const auto& kv : r.m_vars) {
-                        void* d = kv.second->datap(0);
-                        const int w = p.widths[i];
-                        if (w <= 8) *static_cast<CData*>(d) = (CData)pv[i];
-                        else if (w <= 16) *static_cast<SData*>(d) = (SData)pv[i];
-                        else if (w <= 32) *static_cast<IData*>(d) = (IData)pv[i];
-                        else *static_cast<QData*>(d) = pv[i];
+                        storeVar(kv.second->datap(0), p.widths[i], pv[i]);
                         i++;
                     }
                     if (!g_quiet) g_fast++;
@@ -729,20 +824,17 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
     std::vector<uint64_t> val;
     for (const auto& kv : r.m_vars) {
         const VlRandomVar& v = *kv.second;
-        if (v.dimension() != 0 || v.width() > 64 || v.width() < 1)
-            return fallback("variable is an array or wider than 64 bits", kv.first);
+        if (v.dimension() != 0 || v.width() > 128 || v.width() < 1)
+            return fallback("variable is an array or wider than 128 bits", kv.first);
         cx.varIndex[kv.first] = (int)vars.size();
-        cx.width.push_back(v.width());
+        cx.width.push_back(solverWidth(v.width()));
         vars.push_back(&v);
         const bool fz = r.isFrozenVar(kv.first, v);
         frozen.push_back(fz);
         uint64_t cur = 0;
-        const void* p = v.datap(0);
-        if (v.width() <= 8) cur = *static_cast<const CData*>(p);
-        else if (v.width() <= 16) cur = *static_cast<const SData*>(p);
-        else if (v.width() <= 32) cur = *static_cast<const IData*>(p);
-        else cur = *static_cast<const QData*>(p);
-        val.push_back(cur & mask(v.width()));
+        if (!loadVar(v.datap(0), v.width(), cur))
+            return fallback("a variable wider than 64 bits holds a value of more than 64 bits", kv.first);
+        val.push_back(cur & mask(solverWidth(v.width())));
     }
     const int nv = (int)vars.size();
     // constraints: compiled once per text (the variable numbering is part of the key)
@@ -786,6 +878,54 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
     }
     for (int i = 0; i < nv; i++)
         if (dom[i].empty()) { g_unsat = true; return fallback("no value satisfies the constraints"); }
+    // A variable whose domain is one value is known: a constraint over it and one other variable bounds
+    // that one's domain (z == 1 with z -> m == 2: m is 2, not a draw among 2^32) - to a fixed point
+    {
+        std::vector<char> known(frozen.begin(), frozen.end());
+        g_known = known.data();
+        for (bool changed = true; changed;) {
+            changed = false;
+            for (int i = 0; i < nv; i++) {
+                if (!known[i] && dom[i].iv.size() == 1 && dom[i].iv[0].first == dom[i].iv[0].second) {
+                    known[i] = 1;
+                    val[i] = dom[i].iv[0].first;
+                    changed = true;
+                }
+            }
+            g_val = val.data();
+            for (size_t k = 0; k < check.size();) {
+                const Compiled* const c = check[k];
+                std::vector<Part> ps;
+                parts(c->e.get(), false, ps);
+                bool all = true;                   // every part became a variable's set (or held)
+                for (const Part& pt : ps) {
+                    std::vector<int> fv;
+                    freeVars(pt.e, fv);
+                    if (fv.empty()) {
+                        if ((eval(pt.e, val.data()) & 1) == 0) {
+                            g_known = frozen.data(); g_unsat = true; return fallback("constraint false", c->text);
+                        }
+                        continue;
+                    }
+                    Set s;
+                    if (fv.size() != 1 || !(pt.bit ? bitSet(pt.e, fv[0], cx.width[fv[0]], true, s)
+                                                   : boolSet(pt.e, fv[0], cx.width[fv[0]], s))) {
+                        all = false;
+                        continue;
+                    }
+                    dom[fv[0]] = setAnd(dom[fv[0]], s);
+                    if (dom[fv[0]].iv.size() == 1 && dom[fv[0]].iv[0].first == dom[fv[0]].iv[0].second) changed = true;
+                    if (dom[fv[0]].empty()) {
+                        g_known = frozen.data(); g_unsat = true; return fallback("no value satisfies the constraints");
+                    }
+                }
+                if (!all) { k++; continue; }
+                check.erase(check.begin() + static_cast<long>(k));
+                changed = true;
+            }
+        }
+        g_known = frozen.data();
+    }
     // Variables tied by a remaining constraint form a group; groups are drawn independently, so
     // a hard group does not spoil the exact draw of an easy one.
     std::vector<int> grp(nv);
@@ -898,7 +1038,20 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
                         v = d.iv[0].first;
                     }
                 }
-                if (nsol == 0) { g_known = nullptr; g_unsat = true; return fallback("no combination satisfies the constraints"); }
+                if (nsol == 0) {
+                    if (const char* d = std::getenv("OCV_FAST_RANDOM_DEBUG")) {
+                        if (d[0] == '2') {   // (the group's variables, domains, and every constraint)
+                            for (size_t k = 0; k < mem.size(); k++)
+                                for (const auto& kv : cx.varIndex)
+                                    if (kv.second == mem[k])
+                                        VL_PRINTF("ocv_fast_random:   var %s domain %zu interval(s) from %llu\n",
+                                                  kv.first.c_str(), dom[mem[k]].iv.size(),
+                                                  (unsigned long long)dom[mem[k]].iv[0].first);
+                            for (const std::string& t : r.m_constraints) VL_PRINTF("ocv_fast_random:   %s\n", t.c_str());
+                        }
+                    }
+                    g_known = nullptr; g_unsat = true; return fallback("no combination satisfies the constraints");
+                }
                 for (size_t k = 0; k < mem.size(); k++) val[mem[k]] = pick[k];
                 ok = true;
             }
@@ -920,12 +1073,7 @@ bool ocv_fast_randomize(VlRandomizer& r, VlRNG& rng)
     if (found) {
         for (int i = 0; i < nv; i++) {
             if (frozen[i]) continue;
-            void* p = vars[i]->datap(0);
-            const int w = cx.width[i];
-            if (w <= 8) *static_cast<CData*>(p) = (CData)val[i];
-            else if (w <= 16) *static_cast<SData*>(p) = (SData)val[i];
-            else if (w <= 32) *static_cast<IData*>(p) = (IData)val[i];
-            else *static_cast<QData*>(p) = val[i];
+            storeVar(vars[i]->datap(0), vars[i]->width(), val[i]);
         }
         if (!g_quiet) g_fast++;
         return true;

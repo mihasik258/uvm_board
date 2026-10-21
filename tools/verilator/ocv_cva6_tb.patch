@@ -1,8 +1,65 @@
+diff --git a/include/verilated_cov.cpp b/include/verilated_cov.cpp
+index 1370c38ec..d7b771abe 100644
+--- a/include/verilated_cov.cpp
++++ b/include/verilated_cov.cpp
+@@ -451,6 +451,9 @@ void VerilatedCovContext::clearNonMatch(const char* matchp) VL_MT_SAFE {
+ }
+ void VerilatedCovContext::zero() VL_MT_SAFE { impp()->zero(); }
+ void VerilatedCovContext::write(const std::string& filename) VL_MT_SAFE {
++    std::vector<std::function<void()>> pre;
++    pre.swap(m_preWrite);
++    for (const auto& fn : pre) fn();
+     impp()->write(filename);
+ }
+ void VerilatedCovContext::_inserti(uint32_t* itemp) VL_MT_SAFE {
+diff --git a/include/verilated_cov.h b/include/verilated_cov.h
+index f47289f74..89b320d8a 100644
+--- a/include/verilated_cov.h
++++ b/include/verilated_cov.h
+@@ -29,9 +29,11 @@
+ 
+ #include "verilated.h"
+ 
++#include <functional>
+ #include <iostream>
+ #include <sstream>
+ #include <string>
++#include <vector>
+ 
+ class VerilatedCovImp;
+ 
+@@ -149,6 +151,7 @@ inline void VL_COV_TOGGLE_CHG_MT_W(const int width, std::atomic<uint32_t>* covp,
+ 
+ class VerilatedCovContext VL_NOT_FINAL : public VerilatedVirtualBase {
+     VL_UNCOPYABLE(VerilatedCovContext);
++    std::vector<std::function<void()>> m_preWrite;  // OCV: addPreWrite()
+ 
+ public:
+     // METHODS
+@@ -159,6 +162,9 @@ public:
+     /// Write all coverage data to a file
+     void write() VL_MT_SAFE { write(defaultFilename()); }
+     void write(const std::string& filename) VL_MT_SAFE;
++    /// OCV: run fn just before the next write() (items too many to register up front - a cross of
++    /// millions of tuples - register what they have then)
++    void addPreWrite(std::function<void()> fn) VL_MT_SAFE { m_preWrite.push_back(std::move(fn)); }
+     /// Clear coverage points (and call delete on all items)
+     void clear() VL_MT_SAFE;
+     /// Clear items not matching the provided string
 diff --git a/include/verilated_covergroup.cpp b/include/verilated_covergroup.cpp
-index f7cb3b6ae..b3c243f81 100644
+index f7cb3b6ae..62d9c3dfb 100644
 --- a/include/verilated_covergroup.cpp
 +++ b/include/verilated_covergroup.cpp
-@@ -42,6 +42,7 @@ void VlCoverpoint::init(const char* hier, uint32_t atLeast, uint32_t nBins) {
+@@ -23,6 +23,8 @@
+ 
+ #include "verilated_covergroup.h"
+ 
++#include <fstream>
++
+ #include "verilated.h"
+ 
+ // This file is compiled whenever covergroups are used, with or without
+@@ -42,6 +44,7 @@ void VlCoverpoint::init(const char* hier, uint32_t atLeast, uint32_t nBins) {
      m_atLeast = atLeast;
      m_total = nBins;
      m_counts.assign(nBins, 0);
@@ -10,7 +67,7 @@ index f7cb3b6ae..b3c243f81 100644
      m_crossIdx.assign(nBins, -1);
      m_crossToBin.clear();
  }
-@@ -83,6 +84,7 @@ std::string VlCoverpoint::binName(uint32_t i) const {
+@@ -83,6 +86,7 @@ std::string VlCoverpoint::binName(uint32_t i) const {
  #if VM_COVERAGE
  void VlCoverpoint::registerBins(VerilatedCovContext* covcontextp, const char* page) {
      for (uint32_t i = 0; i < binCount(); ++i) {
@@ -18,7 +75,7 @@ index f7cb3b6ae..b3c243f81 100644
          const VlCovNamer& nm = namerFor(i);
          const VlCovBinKind kind = binKind(i);
          const std::string binp = binName(i);
-@@ -134,6 +136,54 @@ void VlCoverCross::init(const char* hier, uint32_t dims, VlCoverpoint* const* cp
+@@ -134,6 +138,54 @@ void VlCoverCross::init(const char* hier, uint32_t dims, VlCoverpoint* const* cp
      m_flatCounts.assign(m_numAutoBins, 0);
  }
  
@@ -73,15 +130,33 @@ index f7cb3b6ae..b3c243f81 100644
  void VlCoverCross::iterateProduct(VlCoverpoint* const* cps, uint32_t dim, uint32_t baseIdx) {
      const uint32_t hits = cps[dim]->hitCount();
      const uint32_t* const list = cps[dim]->hitList();
-@@ -175,6 +225,7 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
+@@ -170,11 +222,25 @@ std::string VlCoverCross::binName(uint32_t flat) const {
+ 
+ #if VM_COVERAGE
+ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* page) {
++    // OCV: a cross of more tuples than this (core-v-verif's cg_sequential: 4 instruction groups,
++    // millions) registers at write time only the tuples that were hit - every tuple as an item is
++    // gigabytes. Its coverage (get_coverage) is the same; the file lacks the holes.
++    if (binCount() > (1U << 16)) {
++        const std::string pageStr = page;
++        covcontextp->addPreWrite([this, covcontextp, pageStr]() { registerTuples(covcontextp, pageStr.c_str(), true); });
++        return;
++    }
++    registerTuples(covcontextp, page, false);
++}
++
++void VlCoverCross::registerTuples(VerilatedCovContext* covcontextp, const char* page, bool hitOnly) {
+     // Register every auto cross bin (zero-count bins included), so the report
+     // shows the full Cartesian product of cross bins.  Names are built on the fly.
      const std::string lineStr = std::to_string(m_line);
      const std::string colStr = std::to_string(m_col);
      for (uint32_t flat = 0; flat < binCount(); ++flat) {
 +        if (!m_kind.empty() && m_kind[flat] != KIND_AUTO) continue;  // (OCV: below, or not a bin)
++        if (hitOnly && !m_flatCounts[flat]) continue;
          const std::string bin = binName(flat);  // "b1_x_b2_x_..."
          // cross_bins metadata: the same components joined by ',' (not read by the report)
          std::string crossBins;
-@@ -188,5 +239,13 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
+@@ -188,5 +254,77 @@ void VlCoverCross::registerBins(VerilatedCovContext* covcontextp, const char* pa
                          m_file, "lineno", lineStr.c_str(), "column", colStr.c_str(), "bin",
                          bin.c_str(), "cross", "1", "cross_bins", crossBins.c_str());
      }
@@ -95,11 +170,86 @@ index f7cb3b6ae..b3c243f81 100644
 +    }
  }
  #endif  // VM_COVERAGE
++
++//=============================================================================
++// VlCovergroupInst (OCV)
++
++namespace {
++std::vector<VlCovergroupInst*>& covergroupInsts() {
++    static std::vector<VlCovergroupInst*> s_insts;
++    return s_insts;
++}
++}  // namespace
++
++VlCovergroupInst::VlCovergroupInst() { covergroupInsts().push_back(this); }
++VlCovergroupInst::VlCovergroupInst(const VlCovergroupInst&) { covergroupInsts().push_back(this); }
++VlCovergroupInst::~VlCovergroupInst() {
++    std::vector<VlCovergroupInst*>& v = covergroupInsts();
++    for (size_t i = v.size(); i-- > 0;) {
++        if (v[i] == this) {
++            v.erase(v.begin() + static_cast<long>(i));
++            break;
++        }
++    }
++}
++
++double VlCovergroupInst::coverage() const {
++    double sum = 0.0;
++    double n = 0.0;
++    for (const auto& part : m_parts) {
++        double covered = 0.0;
++        double total = 0.0;
++        part.second->coverageParts(covered, total);
++        if (total != 0.0) {
++            sum += 100.0 * covered / total;
++            n += 1.0;
++        }
++    }
++    return n != 0.0 ? sum / n : 100.0;
++}
++
++void VlCovergroupInst::report(std::ostream& os, bool parts) {
++    char buf[64];
++    for (const VlCovergroupInst* const ip : covergroupInsts()) {
++        if (!ip->m_type) continue;
++        std::string name = ip->m_name ? ip->m_name() : std::string{};
++        if (name.empty()) name = "-";
++        VL_SNPRINTF(buf, sizeof(buf), "%.4f", ip->coverage());
++        os << ip->m_type << " " << name << " " << buf << "\n";
++        if (!parts) continue;
++        for (const auto& part : ip->m_parts) {
++            double covered = 0.0;
++            double total = 0.0;
++            part.second->coverageParts(covered, total);
++            VL_SNPRINTF(buf, sizeof(buf), "%.0f/%.0f %.4f", covered, total,
++                        total != 0.0 ? 100.0 * covered / total : 100.0);
++            os << "  " << part.first << " " << buf << "\n";
++        }
++    }
++}
++
++// the report into a file (OCV builds: +ocv_cov_report=<file>, uvm/vlt/ocv_main.cpp - a weak reference
++// there, as a build without covergroups has no verilated_covergroup.cpp)
++extern "C" void vl_covergroup_report(const char* filename, int parts) {
++    std::ofstream os{filename};
++    VlCovergroupInst::report(os, parts != 0);
++}
 diff --git a/include/verilated_covergroup.h b/include/verilated_covergroup.h
-index 9c1825daf..97ac2bdbd 100644
+index 9c1825daf..66648d11b 100644
 --- a/include/verilated_covergroup.h
 +++ b/include/verilated_covergroup.h
-@@ -109,6 +109,10 @@ protected:
+@@ -35,7 +35,10 @@
+ #include "verilated_cov_model.h"
+ 
+ #include <cstdint>
++#include <functional>
++#include <ostream>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ class VerilatedCovContext;
+@@ -109,6 +112,10 @@ protected:
      // [m_normal] inverse of m_crossIdx: cross idx -> full bin idx, appended in cross-index order
      std::vector<uint32_t> m_crossToBin;
      uint32_t m_hitCount = 0;  // entries valid in the hit list this sample
@@ -110,7 +260,7 @@ index 9c1825daf..97ac2bdbd 100644
  
  private:
      // PRIVATE METHODS
-@@ -131,6 +135,24 @@ public:
+@@ -131,6 +138,24 @@ public:
          addNamer(set, count, VlCovBinNaming::Array, name, file, line, col);
      }
      void registerBins(VerilatedCovContext* covcontextp, const char* page);
@@ -135,7 +285,7 @@ index 9c1825daf..97ac2bdbd 100644
  
      // ---- hot path (from generated sample()) ----
      // Clear the hit list at the start of each sample() for a cross-fed coverpoint.
-@@ -157,14 +179,17 @@ public:
+@@ -157,14 +182,17 @@ public:
          // Count Normal bins that reached option.at_least on demand, so the hot
          // path (incrementBin) stays a plain counter bump.
          uint32_t numCovered = 0;
@@ -154,7 +304,7 @@ index 9c1825daf..97ac2bdbd 100644
      }
  };
  
-@@ -224,12 +249,31 @@ class VlCoverCross final : public VlCoverpointIf {
+@@ -224,12 +252,31 @@ class VlCoverCross final : public VlCoverpointIf {
      std::vector<uint32_t> m_stride;  // [m_dims] Flat-index stride per dimension
      std::vector<uint32_t> m_flatCounts;  // [m_numAutoBins] Per-bin hit counts
      std::vector<VlCoverpoint*> m_cps;  // Feeding coverpoints (the only name source)
@@ -187,10 +337,11 @@ index 9c1825daf..97ac2bdbd 100644
  
  public:
      // CONSTRUCTORS
-@@ -240,6 +284,24 @@ public:
+@@ -240,6 +287,25 @@ public:
      void init(const char* hier, uint32_t dims, VlCoverpoint* const* cps, const char* file,
                int line, int col);
      void registerBins(VerilatedCovContext* covcontextp, const char* page);
++    void registerTuples(VerilatedCovContext* covcontextp, const char* page, bool hitOnly);
 +    // OCV: explicit cross bins. A named bin (addUserBin), then the tuples a select expression takes
 +    // (sel(tuple of coverpoint cross indexes)); finalize() once all are given
 +    uint32_t addUserBin(const char* name);
@@ -212,7 +363,7 @@ index 9c1825daf..97ac2bdbd 100644
  
      // ---- hot path (from generated sample(), after all coverpoints sampled) ----
      void sample(VlCoverpoint* const* cps);
-@@ -249,8 +311,15 @@ public:
+@@ -249,9 +315,44 @@ public:
      uint32_t binCount() const override { return m_numAutoBins; }
      std::string binName(uint32_t flat) const override;
      void coverageParts(double& covered, double& total) const override {
@@ -227,9 +378,38 @@ index 9c1825daf..97ac2bdbd 100644
 +        for (const uint32_t n : m_userSize) users += n != 0;
 +        covered = m_autoCovered + m_userCovered;
 +        total = m_autoTotal + users;
++    }
++};
++
++//=============================================================================
++// OCV: one covergroup instance, for the report of every instance (IEEE 1800-2023 19.11:
++// get_inst_coverage of each), which coverage.dat cannot give - it names bins by covergroup type.
++// A member of the generated covergroup class: it is listed while the instance lives.
++
++class VlCovergroupInst final {
++    const char* m_type = nullptr;  // covergroup name; null: not set up (a copy)
++    std::function<std::string()> m_name;  // option.name, read when reported
++    std::vector<std::pair<const char*, const VlCoverpointIf*>> m_parts;
++
++public:
++    VlCovergroupInst();
++    VlCovergroupInst(const VlCovergroupInst&);  // (a copy is not an instance of the report)
++    VlCovergroupInst& operator=(const VlCovergroupInst&) { return *this; }
++    ~VlCovergroupInst();
++    void init(const char* type, std::function<std::string()> name) {
++        m_type = type;
++        m_name = std::move(name);
      }
++    void add(const char* name, const VlCoverpointIf* partp) { m_parts.emplace_back(name, partp); }
++    // the instance's coverage as get_inst_coverage gives it: the average of its coverpoints and
++    // crosses (each weight 1); 100 when none has bins
++    double coverage() const;
++    // every live instance, in construction order: "<covergroup> <option.name> <percent>", then
++    // with parts, a line per coverpoint and cross "  <name> <covered>/<total> <percent>"
++    static void report(std::ostream& os, bool parts);
  };
  
+ #endif  // Guard
 diff --git a/include/verilated_types.h b/include/verilated_types.h
 index 76a24d01b..69e5eb579 100644
 --- a/include/verilated_types.h
@@ -370,7 +550,7 @@ index 46c72718f..34758a288 100644
      // Coverage-option assignment
      // @astgen op1 := valuep : AstNodeExpr
 diff --git a/src/V3Covergroup.cpp b/src/V3Covergroup.cpp
-index dc9e05697..5c27650d9 100644
+index dc9e05697..1ef289f23 100644
 --- a/src/V3Covergroup.cpp
 +++ b/src/V3Covergroup.cpp
 @@ -160,6 +160,10 @@ class FunctionalCoverageVisitor final : public VNVisitor {
@@ -380,7 +560,7 @@ index dc9e05697..5c27650d9 100644
 +    // OCV: per coverpoint, its Normal bins' values in cross-index order (cross bins' binsof ... intersect)
 +    std::map<std::string, std::vector<std::vector<std::pair<uint64_t, uint64_t>>>> m_cpNormVals;
 +    int m_crossSelNum = 0;  // unique names of select tables
-+    std::map<std::string, uint32_t> m_cpMaps;  // OCV: value maps made per coverpoint (addValueMap order)
++    std::map<const AstVar*, uint32_t> m_cpMaps;  // OCV: value maps made per coverpoint member (addValueMap order; names repeat across covergroups)
  
      VMemberMap m_memberMap;  // Member names cached for fast lookup
  
@@ -399,7 +579,7 @@ index dc9e05697..5c27650d9 100644
  
 +        // OCV: an enum coverpoint's automatic bins are its values (IEEE 1800-2023 19.5.3: N is the
 +        // enumeration's cardinality), not the bit patterns of its width
-+        if (const AstEnumDType* const enump = VN_CAST(exprp->dtypep()->skipRefp(), EnumDType)) {
++        if (const AstEnumDType* const enump = VN_CAST(exprp->dtypep()->skipRefToEnump(), EnumDType)) {
 +            int binCount = 0;
 +            for (const AstEnumItem* itemp = enump->itemsp(); itemp;
 +                 itemp = VN_AS(itemp->nextp(), EnumItem)) {
@@ -421,7 +601,35 @@ index dc9e05697..5c27650d9 100644
          UINFO(4, "  Creating implicit automatic bins for coverpoint: " << coverpointp->name());
  
          const uint64_t numTotalValues = (width >= 64) ? UINT64_MAX : (1ULL << width);
-@@ -914,6 +941,281 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -581,15 +608,25 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         // Create implicit automatic bins if no regular bins exist
+         createImplicitAutoBins(coverpointp, exprp, autoBinMax);
+ 
++        // OCV: the iff first, and the expression read only when it holds (19.5: iff (instr_prev != null)
++        // guards instr_prev.name - read regardless, a null dereference)
++        if (AstNodeExpr* const iffp = coverpointp->iffp()) {
++            coverpointp->iffp(
++                captureIffToTemp(iffp, "__VcpIff_" + sanitizeGeneratedName(coverpointp->name())));
++        }
+         AstVar* const valueVarp = new AstVar{
+             coverpointp->fileline(), VVarType::BLOCKTEMP,
+             "__VcpValue_" + sanitizeGeneratedName(coverpointp->name()), exprp->dtypep()};
+         valueVarp->funcLocal(true);
+         m_sampleFuncp->addStmtsp(valueVarp);
+         exprp->unlinkFrBack();
+-        m_sampleFuncp->addStmtsp(new AstAssign{
++        AstNode* valueAssignp = new AstAssign{
+             coverpointp->fileline(),
+-            new AstVarRef{coverpointp->fileline(), valueVarp, VAccess::WRITE}, exprp});
++            new AstVarRef{coverpointp->fileline(), valueVarp, VAccess::WRITE}, exprp};
++        if (coverpointp->iffp())
++            valueAssignp = new AstIf{coverpointp->fileline(), coverpointp->iffp()->cloneTree(false),
++                                     valueAssignp};
++        m_sampleFuncp->addStmtsp(valueAssignp);
+         coverpointp->exprp(new AstVarRef{coverpointp->fileline(), valueVarp, VAccess::READ});
+         exprp = coverpointp->exprp();
+ 
+@@ -914,16 +951,288 @@ class FunctionalCoverageVisitor final : public VNVisitor {
          m_sampleFuncp->addStmtsp(new AstIf{fl, guardedp, actionp, nullptr});
      }
  
@@ -703,7 +911,18 @@ index dc9e05697..5c27650d9 100644
      // Route a coverpoint through a VlCoverpoint member: emit the member, its sample()
      // increments, the constructor configuration (init + namers), and registration.
      void generateCoverpoint(AstCoverpoint* coverpointp, AstNodeExpr* exprp, int atLeastValue) {
-@@ -947,6 +1249,46 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         FileLine* const fl = coverpointp->fileline();
+         UINFO(4, "  Generating VlCoverpoint member: " << coverpointp->name());
+ 
+-        if (AstNodeExpr* const iffp = coverpointp->iffp()) {
+-            coverpointp->iffp(
+-                captureIffToTemp(iffp, "__VcpIff_" + sanitizeGeneratedName(coverpointp->name())));
+-        }
++        // (the iff is already a temporary: captured before the value, above)
+ 
+         // Size the hit list to the gen-time max bin overlap (1 unless cross-fed with
+         // overlapping ranges), so no cross hit is ever dropped and storage is minimal.
+@@ -947,6 +1256,46 @@ class FunctionalCoverageVisitor final : public VNVisitor {
              m_sampleFuncp->addStmtsp(clrp);
          }
  
@@ -750,7 +969,7 @@ index dc9e05697..5c27650d9 100644
          // Walk bins (non-default, then default), assigning sequential indices that match the
          // namer append order; emit sample increments and collect namer statements.
          std::vector<AstCStmt*> namerStmts;
-@@ -966,6 +1308,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -966,6 +1315,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
                  // matching is generated as a state machine, with the hit routed to this bin's
                  // runtime slot.
                  namerStmts.push_back(makeNamer(cpVarp, cbinp, -1));
@@ -758,7 +977,7 @@ index dc9e05697..5c27650d9 100644
                  const ConvBinTarget tgt{cpVarp, idx, cbinp->binsType().binIsNormal()};
                  for (AstNode* sp = cbinp->transp(); sp; sp = sp->nextp())
                      generateSingleTransitionCode(coverpointp, cbinp, exprp, tgt,
-@@ -973,24 +1316,208 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -973,24 +1323,208 @@ class FunctionalCoverageVisitor final : public VNVisitor {
                  ++idx;
                  continue;
              }
@@ -829,7 +1048,7 @@ index dc9e05697..5c27650d9 100644
 +                        AstCStmt* const hitp = new AstCStmt{bfl};
 +                        hitp->add("{ const int32_t __Vb = ");
 +                        hitp->add(memberRef(bfl, cpVarp));
-+                        hitp->add(".mapped(" + std::to_string(m_cpMaps[coverpointp->name()]++)
++                        hitp->add(".mapped(" + std::to_string(m_cpMaps[cpVarp]++)
 +                                  + "u, (static_cast<QData>(");
 +                        hitp->add(exprp->cloneTree(false));
 +                        hitp->add(")" + cleanMask(exprp->width()) + ")); if (__Vb >= 0) ");
@@ -971,7 +1190,7 @@ index dc9e05697..5c27650d9 100644
                  ++idx;
              }
          }
-@@ -1024,6 +1551,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1024,6 +1558,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
                     + std::to_string(idx) + ");");
          m_constructorp->addStmtsp(initp);
          for (AstCStmt* const ns : namerStmts) m_constructorp->addStmtsp(ns);
@@ -979,7 +1198,7 @@ index dc9e05697..5c27650d9 100644
          if (v3Global.opt.coverage()) {
              const std::string page
                  = VIdProtect::protectIf("v_covergroup/" + m_covergroupp->name(), prot);
-@@ -1213,6 +1741,26 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1213,6 +1748,26 @@ class FunctionalCoverageVisitor final : public VNVisitor {
      // Build a one-sided comparison for an open-ended bin range whose other bound is '$'.
      // '$' denotes the coverpoint domain extreme, so {[lo:$]} == (expr >= lo) and
      // {[$:hi]} == (expr <= hi).
@@ -1006,7 +1225,7 @@ index dc9e05697..5c27650d9 100644
      AstNodeExpr* makeOpenRangeCondition(FileLine* fl, AstNodeExpr* exprp, AstConst* boundp,
                                          bool isLowerBound) {
          AstConst* const widep = widenConst(fl, boundp, exprp->widthMin());
-@@ -1242,9 +1790,41 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1242,9 +1797,41 @@ class FunctionalCoverageVisitor final : public VNVisitor {
          for (AstNode* valp = itemp->valuesp(); valp; valp = valp->nextp()) {
              AstNodeExpr* singleCondp = nullptr;
  
@@ -1051,7 +1270,7 @@ index dc9e05697..5c27650d9 100644
  
              if (condp) {
                  condp = new AstOr{itemp->fileline(), condp, singleCondp};
-@@ -1333,9 +1913,11 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1333,9 +1920,11 @@ class FunctionalCoverageVisitor final : public VNVisitor {
          // Resolve and unlink the coverpoint refs, in dimension order.  Every ref resolves to a
          // known coverpoint (a cross with an unresolvable item was dropped earlier).
          std::vector<AstVar*> cpVars;
@@ -1063,7 +1282,7 @@ index dc9e05697..5c27650d9 100644
              const auto it = m_cpVarMap.find(refp->name());
              UASSERT_OBJ(it != m_cpVarMap.end(), crossp, "Cross references an unknown coverpoint");
              cpVars.push_back(it->second);
-@@ -1364,6 +1946,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1364,6 +1953,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
                + VIdProtect::protectIf(fl->filename(), prot) + "\", " + std::to_string(fl->lineno())
                + ", " + std::to_string(fl->firstColumn()) + ");";
          m_constructorp->addStmtsp(makeCrossCpsCall(fl, cpVars, cxVarp, initCall));
@@ -1071,7 +1290,7 @@ index dc9e05697..5c27650d9 100644
          if (v3Global.opt.coverage()) {
              const std::string page
                  = VIdProtect::protectIf("v_covergroup/" + m_covergroupp->name(), prot);
-@@ -1383,6 +1966,129 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1383,6 +1973,129 @@ class FunctionalCoverageVisitor final : public VNVisitor {
          }
      }
  
@@ -1201,7 +1420,7 @@ index dc9e05697..5c27650d9 100644
      void generateCrossCode(AstCoverCross* crossp) {
          UINFO(4, "  Generating code for cross: " << crossp->name());
  
-@@ -1451,10 +2157,16 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1451,10 +2164,16 @@ class FunctionalCoverageVisitor final : public VNVisitor {
                      if (loUnbounded && hiUnbounded) {
                          rangeCondp = new AstConst{irp->fileline(), AstConst::BitTrue{}};
                      } else if (!boundp) {
@@ -1222,7 +1441,7 @@ index dc9e05697..5c27650d9 100644
                      } else if (boundp->num().isFourState()) {
                          irp->v3error("Four-state (x/z) value in bin range bound; "
                                       "range bounds must be two-state constants");
-@@ -1465,10 +2177,18 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1465,10 +2184,18 @@ class FunctionalCoverageVisitor final : public VNVisitor {
                                                              /*isLowerBound=*/hiUnbounded);
                      }
                  } else if (!minConstp || !maxConstp) {
@@ -1245,7 +1464,95 @@ index dc9e05697..5c27650d9 100644
                  } else if (minConstp->num().isFourState() || maxConstp->num().isFourState()) {
                      irp->v3error("Four-state (x/z) value in bin range bound; "
                                   "range bounds must be two-state constants");
-@@ -1578,7 +2298,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1480,7 +2207,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                         rangeCondp = buildWildcardCondition(binp, exprp, minConstp);
+                     } else {
+                         rangeCondp = new AstEq{binp->fileline(), exprp->cloneTree(false),
+-                                               minExprp->cloneTree(false)};
++                                               widenConst(binp->fileline(), minConstp, exprp->width())};
+                     }
+                 } else {
+                     rangeCondp = makeRangeCondition(irp->fileline(), exprp, minExprp, maxExprp);
+@@ -1492,8 +2219,9 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+                     // TODO: A 4-state bin value (e.g. bins b = {2'b0x}) must match with ===
+                     // (AstEqCase) per IEEE 1800-2023 19.5.4. == is equivalent under 2-state sim
+                     // (x/z collapse to 0); switch to AstEqCase when 4-state sim support lands.
++                    // (OCV: the value widened to the coverpoint's width - a wide one, CVA6's 128-bit boot_addr)
+                     rangeCondp = new AstEq{binp->fileline(), exprp->cloneTree(false),
+-                                           constp->cloneTree(false)};
++                                           widenConst(binp->fileline(), constp, exprp->width())};
+                 }
+             } else {
+                 currRangep->v3error(
+@@ -1558,6 +2286,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+ 
+         // Generate code for get_inst_coverage() (an empty covergroup returns 100%).
+         generateCoverageMethodBody(getInstCoveragep);
++        generateInstanceRegistration();
+ 
+         // Generate code for get_coverage() (type-level)
+         // NOTE: Full type-level coverage requires instance tracking infrastructure
+@@ -1573,12 +2302,67 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+         UINFO(4, "    Added placeholder get_coverage() (returns 0.0)");
+     }
+ 
++    // OCV: a VlCovergroupInst member: the instance, its option.name (read when reported) and its
++    // coverpoints and crosses, in the report of every covergroup instance (+ocv_cov_report=,
++    // uvm/vlt/ocv_main.cpp) - coverage.dat names bins by covergroup type, not by instance
++    void generateInstanceRegistration() {
++        if (!m_constructorp) return;
++        FileLine* const fl = m_covergroupp->fileline();
++        static AstCDType* s_instTypep = nullptr;
++        if (!s_instTypep) {
++            s_instTypep = new AstCDType{fl, "VlCovergroupInst"};
++            v3Global.rootp()->typeTablep()->addTypesp(s_instTypep);
++        }
++        AstVar* const instVarp = new AstVar{fl, VVarType::MEMBER, "__Vcginst", s_instTypep};
++        instVarp->isStatic(false);
++        m_covergroupp->addMembersp(instVarp);
++        AstCStmt* const cs = new AstCStmt{fl};
++        cs->add(memberRef(fl, instVarp));
++        std::string type = m_covergroupp->prettyName();
++        if (type.rfind("__vlAnonCG_", 0) == 0) type = type.substr(std::string{"__vlAnonCG_"}.size());
++        cs->add(".init(\"" + type + "\", [this]() -> std::string { return ");
++        AstNodeExpr* namep = nullptr;
++        if (AstVar* const optVarp = VN_CAST(m_memberMap.findMember(m_covergroupp, "option"), Var)) {
++            if (AstNodeUOrStructDType* const sdtp
++                = VN_CAST(optVarp->dtypep()->skipRefp(), NodeUOrStructDType)) {
++                for (AstMemberDType* mp = sdtp->membersp(); mp; mp = VN_AS(mp->nextp(), MemberDType)) {
++                    if (mp->name() != "name") continue;
++                    AstStructSel* const selp = new AstStructSel{fl, memberRef(fl, optVarp), "name"};
++                    selp->dtypeFrom(mp);
++                    namep = selp;
++                }
++            }
++        }
++        if (namep) {
++            cs->add(namep);
++        } else {
++            cs->add("std::string{}");
++        }
++        cs->add("; });");
++        for (AstVar* const varp : m_cpVars) {
++            cs->add(" ");
++            cs->add(memberRef(fl, instVarp));
++            cs->add(".add(\"" + varp->name().substr(std::string{"__Vcp_"}.size()) + "\", &");
++            cs->add(memberRef(fl, varp));
++            cs->add(");");
++        }
++        for (AstVar* const varp : m_crossVars) {
++            const std::string& n = varp->name();
++            cs->add(" ");
++            cs->add(memberRef(fl, instVarp));
++            cs->add(".add(\"" + (n.rfind("__Vcx_", 0) == 0 ? n.substr(6) : n) + "\", &");
++            cs->add(memberRef(fl, varp));
++            cs->add(");");
++        }
++        m_constructorp->addStmtsp(cs);
++    }
++
+     void generateCoverageMethodBody(AstFunc* funcp) {
+         FileLine* const fl = funcp->fileline();
          AstVar* const returnVarp = VN_AS(funcp->fvarp(), Var);
  
          // Every coverpoint and cross holds its bins in the runtime (VlCoverpoint/VlCoverCross).
@@ -1254,7 +1561,7 @@ index dc9e05697..5c27650d9 100644
          // illegal, and default are excluded per LRM 19.5).  A covergroup with no coverpoints
          // (and hence no crosses) has nothing to cover and reports 100%.
          if (m_cpVars.empty()) {
-@@ -1593,7 +2313,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1593,7 +2377,7 @@ class FunctionalCoverageVisitor final : public VNVisitor {
              AstCStmt* const cs = new AstCStmt{fl};
              cs->add("{ double __Vc = 0.0; double __Vt = 0.0; ");
              cs->add(memberRef(fl, cpVarp));
@@ -1263,7 +1570,7 @@ index dc9e05697..5c27650d9 100644
              funcp->addStmtsp(cs);
          }
          // Crosses contribute the same covered/total ratio as their per-tuple bins.
-@@ -1601,12 +2321,14 @@ class FunctionalCoverageVisitor final : public VNVisitor {
+@@ -1601,12 +2385,14 @@ class FunctionalCoverageVisitor final : public VNVisitor {
              AstCStmt* const cs = new AstCStmt{fl};
              cs->add("{ double __Vc = 0.0; double __Vt = 0.0; ");
              cs->add(memberRef(fl, cxVarp));
@@ -1281,10 +1588,37 @@ index dc9e05697..5c27650d9 100644
      }
  
 diff --git a/src/V3LinkParse.cpp b/src/V3LinkParse.cpp
-index 67290dd7e..74c8f5f22 100644
+index 67290dd7e..ef3230083 100644
 --- a/src/V3LinkParse.cpp
 +++ b/src/V3LinkParse.cpp
-@@ -1412,6 +1412,28 @@ class LinkParseVisitor final : public VNVisitor {
+@@ -1360,6 +1360,26 @@ class LinkParseVisitor final : public VNVisitor {
+         // Add all boilerplate covergroup methods (reads argsp/sampleArgsp from nodep)
+         createCovergroupMethods(cgClassp, newFuncp, nodep->argsp(), nodep->sampleArgsp());
+ 
++        // OCV: a covergroup's option.name/comment/weight/goal/per_instance = <expr> (19.7) sets the
++        // instance's option member at construction (cg.option.name reads it; the per-instance report
++        // names instances by it - isacov: option.name = name, 132 instances of 53 covergroups)
++        for (AstNode* stmtp = newFuncp->stmtsp(); stmtp; stmtp = stmtp->nextp()) {
++            AstCgOptionAssign* const optp = VN_CAST(stmtp, CgOptionAssign);
++            if (!optp || optp->typeOption()) continue;
++            const VCoverOptionType t = optp->optType();
++            if (!(t == VCoverOptionType::NAME || t == VCoverOptionType::COMMENT
++                  || t == VCoverOptionType::WEIGHT || t == VCoverOptionType::GOAL
++                  || t == VCoverOptionType::PER_INSTANCE))
++                continue;
++            FileLine* const fl = optp->fileline();
++            AstNodeExpr* const lhsp = new AstDot{
++                fl, false,
++                new AstDot{fl, false, new AstParseRef{fl, "this"}, new AstParseRef{fl, "option"}},
++                new AstParseRef{fl, optp->name()}};
++            optp->addNextHere(new AstAssign{fl, lhsp, optp->valuep()->cloneTree(false)});
++            stmtp = stmtp->nextp();  // (past the assignment)
++        }
++
+         // Replace AstCovergroup with AstClass and process the new class normally.
+         // Reset the unnamed-coverpoint counter so synthesized names are stable and
+         // independent of unrelated covergroups elsewhere in the file.
+@@ -1412,6 +1432,28 @@ class LinkParseVisitor final : public VNVisitor {
                  VL_DO_DANGLING(optp->deleteTree(), optp);
              }
          }
@@ -1313,7 +1647,7 @@ index 67290dd7e..74c8f5f22 100644
          iterateChildren(nodep);
      }
  
-@@ -1421,9 +1443,14 @@ class LinkParseVisitor final : public VNVisitor {
+@@ -1421,9 +1463,14 @@ class LinkParseVisitor final : public VNVisitor {
          // typed optionsp slot.  The grammar produces AstCgOptionAssign nodes for
          // option.* items; convert them to AstCoverOption exactly as visit(AstCoverpoint*)
          // does.  Other items (functions, unsupported bin selectors) are discarded.
@@ -1328,7 +1662,7 @@ index 67290dd7e..74c8f5f22 100644
              AstCgOptionAssign* const optp = VN_AS(itemp, CgOptionAssign);
              const VCoverOptionType optType = optp->optType();
              optp->v3warn(COVERIGN,
-@@ -1434,6 +1461,7 @@ class LinkParseVisitor final : public VNVisitor {
+@@ -1434,6 +1481,7 @@ class LinkParseVisitor final : public VNVisitor {
                  new AstCoverOption{optp->fileline(), optType, optp->valuep()->cloneTree(false)});
              VL_DO_DANGLING(optp->deleteTree(), optp);
          }
@@ -1419,8 +1753,90 @@ index 3515d25cd..0e5b314d9 100644
              }
          } else if (AstParamTypeDType* const modvarp = pinp->modPTypep()) {
              // Handle DOT with ParseRef RHS (e.g., p_class#(8)::p_type)
+diff --git a/src/V3Randomize.cpp b/src/V3Randomize.cpp
+index 15ddf52e9..d1f82a2ad 100644
+--- a/src/V3Randomize.cpp
++++ b/src/V3Randomize.cpp
+@@ -2713,8 +2713,12 @@ class ConstraintExprVisitor final : public VNVisitor {
+         if (nodep->method() == VCMethod::ARRAY_INSIDE) {
+             const bool randArr = nodep->fromp()->user1();
+ 
++            // (OCV: an associative array's index has its key's type)
++            const AstAssocArrayDType* const assocp
++                = VN_CAST(nodep->fromp()->dtypep()->skipRefp(), AssocArrayDType);
+             AstVar* const newVarp
+-                = new AstVar{fl, VVarType::BLOCKTEMP, "__Vinside", nodep->findIntDType()};
++                = new AstVar{fl, VVarType::BLOCKTEMP, "__Vinside",
++                             assocp ? assocp->keyDTypep() : nodep->findIntDType()};
+             AstNodeExpr* const idxRefp = new AstVarRef{nodep->fileline(), newVarp, VAccess::READ};
+             AstForeachHeader* const headerp
+                 = new AstForeachHeader{fl, nodep->fromp()->cloneTreePure(false), newVarp};
+@@ -3153,6 +3157,54 @@ class ConstraintExprVisitor final : public VNVisitor {
+         return hoistListp;
+     }
+ 
++    // OCV: a soft constraint inside an if / else (IEEE 1800-2023 18.5.13: it applies when the condition
++    // holds) - lowering folds an if's branches into one expression, which made it hard. Each one becomes a
++    // soft constraint of its own, 'accumulated_cond -> expr', and leaves 1'b1 in the branch (core-v-verif:
++    // if (pure_mode_agent) { soft ordering_read_mode == FIFO; } else { soft ... == RANDOM; }).
++    AstNode* extractConditionalSofts(AstNode* itemsp, AstNodeExpr* outerCondp) {
++        AstNode* hoistListp = nullptr;
++        for (AstNode *stmtp = itemsp, *nextp; stmtp; stmtp = nextp) {
++            nextp = stmtp->nextp();
++            if (AstConstraintIf* const ifp = VN_CAST(stmtp, ConstraintIf)) {
++                FileLine* const fl = ifp->fileline();
++                AstNodeExpr* const thenCondp
++                    = outerCondp ? static_cast<AstNodeExpr*>(
++                                       new AstLogAnd{fl, outerCondp->cloneTreePure(false),
++                                                     ifp->condp()->cloneTreePure(false)})
++                                 : ifp->condp()->cloneTreePure(false);
++                if (AstNode* const hp = extractConditionalSofts(ifp->thensp(), thenCondp))
++                    hoistListp = hoistListp ? AstNode::addNext(hoistListp, hp) : hp;
++                VL_DO_DANGLING(thenCondp->deleteTree(), thenCondp);
++                if (ifp->elsesp()) {
++                    AstNodeExpr* const notInnerp
++                        = new AstLogNot{fl, ifp->condp()->cloneTreePure(false)};
++                    AstNodeExpr* const elseCondp
++                        = outerCondp ? static_cast<AstNodeExpr*>(new AstLogAnd{
++                                           fl, outerCondp->cloneTreePure(false), notInnerp})
++                                     : notInnerp;
++                    if (AstNode* const hp = extractConditionalSofts(ifp->elsesp(), elseCondp))
++                        hoistListp = hoistListp ? AstNode::addNext(hoistListp, hp) : hp;
++                    VL_DO_DANGLING(elseCondp->deleteTree(), elseCondp);
++                }
++            } else if (AstConstraintExpr* const exprp = VN_CAST(stmtp, ConstraintExpr)) {
++                if (exprp->isSoft() && outerCondp && !exprp->isDisableSoft()) {
++                    FileLine* const fl = exprp->fileline();
++                    AstNodeExpr* const implp
++                        = new AstLogIf{fl, outerCondp->cloneTreePure(false), exprp->exprp()->unlinkFrBack()};
++                    implp->dtypeSetBit();
++                    implp->user1(true);  // result-dependent, as the if's own lowering marks it
++                    AstConstraintExpr* const softp = new AstConstraintExpr{fl, implp};
++                    softp->isSoft(true);
++                    hoistListp = hoistListp ? AstNode::addNext(hoistListp, static_cast<AstNode*>(softp))
++                                            : static_cast<AstNode*>(softp);
++                    exprp->replaceWith(new AstConstraintExpr{fl, new AstConst{fl, AstConst::BitTrue{}}});
++                    VL_DO_DANGLING(exprp->deleteTree(), exprp);
++                }
++            }
++        }
++        return hoistListp;
++    }
++
+ public:
+     // CONSTRUCTORS
+     explicit ConstraintExprVisitor(AstClass* classp, VMemberMap& memberMap, AstNode* nodep,
+@@ -3176,6 +3228,8 @@ public:
+             = nodep ? extractConditionalDisableSofts(nodep, nullptr) : nullptr) {
+             nodep->addNext(hoistListp);
+         }
++        if (AstNode* const softListp = nodep ? extractConditionalSofts(nodep, nullptr) : nullptr)
++            nodep->addNext(softListp);  // (OCV)
+         iterateAndNextNull(nodep);
+     }
+ };
 diff --git a/src/V3Task.cpp b/src/V3Task.cpp
-index 7ef30f56a..36876890e 100644
+index 7ef30f56a..bd075388b 100644
 --- a/src/V3Task.cpp
 +++ b/src/V3Task.cpp
 @@ -1166,12 +1166,41 @@ class TaskVisitor final : public VNVisitor {
@@ -1483,7 +1899,7 @@ index 7ef30f56a..36876890e 100644
 +                    const string bufName = portp->name() + "__Vdynbuf";
 +                    cfuncp->addStmtsp(new AstCStmt{
 +                        portp->fileline(), "for (size_t __Vi = 0; __Vi < " + bufName + ".size(); ++__Vi) "
-+                                               + portp->name() + ".at(__Vi) = " + bufName + "[__Vi];\n"});
++                                               + portp->name() + ".atWrite(__Vi) = " + bufName + "[__Vi];\n"});
 +                }
                  if (portp->isIO() && (portp->isWritable() || portp->isFuncReturn())
                      && !portp->isDpiOpenArray()) {
