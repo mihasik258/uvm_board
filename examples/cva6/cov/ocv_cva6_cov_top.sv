@@ -6,6 +6,11 @@
 //   +OCV_RVFI=<file>     the records
 //   +OCV_FIRST=<file>    also the records that hit a bin for the first time: "<record> <new bins>" (each record
 //                        sampled before the next: slower) - how few records a filter has to keep
+//   +OCV_CHECK=<file>    what isacov's monitor and coverage model made of each record (each record sampled before
+//                        the next: slower): a line "cfg <flag>=<v>..." (the flags of isacov's sample() branches),
+//                        then per record "<history moved> <raw_hazard> <csr_hazard>" and the value of every
+//                        coverpoint expression and condition reading only the transaction (ocv_cov_fields.svh,
+//                        tools/cov/cov_fields.py --sv) - the filter's fields checked by tools/cov/cov_check.py
 `include "uvm_macros.svh"
 module ocv_cva6_cov_top;
     import uvm_pkg::*;
@@ -20,6 +25,19 @@ module ocv_cva6_cov_top;
     import "DPI-C" function int ocv_cov_next(output longint unsigned f[16]);
     import "DPI-C" function longint unsigned vl_covergroup_first_hits();
     import "DPI-C" function void vl_covergroup_enable(int on);
+`include "ocv_cov_fields.svh"
+
+    // the monitor's last transaction (check mode)
+    class ocv_cov_tap extends uvm_subscriber#(uvma_isacov_mon_trn_c);
+        `uvm_component_utils(ocv_cov_tap)
+        uvma_isacov_mon_trn_c last;
+        function new(string name = "ocv_cov_tap", uvm_component parent = null);
+            super.new(name, parent);
+        endfunction
+        function void write(uvma_isacov_mon_trn_c t);
+            last = t;
+        endfunction
+    endclass
 
     class ocv_cva6_cov_test extends uvm_test;
         `uvm_component_utils(ocv_cva6_cov_test)
@@ -27,6 +45,7 @@ module ocv_cva6_cov_top;
         uvme_cva6_cntxt_c                cntxt;
         uvma_isacov_agent_c#(ILEN, XLEN) isacov_agent;
         uvme_cva6_cov_model_c            cov_model;
+        ocv_cov_tap                      tap;
         longint unsigned                 records;
 
         function new(string name = "ocv_cva6_cov_test", uvm_component parent = null);
@@ -50,6 +69,7 @@ module ocv_cva6_cov_top;
             uvm_config_db#(uvme_cva6_cntxt_c)::set(this, "cov_model", "cntxt", cntxt);
             isacov_agent = uvma_isacov_agent_c#(ILEN, XLEN)::type_id::create("isacov_agent", this);
             cov_model = uvme_cva6_cov_model_c::type_id::create("cov_model", this);
+            tap = ocv_cov_tap::type_id::create("tap", this);
         endfunction
 
         function void connect_phase(uvm_phase phase);
@@ -61,6 +81,7 @@ module ocv_cva6_cov_top;
             end
             if (cfg.interrupt_cfg.cov_model_enabled)
                 isacov_agent.monitor.ap.connect(cov_model.interrupt_covg.mon_trn_fifo.analysis_export);
+            isacov_agent.monitor.ap.connect(tap.analysis_export);
         endfunction
 
         function uvma_rvfi_csr_seq_item_c#(XLEN) csr(longint unsigned v);
@@ -72,12 +93,17 @@ module ocv_cva6_cov_top;
         task run_phase(uvm_phase phase);
             longint unsigned f[16], hits, h;
             longint unsigned contexts = 0;
-            string file, first;
-            int fd = 0;
+            string file, first, check;
+            int fd = 0, fc = 0;
+            uvma_isacov_instr_c p;
             phase.raise_objection(this);
             if (!$value$plusargs("OCV_RVFI=%s", file)) `uvm_fatal("OCV", "+OCV_RVFI=<records> missing")
             if (ocv_cov_open(file) != 0) `uvm_fatal("OCV", {"cannot open ", file})
             if ($value$plusargs("OCV_FIRST=%s", first)) fd = $fopen(first, "w");
+            if ($value$plusargs("OCV_CHECK=%s", check)) begin
+                fc = $fopen(check, "w");
+                $fwrite(fc, "%s\n", ocv_cov_cfg(cfg.isacov_cfg.core_cfg));
+            end
             hits = vl_covergroup_first_hits();
             while (ocv_cov_next(f)) begin
                 uvma_rvfi_instr_seq_item_c#(ILEN, XLEN) it = new("rvfi");
@@ -99,8 +125,15 @@ module ocv_cva6_cov_top;
                     contexts++;
                     continue;
                 end
+                p = isacov_agent.cov_model.instr_prev;
                 isacov_agent.monitor.write_rvfi_instr(it);
                 records++;
+                if (fc != 0) begin
+                    #1;                           // isacov's model has taken this record
+                    $fwrite(fc, "%0d %0d %0d%s\n", isacov_agent.cov_model.instr_prev == tap.last.instr,
+                            isacov_agent.cov_model.is_raw_hazard(tap.last.instr, p),
+                            isacov_agent.cov_model.is_csr_hazard(tap.last.instr, p), ocv_cov_fields(tap.last.instr));
+                end
                 if (fd != 0) begin
                     #1;                           // every model has sampled this record
                     h = vl_covergroup_first_hits();
@@ -110,6 +143,7 @@ module ocv_cva6_cov_top;
             end
             #10;
             if (fd != 0) $fclose(fd);
+            if (fc != 0) $fclose(fc);
             `uvm_info("OCV", $sformatf("%0d RVFI records sampled, %0d context records", records, contexts), UVM_LOW)
             phase.drop_objection(this);
         endtask

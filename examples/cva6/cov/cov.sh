@@ -7,6 +7,10 @@
 #   examples/cva6/cov/cov.sh run <records> [name]   the coverage of the records: $OUT/<name>.rep (every
 #                                                   covergroup instance and its coverpoints/crosses, as
 #                                                   get_inst_coverage gives them) and $OUT/<name>.dat
+#   examples/cva6/cov/cov.sh check <records> [name] also $OUT/<name>.chk: what isacov's monitor made of each
+#                                                   record (+OCV_CHECK=, tools/cov/cov_check.py; slower)
+#   examples/cva6/cov/cov.sh table                  the model's record filter table: $OUT/filter.tab (--model-opt
+#                                                   rvfi_filter=: only the records with something new, docs/COVERAGE.md)
 #   records: hw/cpu/run.sh examples/cva6/cva6.bind bench -- --model-opt rvfi_out=<file> ...
 #
 # Sources: CVA6 (ext/cva6) and CORE_V_VERIF (default ext/core-v-verif), unmodified; the harness
@@ -48,6 +52,7 @@ case ${1:-} in
         # the packages of the CVA6 environment, in core-v-verif's file lists (cv32a60x)
         cat > "$OUT/files.f" <<EOT
 +incdir+$OCV/uvm/vlt
++incdir+$OUT
 +incdir+$(dirname "$UVM")
 +incdir+$CORE
 $CORE/config_pkg.sv
@@ -79,6 +84,22 @@ $CVA6_CORET_DIR/uvma_cva6pkg_utils_pkg.sv
 $HERE/ocv_cva6_cov_top.sv
 EOT
         D=$OUT/dasm
+        # Spike's instruction-name table as its disassembler searches it (the model's record filter names
+        # instructions with it: tools/cov/spike_table.cpp)
+        g++ -O2 -std=c++17 -w -I"$D" -I"$VI/vltstd" -I"$S/riscv" -I"$S/softfloat" -I"$S" -I"$S/fesvr" -I"$S/disasm" \
+            "$OCV/tools/cov/spike_table.cpp" "$HERE/ocv_cva6_cov_stubs.cpp" "$D/dpi_dasm.o" "$D/disasm.o" "$D/regnames.o" \
+            "$D/isa_parser.o" -o "$OUT/spike_table"
+        "$OUT/spike_table" > "$OUT/spike.tab" 2> /dev/null
+        # what each coverpoint reads, which records move isacov's history (fields.json: the record filter's
+        # table) and the check mode's function (ocv_cov_fields.svh): tools/cov/cov_fields.py over the covergroup
+        # sources after the preprocessor, with isacov's macros
+        mkdir -p "$OUT/pp"
+        for f in "$DV_UVMA_ISACOV_PATH/cov/uvma_isacov_cov_model.sv" "$CVA6_UVME_PATH"/cov/*covg.sv; do
+            cat "$DV_UVMA_ISACOV_PATH/uvma_isacov_macros.sv" "$f" > "$OUT/pp/in_$(basename "$f")"
+            "$V" -E -P "$OUT/pp/in_$(basename "$f")" > "$OUT/pp/$(basename "$f")"
+        done
+        python3 "$OCV/tools/cov/cov_fields.py" "$OUT"/pp/*covg.sv "$OUT/pp/uvma_isacov_cov_model.sv" \
+            --json "$OUT/fields.json" --sv "$OUT/ocv_cov_fields.svh" > "$OUT/fields.log"
         # OCV's sampling profiler, idle unless OCV_PROF=<file> (tools/prof_report.py)
         cc -O2 -fno-pie -c "$OCV/uvm/vlt/ocv_prof.c" -o "$OUT/ocv_prof.o"
         "$V" --cc --exe --build --timing --coverage-user -j "${OCV_MAKE_J:-6}" -Wno-fatal -Wno-lint -Wno-style \
@@ -88,16 +109,26 @@ EOT
             -LDFLAGS "$D/dpi_dasm.o $D/disasm.o $D/regnames.o $D/isa_parser.o $OUT/ocv_prof.o -no-pie" > "$OUT/build.log" 2>&1 \
             || { grep -m20 '%Error\|error:' "$OUT/build.log"; exit 1; }
         echo "build: $OUT/obj/Vcov" ;;
-    run)
-        [ $# -ge 2 ] || { sed -n '2,12p' "$0"; exit 1; }
+    run|check)
+        [ $# -ge 2 ] || { sed -n '2,16p' "$0"; exit 1; }
         REC=$(realpath "$2"); NAME=${3:-$(basename "${REC%.*}")}
+        CHK=(); [ "$1" = check ] && CHK=(+OCV_CHECK="$OUT/$NAME.chk")
         rc=0
         (cd "$OUT" && ./obj/Vcov +OCV_RVFI="$REC" +UVM_NO_RELNOTES +ocv_cov_dat="$OUT/$NAME.dat" \
-            +ocv_cov_report="$OUT/$NAME.rep") > "$OUT/$NAME.log" 2>&1 || rc=$?
+            +ocv_cov_report="$OUT/$NAME.rep" "${CHK[@]}") > "$OUT/$NAME.log" 2>&1 || rc=$?
         grep -E "RVFI records sampled|^UVM_(ERROR|FATAL) :|^%Error" "$OUT/$NAME.log" | sed 's/^/  /' || true
         awk '/^[^ ]/ { s += $3; n++ } END { if (n) printf "cov: %d covergroup instances, mean %.2f%%\n", n, s / n }' \
             "$OUT/$NAME.rep" 2>/dev/null || true
         echo "cov: $OUT/$NAME.rep (rc $rc)"
         exit $rc ;;
-    *) sed -n '2,12p' "$0"; exit 1 ;;
+    table)
+        # the model's record filter table: the items with bins and the configuration flags of this configuration
+        # (the harness on no records), the projections and Spike's names (tools/cov/cov_filter_gen.py)
+        : > "$OUT/none.rvfi"
+        (cd "$OUT" && ./obj/Vcov +OCV_RVFI="$OUT/none.rvfi" +UVM_NO_RELNOTES +ocv_cov_report="$OUT/bins.rep" \
+            +OCV_CHECK="$OUT/bins.chk") > "$OUT/bins.log" 2>&1 || { tail -5 "$OUT/bins.log"; exit 1; }
+        python3 "$OCV/tools/cov/cov_filter_gen.py" "$OUT/fields.json" "$OUT/bins.rep" "$OUT/bins.chk" "$OUT/spike.tab" \
+            > "$OUT/filter.tab"
+        echo "table: $OUT/filter.tab ($(grep -c '^proj' "$OUT/filter.tab") projections)" ;;
+    *) sed -n '2,16p' "$0"; exit 1 ;;
 esac

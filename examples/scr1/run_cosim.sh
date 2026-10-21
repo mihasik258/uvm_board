@@ -31,7 +31,7 @@ mkdir -p "$OUT"
 mapfile -t RTL < "$OUT/scr1_rtl.f"
 
 export RTL_DEFINES="-DSCR1_CFG_RV32IMC_MAX -DSCR1_RVFI_EN -I$S/includes ${SCR1_DEFINES:-}"
-export MODEL_SRCS="$OCV/models/cpu/iss/rv32_iss.c $OCV/models/cpu/cpu_model.c $HERE/scr1_cov.c $HERE/scr1_gen.c ${CPU_SRCS:-}"
+export MODEL_SRCS="$OCV/models/cpu/iss/rv32_iss.c $OCV/models/cpu/cpu_model.c $OCV/models/cpu/ocv_cov_filter.c $HERE/scr1_cov.c $HERE/scr1_gen.c ${CPU_SRCS:-}"
 export MODEL_CFLAGS="-I$OCV/models/cpu/iss -I$OCV/models/cpu ${CPU_CFLAGS:-}"
 export OUT
 exec "$OCV/sim/cosim.sh" "$HERE/scr1.json" "$HERE/scr1_model.c" \

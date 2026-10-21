@@ -17,7 +17,8 @@
 #      uvm2board.py on the simulated board (engine A); the verifier-style testbenches (uvm_v) of SCR1
 #      and mac16 without a description file, in their board form
 #  12. the verifier's own coverage: Verilator's covergroups against IEEE 1800-2023 (t_cg_ieee.sv); CVA6's
-#      covergroups (core-v-verif) over the reference model's RVFI records (examples/cva6/cov/cov.sh)
+#      covergroups (core-v-verif) over the reference model's RVFI records (examples/cva6/cov/cov.sh); the
+#      model's record filter: its fields against isacov's monitor, the kept records' coverage = all records'
 # FAST=1 skips steps 6 and 8.
 set -uo pipefail
 OCV=$(cd "$(dirname "$0")" && pwd)
@@ -232,6 +233,26 @@ if [ -d "$OCV/ext/cva6" ]; then
     # every covergroup instance of cv32a60x's configuration (isacov's and the CVA6 models'), no UVM error
     grep -q "UVM_ERROR :    0" "$B/cov_cva6.log" && grep -q "UVM_FATAL :    0" "$B/cov_cva6.log" && \
         grep -q "cov: 148 covergroup instances" "$B/cov_cva6.log"; ok $?
+    # the model's record filter (docs/COVERAGE.md, 2.3), 4 programs: its fields determine what isacov's monitor
+    # and model make of every record (tools/cov/cov_check.py); the records it keeps give the coverage all the
+    # records give, instance by instance (the report) and bin by bin (coverage.dat: the bins hit)
+    C=$B/cov_cva6
+    OUT=$C "$OCV/examples/cva6/cov/cov.sh" table | sed 's/^/  /'
+    for f in all kept; do
+        F=(); [ $f = kept ] && F=(--model-opt rvfi_filter="$C/filter.tab")
+        OUT=$B/cpu_cva6 "$OCV/hw/cpu/run.sh" "$OCV/examples/cva6/cva6.bind" bench -- --model-opt gen=directed \
+            --model-opt cpu=fast --model-opt rvfi_out="$B/cov_cva6_$f.rvfi" "${F[@]}" --batches 4 > "$B/cov_cva6_$f.log" 2>&1
+    done
+    grep "cov_filter:" "$B/cov_cva6_kept.log" | sed 's/^/  /'
+    (ulimit -v 8000000; OUT=$C "$OCV/examples/cva6/cov/cov.sh" check "$B/cov_cva6_all.rvfi" all) > /dev/null
+    (ulimit -v 8000000; OUT=$C "$OCV/examples/cva6/cov/cov.sh" run "$B/cov_cva6_kept.rvfi" kept) > /dev/null
+    python3 "$OCV/tools/cov/cov_check.py" "$C/fields.json" "$C/bins.rep" "$C/all.chk" "$C/spike.tab" \
+        "$B/cov_cva6_all.rvfi" > "$B/cov_check.log"; r=$?
+    sed 's/^/  /' "$B/cov_check.log" | tail -3
+    hits() { awk '/^C / { n = $NF; $NF = ""; print $0, (n > 0) }' "$1" | sort; }
+    [ $r -eq 0 ] && cmp -s "$C/all.rep" "$C/kept.rep" && cmp -s <(hits "$C/all.dat") <(hits "$C/kept.dat") && \
+        echo "  the kept records' coverage = all records': $(grep -c '^[^ ]' "$C/kept.rep") instances, $(hits "$C/kept.dat" | grep -c ' 1$') bins hit"
+    ok $?
 else
     echo "  (no ext/cva6: tools/get_cores.sh)"
 fi
