@@ -939,7 +939,8 @@ def env(b, out):
          f"RTL_FPGA=({q(b.rtl + b.rtl_fpga + lib + [dut])})",
          "RTL_DEFINES=\"" + " ".join([f"-I{i}" for i in b.incdirs] + [f"-D{d}" for d in b.defines]) + "\"",
          "MODEL_SRCS=\"" + " ".join([os.path.join(OCV, "models", "cpu", "iss", "rv32_iss.c"),
-                                     os.path.join(OCV, "models", "cpu", "cpu_model.c")] +
+                                     os.path.join(OCV, "models", "cpu", "cpu_model.c"),
+                                     os.path.join(OCV, "models", "cpu", "ocv_cov_filter.c")] +
                                     [os.path.join(OCV, gdir, f) for f in gfiles]) + "\"",
          "MODEL_CFLAGS=\"" + " ".join([f"-I{out}", f"-I{os.path.join(OCV, 'models', 'cpu')}",
                                        f"-I{os.path.join(OCV, 'models', 'cpu', 'iss')}",

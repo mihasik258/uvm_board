@@ -17,6 +17,11 @@
  *                                               mismatches (default: counted apart and reported, ERRATUM:)
  *   --model-opt irq=V                           with a program (no generation): the interrupt lines held at V
  *                                               from the start (e.g. 0x80: the timer line high) - directed tests
+ *   --model-opt rvfi_out=<file>                 every retired instruction as an RVFI record (a testbench's own
+ *                                               coverage: docs/COVERAGE.md, examples/cva6/cov)
+ *   --model-opt rvfi_filter=<table>             with rvfi_out: only the records that give the testbench's
+ *                                               covergroups something new, with their context (ocv_cov_filter.c;
+ *                                               the table: tools/cov/cov_filter_gen.py)
  *   --model-opt lat=G,R                         memory latency (binding `latency`): grant 0..G, response
  *                                               0..R clocks, a new seed per program (default 0,0)
  *
@@ -54,6 +59,7 @@
 #include "cpu_model.h"
 #include "cpu_streams.h"
 #include "rv32_iss.h"
+#include "ocv_cov_filter.h"
 #include "ocv_cpu_wrap.h"
 #if defined(CPU_GEN_CV32)
 #include "cv32_gen.h"
@@ -114,9 +120,9 @@ static void rvfi_write(cpu_model_t *cpu, const cpu_retire_t *rp, uint32_t raw, i
     uint32_t maddr = rp->mem_addr;
     if ((insn & 0x7f) == 0x03) maddr = a + (uint32_t)((int32_t)insn >> 20);   /* a load: rs1 + imm */
     const uint32_t trap = rp->trap ? (1u | ((mcause & 0x7fffffffu) << 1)) : 0;
-    fprintf(rvfi_f, "%x %x %x %x %x %x %x %x %x %x %x %x %x %x 0\n", c ? raw & 0xFFFFu : insn, rp->pc, trap,
-            (insn >> 15) & 31, a, (insn >> 20) & 31, b, rp->rd_addr, rp->rd_wdata, maddr, rvfi_intr, mcause,
-            mstatus, mie);
+    const uint32_t r[COV_REC_N] = { c ? raw & 0xFFFFu : insn, rp->pc, trap, (insn >> 15) & 31, a, (insn >> 20) & 31, b,
+                                    rp->rd_addr, rp->rd_wdata, maddr, (uint32_t)rvfi_intr, mcause, mstatus, mie, 0 };
+    cov_filter_record(rvfi_f, r);           /* (no rvfi_filter: every record) */
     rvfi_intr = 0;
 }
 /* checkpoint (ckpt_write): the channel and record of a failing window, the margin before it, the files */
@@ -152,6 +158,7 @@ static int      errata_strict;              /* --model-opt strict=1: report them
 
 static void cov_report(void)
 {
+    cov_filter_report();
     if (irq_taken)
         printf("IRQ: %llu taken, at most %llu clocks after the line was raised (window %u)\n",
                (unsigned long long)irq_taken, (unsigned long long)irq_lat_max, CPU_IRQ_WINDOW);
@@ -261,6 +268,7 @@ static int configure(const char *key, const char *value)
         if (!rvfi_f) { perror(value); return 1; }
         return 0;
     }
+    if (!strcmp(key, "rvfi_filter")) return cov_filter_open(value);
     if (!strcmp(key, "ckpt_file"))   { snprintf(ckpt_file, sizeof ckpt_file, "%s", value); return 0; }
     if (!strcmp(key, "lat"))   return sscanf(value, "%u,%u", &lat_g, &lat_r) != 2 || lat_g > 255 || lat_r > 255;
     return -1;

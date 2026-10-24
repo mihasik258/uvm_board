@@ -15,3 +15,5 @@ platforms/vd100/sd/boot.scr
 # what simulations leave in the directory they run in (core-v-verif's printer, CVA6's Verilator tracer)
 stdout.txt
 trace_hart_*.dasm
+# Verilator output when run from the repo root
+obj_dir/
