@@ -122,10 +122,12 @@ static void compressed(code_t *c, int k, uint64_t *s)
     case COV_C_ADDI4SPN: put(c, pair(c_addi4spn(a, range(s, 1, 255) * 4), C_NOP)); break;
     case COV_C_LW: case COV_C_SW:                  /* x15 = data base for the pair */
         put(c, I(0, 31, 0, 15, 0x13));
-        put(c, pair(c_lw(k == COV_C_SW, a == 15 ? 9 : a, 15, range(s, 0, 31) * 4), c_lw(1, b, 15, range(s, 0, 31) * 4)));
+        { const uint32_t o2 = range(s, 0, 31) * 4, o1 = range(s, 0, 31) * 4;
+          put(c, pair(c_lw(k == COV_C_SW, a == 15 ? 9 : a, 15, o1), c_lw(1, b, 15, o2))); }
         break;
     case COV_C_NOP:   put(c, pair(C_NOP, C_NOP)); break;
-    case COV_C_ADDI:  put(c, pair(c_ci(0, r, nz6(s), 1), c_ci(0, reg(s), nz6(s), 1))); break;
+    case COV_C_ADDI:  { const int32_t i2 = nz6(s); const uint32_t r2 = reg(s); const int32_t i1 = nz6(s);
+                        put(c, pair(c_ci(0, r, i1, 1), c_ci(0, r2, i2, 1))); break; }
     case COV_C_JAL:   put(c, pair(c_j(1, 4), C_NOP)); break;
     case COV_C_LI:    put(c, pair(c_ci(2, r, (int32_t)range(s, 0, 63) - 32, 1), C_NOP)); break;
     case COV_C_ADDI16SP: { int32_t v = (int32_t)range(s, 1, 31) - 16; put(c, pair(c_addi16sp((v ? v : 1) * 16), C_NOP)); break; }
@@ -134,7 +136,8 @@ static void compressed(code_t *c, int k, uint64_t *s)
         put(c, pair(c_shift((uint32_t)(k - COV_C_SRLI), a, k == COV_C_ANDI ? (uint32_t)(range(s, 0, 63)) : range(s, 1, 31)), C_NOP));
         break;
     case COV_C_SUB: case COV_C_XOR: case COV_C_OR: case COV_C_AND:
-        put(c, pair(c_arith((uint32_t)(k - COV_C_SUB), a, b), c_arith(range(s, 0, 3), creg(s), creg(s))));
+        { const uint32_t b2 = creg(s), a2 = creg(s), k2 = range(s, 0, 3);
+          put(c, pair(c_arith((uint32_t)(k - COV_C_SUB), a, b), c_arith(k2, a2, b2))); }
         break;
     case COV_C_J:     put(c, pair(c_j(5, 4), C_NOP)); break;
     case COV_C_BEQZ: case COV_C_BNEZ: put(c, pair(c_b(k == COV_C_BNEZ, a, 4), c_ci(0, b, nz6(s), 1))); break;
@@ -198,23 +201,27 @@ static void exception(code_t *c, int k, uint64_t *s)
     case COV_X_EBREAK:  put(c, 0x00100073u); break;
     case COV_X_CEBREAK: put(c, pair(c_cr(1, 0, 0), C_NOP)); break;
     case COV_X_ONES:    put(c, 0xFFFFFFFFu); break;
-    case COV_X_LOAD:    put(c, I(0, 31, range(s, 0, 1) ? 3 : range(s, 6, 7), reg(s), 0x03)); break;
-    case COV_X_STORE:   put(c, S(0, reg(s), 31, range(s, 3, 7))); break;
-    case COV_X_SHIFT:   put(c, I((int32_t)(range(s, 1, 0x7F) << 5 | range(s, 0, 31)), reg(s), 1, reg(s), 0x13)); break;
-    case COV_X_OP:      put(c, R(range(s, 2, 0x1F), reg(s), reg(s), range(s, 0, 7), reg(s))); break;
+    case COV_X_LOAD:    { const uint32_t rd = reg(s), f3 = range(s, 0, 1) ? 3 : range(s, 6, 7); put(c, I(0, 31, f3, rd, 0x03)); break; }
+    case COV_X_STORE:   { const uint32_t f3 = range(s, 3, 7), rs2 = reg(s); put(c, S(0, rs2, 31, f3)); break; }
+    case COV_X_SHIFT:   { const uint32_t rd = reg(s), rs1 = reg(s), hi = range(s, 1, 0x7F), lo = range(s, 0, 31);
+                          put(c, I((int32_t)(hi << 5 | lo), rs1, 1, rd, 0x13)); break; }
+    case COV_X_OP:      { const uint32_t rd = reg(s), f3 = range(s, 0, 7), rs1 = reg(s), rs2 = reg(s), f7 = range(s, 2, 0x1F);
+                          put(c, R(f7, rs2, rs1, f3, rd)); break; }
     case COV_X_JALR:    put(c, I(0, 5, range(s, 1, 7), 0, 0x67)); break;
-    case COV_X_BRANCH:  put(c, B(8, reg(s), reg(s), range(s, 2, 3))); break;
+    case COV_X_BRANCH:  { const uint32_t f3 = range(s, 2, 3), rs1 = reg(s), rs2 = reg(s); put(c, B(8, rs2, rs1, f3)); break; }
     case COV_X_FENCE:   put(c, I(0, 0, range(s, 2, 7), 0, 0x0f)); break;
-    case COV_X_SYS4:    put(c, CSR(0x340, reg(s), 4, reg(s))); break;
+    case COV_X_SYS4:    { const uint32_t rd = reg(s), rs1 = reg(s); put(c, CSR(0x340, rs1, 4, rd)); break; }
     case COV_X_URET:    put(c, 0x00200073u); break;
     case COV_X_DRET:    put(c, 0x7B200073u); break;
-    case COV_X_CSR:     csr_op(c, range(s, 0, 5), gen_cva6 ? BAD_CSR_CVA6[range(s, 0, sizeof BAD_CSR_CVA6 / 4 - 1)]
-                                                           : BAD_CSR_CV32[range(s, 0, sizeof BAD_CSR_CV32 / 4 - 1)],
-                               (int)range(s, 0, 1), s); break;
-    case COV_X_CSR_RO:  csr_op(c, range(s, 0, 1) ? 0 : 3, 0xF11 + range(s, 0, 3), 1, s); break;
+    case COV_X_CSR:     { const int imm = (int)range(s, 0, 1);
+                          const uint32_t csr = gen_cva6 ? BAD_CSR_CVA6[range(s, 0, sizeof BAD_CSR_CVA6 / 4 - 1)]
+                                                        : BAD_CSR_CV32[range(s, 0, sizeof BAD_CSR_CV32 / 4 - 1)];
+                          const uint32_t op = range(s, 0, 5);
+                          csr_op(c, op, csr, imm, s); break; }
+    case COV_X_CSR_RO:  { const uint32_t csr = 0xF11 + range(s, 0, 3), op = range(s, 0, 1) ? 0 : 3; csr_op(c, op, csr, 1, s); break; }
     case COV_X_CUSTOM:  { static const uint32_t o[] = { 0x0B, 0x2B, 0x5B, 0x7B, 0x07, 0x27, 0x43, 0x53, 0x57 };
-                          put(c, (uint32_t)(rnd(s) & ~0x7Fu) | o[range(s, 0, 8)]); break; }
-    case COV_X_AMO:     put(c, R(range(s, 0, 0x7F), reg(s), 31, 2, reg(s)) ^ 0x33u ^ 0x2Fu); break;
+                          const uint32_t hi = (uint32_t)(rnd(s) & ~0x7Fu); put(c, hi | o[range(s, 0, 8)]); break; }
+    case COV_X_AMO:     { const uint32_t rd = reg(s), rs2 = reg(s), f7 = range(s, 0, 0x7F); put(c, R(f7, rs2, 31, 2, rd) ^ 0x33u ^ 0x2Fu); break; }
     case COV_X_C0:      put(c, pair(0x0000, C_NOP)); break;
     default:            put(c, 0x00000073u); break;    /* mret: by the handler */
     }
@@ -240,7 +247,8 @@ static unsigned random_op(code_t *c, uint64_t *s, unsigned remaining)
         if (k < 0.06) {
             const uint32_t csr = cov_csrs[range(s, 0, COV_NCSR - 1)];
             if (csr == 0x305 && remaining == 0) { put(c, CSR(csr, 0, 2, reg(s))); return 0; }   /* read mtvec */
-            csr_op(c, range(s, 0, 5), csr, (int)range(s, 0, 1), s);
+            const int imm = (int)range(s, 0, 1); const uint32_t op = range(s, 0, 5);
+            csr_op(c, op, csr, imm, s);
         } else if (k < 0.09) {
             int x = (int)range(s, 0, COV_NX - 1);
             exception(c, x == COV_X_MRET ? COV_X_ECALL : x, s);   /* (mret: the handler's) */
@@ -253,41 +261,52 @@ static unsigned random_op(code_t *c, uint64_t *s, unsigned remaining)
         return 0;
     }
     k = (k - 0.20) / 0.80;
-    if (k < 0.25) { const uint32_t *t = RTYPE[range(s, 0, 9)]; put(c, R(t[0], src(s), src(s), t[1], reg(s))); return 0; }
-    if (k < 0.40) { put(c, R(1, src(s), src(s), range(s, 0, 7), reg(s))); return 0; }
+    if (k < 0.25) {
+        const uint32_t *t = RTYPE[range(s, 0, 9)];
+        const uint32_t rd = reg(s), rs1 = src(s), rs2 = src(s);
+        put(c, R(t[0], rs2, rs1, t[1], rd));
+        return 0;
+    }
+    if (k < 0.40) { const uint32_t rd = reg(s), f3 = range(s, 0, 7), rs1 = src(s), rs2 = src(s); put(c, R(1, rs2, rs1, f3, rd)); return 0; }
     if (k < 0.55) {
         static const int32_t pick[5] = { 0, 1, -1, 2047, -2048 };
         uint32_t w = range(s, 0, 5);
         int32_t imm = w < 5 ? pick[w] : (int32_t)range(s, 0, 4095) - 2048;
-        put(c, I(imm, src(s), ITYPE[range(s, 0, 5)], reg(s), 0x13));
+        const uint32_t rd = reg(s), f3 = ITYPE[range(s, 0, 5)], rs1 = src(s);
+        put(c, I(imm, rs1, f3, rd, 0x13));
         return 0;
     }
     if (k < 0.68) {
         static const uint32_t sh[3][2] = { {1,0},{5,0},{5,0x20} };
         const uint32_t *t = sh[range(s, 0, 2)];
         uint32_t w = range(s, 0, 3), amt = w == 0 ? 0 : w == 1 ? 1 : w == 2 ? 31 : range(s, 0, 31);
-        put(c, I((int32_t)((t[1] << 5) | amt), src(s), t[0], reg(s), 0x13));
+        const uint32_t rd = reg(s), rs1 = src(s);
+        put(c, I((int32_t)((t[1] << 5) | amt), rs1, t[0], rd, 0x13));
         return 0;
     }
     if (k < 0.78 && remaining > 5) {
         static const uint32_t f3s[6] = { 0, 1, 4, 5, 6, 7 };
         unsigned skip = range(s, 1, 4);
-        put(c, B((int32_t)((skip + 1) * 4), src(s), src(s), f3s[range(s, 0, 5)]));
+        const uint32_t f3 = f3s[range(s, 0, 5)], rs1 = src(s), rs2 = src(s);
+        put(c, B((int32_t)((skip + 1) * 4), rs2, rs1, f3));
         return skip;
     }
     if (k < 0.86) {
         static const uint32_t ld[5][2] = { {0,1},{4,1},{1,2},{5,2},{2,4} };
         const uint32_t *t = ld[range(s, 0, 4)];
-        put(c, I((int32_t)(range(s, 0, DATA_BYTES / t[1] - 1) * t[1]), 31, t[0], reg(s), 0x03));
+        const uint32_t rd = reg(s);
+        put(c, I((int32_t)(range(s, 0, DATA_BYTES / t[1] - 1) * t[1]), 31, t[0], rd, 0x03));
         return 0;
     }
     if (k < 0.94) {
         static const uint32_t st[3][2] = { {0,1},{1,2},{2,4} };
         const uint32_t *t = st[range(s, 0, 2)];
-        put(c, S((int32_t)(range(s, 0, DATA_BYTES / t[1] - 1) * t[1]), src(s), 31, t[0]));
+        const uint32_t rs2 = src(s);
+        put(c, S((int32_t)(range(s, 0, DATA_BYTES / t[1] - 1) * t[1]), rs2, 31, t[0]));
         return 0;
     }
-    put(c, U((uint32_t)rnd(s), reg(s), k < 0.97 ? 0x37 : 0x17));
+    const uint32_t rd = reg(s);
+    put(c, U((uint32_t)rnd(s), rd, k < 0.97 ? 0x37 : 0x17));
     return 0;
 }
 
