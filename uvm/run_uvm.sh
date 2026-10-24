@@ -45,7 +45,8 @@ mkdir -p "$OUT/tbc"
 MCF=(-std=c99 -O2 -fPIC -D_POSIX_C_SOURCE=200809L -I"$OCV/sw/include" -I"$OCV/uvm" -I"$OUT/gen"
      -include "$OUT/gen/${NAME}_ocv_meta.h" -DOCV_UVM_DUT="${NAME}_dut")
 cc "${MCF[@]}" -c "$OCV/uvm/ocv_uvm_check.c" -o "$OUT/tbc/ocv_uvm_check.o"
-TBO=("$OUT/tbc/ocv_uvm_check.o")
+cc "${MCF[@]}" -c "$OCV/uvm/ocv_uvm_model.c" -o "$OUT/tbc/ocv_uvm_model.o"
+TBO=("$OUT/tbc/ocv_uvm_check.o" "$OUT/tbc/ocv_uvm_model.o")
 # shellcheck disable=SC2086
 for f in ${TB_C:-}; do
     o="$OUT/tbc/$(basename "${f%.*}").o"

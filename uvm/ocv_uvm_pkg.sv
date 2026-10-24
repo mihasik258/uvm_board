@@ -58,6 +58,20 @@ package ocv_uvm_pkg;
                                                           output int field, output longint index);
 `endif
 
+    // the whole-DUT reference model (ocv_uvm_model.c, ocv_model_checker): in every build
+    import "DPI-C" function int    ocv_dpi_model_open(string opts);
+    import "DPI-C" function void   ocv_dpi_model_in(int ch, input ocv_rec_t rec);
+    import "DPI-C" function void   ocv_dpi_model_out(int ch, input ocv_rec_t rec);
+    import "DPI-C" function void   ocv_dpi_model_status(output longint checked, output longint errors, output int done);
+    import "DPI-C" function int    ocv_dpi_model_mismatch(output int ch, output ocv_rec_t dut, output ocv_rec_t exp,
+                                                          output int field, output longint index);
+    import "DPI-C" function string ocv_dpi_model_channel(int ch);
+    import "DPI-C" function string ocv_dpi_model_field(int ch, int field);
+    import "DPI-C" function string ocv_dpi_model_format(int ch, input ocv_rec_t rec);
+    import "DPI-C" function void   ocv_dpi_model_close();
+    import "DPI-C" function longint ocv_dpi_model_records();
+    import "DPI-C" function void   ocv_dpi_model_quiet();
+
     // one field compared by the descriptor's rule (ocv_meta.h ocv_cmp_t): 0 exact, 1 ignore,
     // 2 mask (arg), 3 abs (|a-b| <= arg as integers of the field), 4 ulp (IEEE fp of width fp)
     function automatic bit ocv_field_match(int code, longint unsigned arg, int fp, int width, bit sgn,
@@ -146,6 +160,9 @@ package ocv_uvm_pkg;
             `uvm_fatal("OCV", $sformatf("%s: item type '%s' is no channel of this DUT (set ch, or build with uvm/ocv_contract.py)", who, item_type))
         return ocv_channel_of[item_type];
     endfunction
+
+    // an ocv_model_checker is in the testbench: the base drivers and monitors hand it every record
+    bit ocv_model_on;
 
     // State shared by all agents. Package variables, not static class members: simulators
     // differ on statics (xsim loses their values); a package variable is plain and portable.
@@ -272,11 +289,14 @@ package ocv_uvm_pkg;
                     end
                 end
 `else
-                if (t.blk.size() == 0) drive(t);
-                else foreach (t.blk[i]) begin         // a block on the pins: record by record
+                if (t.blk.size() == 0) begin
+                    drive(t);
+                    if (ocv_model_on) ocv_dpi_model_in(ch, t.to_rec());
+                end else foreach (t.blk[i]) begin     // a block on the pins: record by record
                     T x = T::type_id::create("x");
                     x.from_rec(t.blk[i]);
                     drive(x);
+                    if (ocv_model_on) ocv_dpi_model_in(ch, t.blk[i]);
                 end
 `endif
                 ap.write(t);
@@ -333,6 +353,7 @@ package ocv_uvm_pkg;
                 t.from_rec(r);
 `else
                 sample(t);
+                if (ocv_model_on) ocv_dpi_model_out(ch, t.to_rec());
 `endif
                 ap.write(t);
             end
@@ -412,6 +433,76 @@ package ocv_uvm_pkg;
         function void report_phase(uvm_phase phase);
             `uvm_info("OCV_CHECK", $sformatf("%s: %0d transactions checked in C, %0d mismatches", get_name(),
                                              n_checked, n_errors), UVM_NONE)
+        endfunction
+    endclass
+
+    // Checker of the whole DUT against an OCV reference model (ocv_model.h - the runner's, e.g. a processor
+    // core's models/cpu/ocv_cpu_model.c, linked into the testbench): every record of every output channel. The
+    // testbench puts one in its env and connects nothing - the base drivers and monitors hand the model what
+    // the DUT was given and what it made (simulation, ocv_uvm_model.c); `done` rises when the model has checked
+    // the whole stimulus (a processor core: the program to its end). Model options: +OCV_MODEL="key=value ...".
+    class ocv_model_checker extends uvm_component;
+        `uvm_component_utils(ocv_model_checker)
+        string  opts;
+        longint n_checked, n_errors;
+        bit     done;
+        int     max_reports = 10;
+
+        function new(string name, uvm_component parent); super.new(name, parent); endfunction
+
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            void'($value$plusargs("OCV_MODEL=%s", opts));   // (or what the env set before this phase)
+            if (!ocv_dpi_model_open(opts))
+                `uvm_fatal("OCV", $sformatf("%s: no OCV reference model linked into the testbench", get_full_name()))
+            ocv_model_on = 1;
+        endfunction
+
+        function void collect();
+            ocv_rec_t d, e;
+            int c, f, dn;
+            longint ix;
+            while (ocv_dpi_model_mismatch(c, d, e, f, ix)) begin
+                if (n_errors < max_reports)
+                    `uvm_error("OCV_MODEL", $sformatf("MISMATCH channel '%s' record %0d field '%s': dut %s, model %s",
+                               ocv_dpi_model_channel(c), ix, ocv_dpi_model_field(c, f), ocv_dpi_model_format(c, d),
+                               ocv_dpi_model_format(c, e)))
+                n_errors++;
+            end
+            begin
+                longint ec;
+                ocv_dpi_model_status(n_checked, ec, dn);
+                if (ec > n_errors) n_errors = ec;
+                done = dn;
+            end
+        endfunction
+
+        int quiet_us = 100;              // no record of the DUT for this long (once it has made one): it is done
+
+        task run_phase(uvm_phase phase);
+            longint last = -1, n;
+            int still = 0;
+            bit told;
+            forever begin
+                #1us;
+                collect();
+                // the DUT is quiet - it makes no more records: the model goes on to the end without waiting for it
+                n = ocv_dpi_model_records();
+                if (n > 0 && n == last) still++; else still = 0;
+                last = n;
+                if (!told && still >= quiet_us) begin
+                    ocv_dpi_model_quiet();
+                    told = 1;
+                end
+            end
+        endtask
+
+        function void report_phase(uvm_phase phase);
+            collect();
+            ocv_dpi_model_close();
+            `uvm_info("OCV_MODEL", $sformatf("%s: %0d records checked against the model, %0d mismatches%s", get_name(),
+                                             n_checked, n_errors, done ? "" : " - the model did not finish the stimulus"),
+                      UVM_NONE)
         endfunction
     endclass
 

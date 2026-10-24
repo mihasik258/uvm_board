@@ -87,7 +87,8 @@ CF=(-std=c99 -D_POSIX_C_SOURCE=200809L $OPT $HOT -Wall -Wextra -Werror -pthread 
     -include "$OUT/gen/${NAME}_ocv_meta.h")
 "$CC" "${CF[@]}" -c "$OCV/sw/lib/ocv.c" -o "$OUT/c/ocv.o"
 "$CC" "${CF[@]}" -I"$OCV/uvm" -DOCV_UVM_DUT="${NAME}_dut" -c "$OCV/uvm/ocv_uvm_check.c" -o "$OUT/c/ocv_uvm_check.o"
-OBJS+=("$OUT/c/ocv.o" "$OUT/c/ocv_uvm_check.o")
+"$CC" "${CF[@]}" -I"$OCV/uvm" -c "$OCV/uvm/ocv_uvm_model.c" -o "$OUT/c/ocv_uvm_model.o"
+OBJS+=("$OUT/c/ocv.o" "$OUT/c/ocv_uvm_check.o" "$OUT/c/ocv_uvm_model.o")
 if [ "$TARGET" != pc ] && [ "$TARGET" != wave ]; then
     "$CC" "${CF[@]}" -DOCV_UVM_DUT="${NAME}_dut" -c "$OCV/uvm/ocv_uvm_dpi.c" -o "$OUT/c/ocv_uvm_dpi.o"
     OBJS+=("$OUT/c/ocv_uvm_dpi.o")
