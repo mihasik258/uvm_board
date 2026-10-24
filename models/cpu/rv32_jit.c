@@ -1057,7 +1057,7 @@ static cpu_model_t *jit_create(const char *isa, const cpu_env_t *env, uint32_t r
     return &j->f.base;
 }
 
-static uint32_t jit_xreg(cpu_model_t *m, int i)
+static uint64_t jit_xreg(cpu_model_t *m, int i)
 {
     jit_t *j = (jit_t *)m;                                       /* the state after the last handed out */
     if (!(i & 31)) return 0;
@@ -1066,7 +1066,7 @@ static uint32_t jit_xreg(cpu_model_t *m, int i)
     }
     return j->f.x[i & 31];
 }
-static uint32_t jit_pc(cpu_model_t *m)
+static uint64_t jit_pc(cpu_model_t *m)
 {
     jit_t *j = (jit_t *)m;
     if (j->cur_i < j->cur_n) return j->cur[j->cur_i].pc;

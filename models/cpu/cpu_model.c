@@ -63,7 +63,10 @@ static void iss_store(void *ctx, uint32_t a, int n, uint32_t v) { cpu_env_store(
 static int iss_timing(void *ctx, uint32_t csr, uint64_t order, uint32_t *v)
 {
     iss_t *m = ctx;
-    return m->env.timing_csr ? m->env.timing_csr(m->env.ctx, csr, order, v) : 0;
+    uint64_t w = 0;
+    const int got = m->env.timing_csr ? m->env.timing_csr(m->env.ctx, csr, order, &w) : 0;
+    if (got) *v = (uint32_t)w;
+    return got;
 }
 
 static const cpu_impl_t iss_impl;
@@ -92,8 +95,8 @@ static void iss_step(cpu_model_t *mm, cpu_retire_t *r)
     r->csr_we = x.csr_we; r->csr_wcmd = x.csr_wcmd; r->csr_waddr = x.csr_waddr; r->csr_wdata = x.csr_wdata;
 }
 
-static uint32_t iss_xreg(cpu_model_t *m, int i) { return ((iss_t *)m)->s.x[i & 31]; }
-static uint32_t iss_pc(cpu_model_t *m) { return ((iss_t *)m)->s.pc; }
+static uint64_t iss_xreg(cpu_model_t *m, int i) { return ((iss_t *)m)->s.x[i & 31]; }
+static uint64_t iss_pc(cpu_model_t *m) { return ((iss_t *)m)->s.pc; }
 static void iss_destroy(cpu_model_t *m) { free(m); }
 
 static const cpu_impl_t iss_impl = {

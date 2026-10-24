@@ -494,8 +494,9 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
             }
             if (timing) {
                 mask_rdd = 1;
-                if (!(m->env.timing_csr && m->env.timing_csr(m->env.ctx, csr, m->order, &old)))
-                    old = timing == 1 ? (uint32_t)m->order : (uint32_t)(m->order >> 32);
+                uint64_t w = 0;
+                if (m->env.timing_csr && m->env.timing_csr(m->env.ctx, csr, m->order, &w)) old = (uint32_t)w;
+                else old = timing == 1 ? (uint32_t)m->order : (uint32_t)(m->order >> 32);
             }
             if (write) {
                 cwe = 1; ccmd = (f3 & 3) - 1; caddr = csr; cdata = src;
@@ -509,7 +510,9 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
         const uint32_t csr = (uint32_t)d->imm, f3 = d->f3;
         uint32_t old = 0;
         mask_rdd = rv32_is_timing_csr(csr);
-        if (mask_rdd && m->env.timing_csr && m->env.timing_csr(m->env.ctx, csr, m->order, &old)) {
+        uint64_t w_ = 0;
+        if (mask_rdd && m->env.timing_csr && m->env.timing_csr(m->env.ctx, csr, m->order, &w_)) {
+            old = (uint32_t)w_;
         } else if (csr == 0xB02 || csr == 0xC02) old = (uint32_t)m->order;
         else if (csr == 0xB82 || csr == 0xC82) old = (uint32_t)(m->order >> 32);
         else old = 0;
@@ -569,8 +572,8 @@ static cpu_model_t *fast_create(const char *isa, const cpu_env_t *env, uint32_t 
     return &m->base;
 }
 
-static uint32_t fast_xreg(cpu_model_t *m, int i) { return ((fast_t *)m)->x[i & 31]; }
-static uint32_t fast_pc(cpu_model_t *m) { return ((fast_t *)m)->pc; }
+static uint64_t fast_xreg(cpu_model_t *m, int i) { return ((fast_t *)m)->x[i & 31]; }
+static uint64_t fast_pc(cpu_model_t *m) { return ((fast_t *)m)->pc; }
 /* the core profile's machine-mode state (cpu_arch_csrs): in the order a restore writes them */
 static int fast_arch_csrs(cpu_model_t *mm, uint32_t *csr, uint32_t *val, int max)
 {

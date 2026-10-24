@@ -38,29 +38,33 @@ typedef struct {
     void     (*mmio_store)(void *ctx, uint32_t addr, int size, uint32_t value);
     /* optional: value read by a timing CSR (cycle/time/instret and m-/h- forms) at retirement
      * `order`; return 1 and set *value to supply it, 0 to keep the model's own */
-    int      (*timing_csr)(void *ctx, uint32_t csr, uint64_t order, uint32_t *value);
+    int      (*timing_csr)(void *ctx, uint32_t csr, uint64_t order, uint64_t *value);
     void     *ctx;
     /* optional: the DUT's hardwired implementation-defined CSRs (models without them ignore it) */
     const cpu_csr_t *fixed_csrs;
     int              n_fixed_csrs;
 } cpu_env_t;
 
+/* Values and addresses of a retirement are XLEN bits (an RV32 model's upper half 0). */
 typedef struct {
     uint64_t order;                  /* instructions retired before this one */
-    uint32_t pc, pc_next;
-    uint32_t rd_addr, rd_wdata;      /* 0/0 when no register (or x0) is written */
+    uint64_t pc, pc_next;
+    uint32_t rd_addr;
+    uint64_t rd_wdata;               /* 0/0 when no register (or x0) is written */
     uint32_t trap;                   /* the instruction trapped (did not retire normally) */
     uint32_t insn;                   /* 32-bit form (compressed ones expanded) */
     uint32_t timing_csr;             /* it read a timing CSR (rd_wdata supplied by timing_csr) */
     /* what else it wrote (as RVFI's rvfi_mem_* / rvfi_csr_*); all 0 when nothing or on a trap */
-    uint32_t mem_we, mem_wmask;      /* a store; bytes from mem_addr: 0x1 / 0x3 / 0xF */
-    uint32_t mem_addr, mem_wdata;    /* byte address; data, bytes outside the mask 0 */
+    uint32_t mem_we, mem_wmask;      /* a store; bytes from mem_addr: 0x1 / 0x3 / 0xF (/ 0xFF) */
+    uint64_t mem_addr, mem_wdata;    /* byte address; data, bytes outside the mask 0 */
     uint32_t csr_we, csr_wcmd;       /* a CSR write (csrrw; csrrs/csrrc with rs1/uimm != 0): 0 write, 1 set, 2 clear */
-    uint32_t csr_waddr, csr_wdata;   /* the CSR; the operand (rs1's value or uimm) */
+    uint32_t csr_waddr;
+    uint64_t csr_wdata;              /* the CSR; the operand (rs1's value or uimm) */
     /* set by a model with cpu_impl_t.gives_src only (else undefined): the instruction as fetched (a compressed
      * one's 16 bits) and the values of the registers its rs1 / rs2 fields name, before it ran - what a caller
      * would otherwise read again (memory, cpu_xreg) for every instruction */
-    uint32_t raw, src1, src2;
+    uint32_t raw;
+    uint64_t src1, src2;
 } cpu_retire_t;
 
 /* A translated block as it ran (cpu_impl_t.block): per instruction what is the same each time the block runs
@@ -140,8 +144,8 @@ typedef struct {
     int          traps;         /* models traps (exceptions go to the handler); 0: a trap ends the run */
     cpu_model_t *(*create)(const char *isa, const cpu_env_t *env, uint32_t reset_pc, char *err, size_t errlen);
     void         (*step)(cpu_model_t *m, cpu_retire_t *r);
-    uint32_t     (*xreg)(cpu_model_t *m, int i);       /* general register, current state */
-    uint32_t     (*pc)(cpu_model_t *m);                /* next instruction */
+    uint64_t     (*xreg)(cpu_model_t *m, int i);       /* general register, current state (XLEN bits) */
+    uint64_t     (*pc)(cpu_model_t *m);                /* next instruction */
     void         (*destroy)(cpu_model_t *m);
     /* optional: the next 1..n retirements at once (cpu_step_n); NULL: one cpu_step per call */
     int          (*step_n)(cpu_model_t *m, cpu_retire_t *r, int n);
@@ -191,8 +195,8 @@ static inline int cpu_interrupt(cpu_model_t *m, uint32_t id)
 }
 /* The next n instructions are executed one by one (a model that runs blocks ahead stops doing so). */
 static inline void cpu_sync(cpu_model_t *m, uint64_t n) { if (m->impl->sync) m->impl->sync(m, n); }
-static inline uint32_t cpu_xreg(cpu_model_t *m, int i)           { return m->impl->xreg(m, i); }
-static inline uint32_t cpu_pc(cpu_model_t *m)                    { return m->impl->pc(m); }
+static inline uint64_t cpu_xreg(cpu_model_t *m, int i)           { return m->impl->xreg(m, i); }
+static inline uint64_t cpu_pc(cpu_model_t *m)                    { return m->impl->pc(m); }
 static inline int      cpu_arch_csrs(cpu_model_t *m, uint32_t *csr, uint32_t *val, int max)
 {
     return m->impl->arch_csrs ? m->impl->arch_csrs(m, csr, val, max) : 0;

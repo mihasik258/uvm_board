@@ -416,14 +416,14 @@ static int      w_ch = -1;                      /* without a retire stream: the 
                                                    register writes) - what the core read */
 static const ocv_field_t *w_f;
 
-static int timing_csr(void *ctx, uint32_t csr, uint64_t order, uint32_t *value)
+static int timing_csr(void *ctx, uint32_t csr, uint64_t order, uint64_t *value)
 {
     (void)ctx; (void)csr;
     int ok;
     if (obs_ch < 0 && w_ch >= 0) {             /* the value the core wrote: its next non-load write */
         uint32_t rec[CPU_REC_WORDS];
         ok = cur_io && cur_io->observed(cur_io, w_ch, (uint32_t)emitted[w_ch], rec);
-        *value = ok ? (uint32_t)ocv_get_raw(rec, w_f) : 0;
+        *value = ok ? ocv_get_raw(rec, w_f) : 0;
         return ok;
     }
     *value = observed_value(order, &ok);
@@ -1137,8 +1137,8 @@ static void run_program(ocv_model_io_t *io)
         }
         if (irq_seq != ~0ull && irq_seq - issued < 256) cpu_sync(cpu, irq_seq - issued + 64);   /* (traps: not issued) */
         while (irq_f && irq_seq == issued) {   /* the core took an interrupt here: so does the model */
-            if (trace) fprintf(trace, "interrupt %u before issue %llu at pc %08x\n", irq_cause,
-                               (unsigned long long)issued, cpu_pc(cpu));
+            if (trace) fprintf(trace, "interrupt %u before issue %llu at pc %08llx\n", irq_cause,
+                               (unsigned long long)issued, (unsigned long long)cpu_pc(cpu));
             int ok = cpu_interrupt(cpu, irq_cause);
             if (trace && ok != 1)
                 fprintf(trace, ok == 2 ? "  (known erratum: allowed only by mie before a recent write)\n"
@@ -1329,8 +1329,9 @@ static void run_program(ocv_model_io_t *io)
         const int c = (raw & 3) != 3;
         if (!cov_skip) COV(raw, c, insn, op_a, op_b, (int)rp->trap);
         if (rvfi_f) rvfi_write(cpu, rp, raw, c, insn, op_a, op_b);
-        if (trace) fprintf(trace, "%llu %08x %08x x%u=%08x%s%s\n", (unsigned long long)issued, rp->pc, rp->insn, rp->rd_addr,
-                           rp->rd_wdata, rp->trap ? " trap" : "", rp->mem_we ? " store" : "");
+        if (trace) fprintf(trace, "%llu %08llx %08x x%u=%08llx%s%s\n", (unsigned long long)issued,
+                           (unsigned long long)rp->pc, rp->insn, rp->rd_addr, (unsigned long long)rp->rd_wdata,
+                           rp->trap ? " trap" : "", rp->mem_we ? " store" : "");
         executed++;
 #if defined(CPU_FOR_STREAMS)
         CPU_FOR_STREAMS(CPU_STREAM_DO)
