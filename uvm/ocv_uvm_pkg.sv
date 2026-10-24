@@ -52,6 +52,12 @@ package ocv_uvm_pkg;
     import "DPI-C" function int    ocv_dpi_check_enable(int ch);
     import "DPI-C" function int    ocv_dpi_check_deliver(int ch);
 `ifdef OCV_BOARD
+    // the board side of ocv_model_checker (ocv_uvm_runner.c): the runner owns the hub, the agents take part
+    import "DPI-C" function int    ocv_dpi_model_board_open(string args);
+    import "DPI-C" function void   ocv_dpi_model_send(int ch, input ocv_rec_t rec);
+    import "DPI-C" function int    ocv_dpi_model_recv(int ch, output ocv_rec_t rec);
+    import "DPI-C" function void   ocv_dpi_model_wait();
+    import "DPI-C" function int    ocv_dpi_model_board_done(output int rc);
     import "DPI-C" function void   ocv_dpi_check_status(int ch, output longint checked, output longint errors,
                                                         output int done);
     import "DPI-C" function int    ocv_dpi_check_mismatch(int ch, output ocv_rec_t dut, output ocv_rec_t exp,
@@ -161,8 +167,12 @@ package ocv_uvm_pkg;
         return ocv_channel_of[item_type];
     endfunction
 
-    // an ocv_model_checker is in the testbench: the base drivers and monitors hand it every record
-    bit ocv_model_on;
+    // an ocv_model_checker is in the testbench: the base drivers and monitors hand it every record (simulation),
+    // the runner owns the hub (board: the runner's options, the run is over, its exit status)
+    bit    ocv_model_on;
+    string ocv_model_run_args;
+    bit    ocv_model_ended;
+    int    ocv_model_rc;
 
     // State shared by all agents. Package variables, not static class members: simulators
     // differ on statics (xsim loses their values); a package variable is plain and portable.
@@ -202,6 +212,7 @@ package ocv_uvm_pkg;
             ocv_install_hooks();
 `ifdef OCV_BOARD
             if (ocv_opened) return;
+            if (ocv_model_on) return;                  // (the runner opens the hub: start())
             void'($value$plusargs("OCV_BASE=%s", s));   // parsed in C: 64-bit, 0x... or decimal
             if (!ocv_dpi_open(s)) `uvm_fatal("OCV", "cannot open the DUT on the board (see the message above)")
             ocv_opened = 1;
@@ -223,6 +234,24 @@ package ocv_uvm_pkg;
             int squash = 1;
             if (ocv_running) return;
             ocv_running = 1;
+            if (ocv_model_on) begin
+                // the runner checks the DUT against the model; the testbench takes part when the runner hands it the
+                // token: more stimulus, a device access, the end (ocv_uvm_runner.c). Time: a step per hand-over.
+                if (!ocv_dpi_model_board_open(ocv_model_run_args))
+                    `uvm_fatal("OCV", "cannot start the runner on the board (see the message above)")
+                fork
+                    forever begin
+                        #1ns;                          // (the testbench's zero-time work first: what its drivers send)
+                        ocv_dpi_model_wait();
+                        ocv_progress++;
+                        if (ocv_dpi_model_board_done(ocv_model_rc)) begin
+                            ocv_model_ended = 1;
+                            break;
+                        end
+                    end
+                join_none
+                return;
+            end
             void'($value$plusargs("OCV_CLK_NS=%f", ocv_clk_ns));
             void'($value$plusargs("OCV_SQUASH=%d", squash));   // engine A: fused windows of N records
             if (!ocv_dpi_go(squash)) `uvm_fatal("OCV", "cannot start the DUT (see the message above)")
@@ -251,7 +280,7 @@ package ocv_uvm_pkg;
 
         static function void close();
 `ifdef OCV_BOARD
-            if (ocv_opened) `uvm_info("OCV", ocv_dpi_close(), UVM_NONE)
+            if (ocv_opened && !ocv_model_on) `uvm_info("OCV", ocv_dpi_close(), UVM_NONE)
             ocv_opened = 0;
 `endif
         endfunction
@@ -279,7 +308,11 @@ package ocv_uvm_pkg;
             forever begin
                 seq_item_port.get_next_item(t);
 `ifdef OCV_BOARD
-                if (t.blk.size() == 0) begin
+                if (ocv_model_on) begin               // the runner takes it (stimulus, or a device answer)
+                    if (t.blk.size() == 0) ocv_dpi_model_send(ch, t.to_rec());
+                    else foreach (t.blk[i]) ocv_dpi_model_send(ch, t.blk[i]);
+                    ocv_sent++;
+                end else if (t.blk.size() == 0) begin
                     while (!ocv_dpi_send(ch, t.to_rec())) ocv_board::wait_progress();   // ring full
                     ocv_sent++;
                 end else begin
@@ -345,7 +378,7 @@ package ocv_uvm_pkg;
             forever begin
 `ifdef OCV_BOARD
                 ocv_rec_t r;
-                if (!ocv_dpi_recv(ch, r)) begin
+                if (!(ocv_model_on ? ocv_dpi_model_recv(ch, r) : ocv_dpi_recv(ch, r))) begin
                     ocv_board::wait_progress();
                     continue;
                 end
@@ -448,14 +481,32 @@ package ocv_uvm_pkg;
         bit     done;
         int     max_reports = 10;
 
-        function new(string name, uvm_component parent); super.new(name, parent); endfunction
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+            ocv_model_on = 1;                // (before any agent's build_phase: on the board they then leave the hub to the runner)
+        endfunction
 
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
             void'($value$plusargs("OCV_MODEL=%s", opts));   // (or what the env set before this phase)
+`ifdef OCV_BOARD
+            // the runner's options (+OCV_RUN, default: windows of 4096 records) and the model's
+            begin
+                string run = "--squash 4096", t;
+                int i0 = 0;
+                void'($value$plusargs("OCV_RUN=%s", run));
+                ocv_model_run_args = run;
+                for (int i = 0; i <= opts.len(); i++)
+                    if (i == opts.len() || opts[i] == " ") begin
+                        t = opts.substr(i0, i - 1);
+                        if (t.len() > 0) ocv_model_run_args = {ocv_model_run_args, " --model-opt ", t};
+                        i0 = i + 1;
+                    end
+            end
+`else
             if (!ocv_dpi_model_open(opts))
                 `uvm_fatal("OCV", $sformatf("%s: no OCV reference model linked into the testbench", get_full_name()))
-            ocv_model_on = 1;
+`endif
         endfunction
 
         function void collect();
@@ -483,6 +534,17 @@ package ocv_uvm_pkg;
             longint last = -1, n;
             int still = 0;
             bit told;
+`ifdef OCV_BOARD
+            // the runner checks; its verdict comes at the end (a mismatch: its line with the exact record above)
+            ocv_board::start();
+            wait (ocv_model_ended);
+            if (ocv_model_rc != 0) begin
+                n_errors++;
+                `uvm_error("OCV_MODEL", $sformatf("the runner found the DUT and the model apart (exit %0d): see its MISMATCH line", ocv_model_rc))
+            end
+            done = 1;
+            forever #1ms;
+`endif
             forever begin
                 #1us;
                 collect();
@@ -498,6 +560,10 @@ package ocv_uvm_pkg;
         endtask
 
         function void report_phase(uvm_phase phase);
+`ifdef OCV_BOARD
+            `uvm_info("OCV_MODEL", $sformatf("%s: the runner checked the DUT against the model: exit %0d", get_name(), ocv_model_rc), UVM_NONE)
+            return;
+`endif
             collect();
             ocv_dpi_model_close();
             `uvm_info("OCV_MODEL", $sformatf("%s: %0d records checked against the model, %0d mismatches%s", get_name(),

@@ -775,6 +775,10 @@ static int report_mismatch(run_t *r, int ch, uint32_t i, int field, int context,
  * memory this process gives back) */
 #define RUN_END(v) do { int rc_ = (v); ocv_env_close(&r.env); return rc_; } while (0)
 
+/* Set by an environment that makes the stimulus itself (a UVM testbench's sequences: uvm/ocv_uvm_runner.c): the
+ * records of the non-stream sources come from it instead of the model's stimulus() - 0 when it has no more */
+int (*ocv_runner_stimulus_hook)(int ch, uint64_t index, uint32_t *rec);
+
 int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
 {
     const ocv_dut_t *dut = ocv_model_dut;
@@ -984,7 +988,9 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                 uint32_t *rec = r.stim[ch] + (size_t)r.n_stim[ch] * c->rec_words;
                 memset(rec, 0, c->rec_words * 4u);
                 int got = 1;
-                if (ocv_model.stimulus)
+                if (ocv_runner_stimulus_hook)
+                    got = ocv_runner_stimulus_hook(ch, stim_index[ch], rec);
+                else if (ocv_model.stimulus)
                     got = ocv_model.stimulus(ch, stim_index[ch], rec, &rng);
                 else
                     for (int f = 0; f < c->n_fields; f++) ocv_set_raw(rec, &c->fields[f], ocv_rand(&rng));
