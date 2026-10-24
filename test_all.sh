@@ -19,7 +19,9 @@
 #  12. the verifier's own coverage: Verilator's covergroups against IEEE 1800-2023 (t_cg_ieee.sv); CVA6's
 #      covergroups (core-v-verif) over the reference model's RVFI records (examples/cva6/cov/cov.sh); the
 #      model's record filter: its fields against isacov's monitor, the kept records' coverage = all records'
-# FAST=1 skips steps 6 and 8.
+#  13. UVM tests written by the OCV contract (no description file): SCR1 and CVA6 (the core against its model,
+#      ocv_model_checker) in simulation and in the board form with the FPGA simulated
+# FAST=1 skips steps 6, 8 and 13.
 set -uo pipefail
 OCV=$(cd "$(dirname "$0")" && pwd)
 B=$OCV/build/test_all
@@ -255,6 +257,31 @@ if [ -d "$OCV/ext/cva6" ]; then
     ok $?
 else
     echo "  (no ext/cva6: tools/get_cores.sh)"
+fi
+
+step "13. UVM tests by the contract: SCR1 and CVA6, simulation and the board form"
+if [ "${FAST:-0}" = 1 ]; then
+    echo "  (FAST=1: skipped)"
+else
+    # SCR1: the description and the record packing derived from the testbench's classes (uvm/ocv_contract.py)
+    for M in pc host; do
+        (ulimit -v 16000000; OUT=$B/scr1_c_$M "$OCV/examples/scr1/uvm_c/run.sh" $M) > "$B/scr1_c_${M}_build.log" 2>&1 && \
+            (ulimit -v 8000000; timeout 900 "$B/scr1_c_$M/tb_top" +PROG="$OCV/examples/scr1/programs/hello.hex" \
+                +UVM_NO_RELNOTES > "$B/scr1_c_$M.log" 2>&1)
+        grep -E "\[SB\] .*compared" "$B/scr1_c_$M.log" | sed "s/.*\[SB\]/  scr1 $M: [SB]/"
+        grep -q "\[SB\] 9610 instructions compared, 0 errors" "$B/scr1_c_$M.log"; ok $?
+    done
+    # CVA6: every record against the core's model; the board form through the runner (the hw/cpu image's hub)
+    if [ -d "$OCV/ext/cva6" ]; then
+        for M in pc host; do
+            (ulimit -v 16000000; OUT=$B/cva6_c_$M "$OCV/examples/cva6/uvm_c/run.sh" $M) > "$B/cva6_c_${M}_build.log" 2>&1 && \
+                (cd "$B/cva6_c_$M" && ulimit -v 8000000 && timeout 900 ./tb_top +PROG="$OCV/build/repro/cva6/minstret.hex" \
+                    +UVM_NO_RELNOTES > "$B/cva6_c_$M.log" 2>&1)
+            grep -E "OCV_MODEL\] chk|^OCV: cva6 (PASS|FAIL)" "$B/cva6_c_$M.log" | sed "s/^/  cva6 $M: /" | cut -c1-200
+            grep -q "UVM_ERROR :    0" "$B/cva6_c_$M.log" && grep -q "UVM_FATAL :    0" "$B/cva6_c_$M.log" && \
+                grep -qE "300094 records checked against the model, 0 mismatches|^OCV: cva6 PASS" "$B/cva6_c_$M.log"; ok $?
+        done
+    fi
 fi
 
 printf '\nTEST_ALL: %s\n' "$([ $fails -eq 0 ] && echo PASS || echo "$fails FAILED")"
