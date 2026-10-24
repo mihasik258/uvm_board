@@ -20,6 +20,8 @@
 # More Verilator arguments for the testbench (file lists -f, defines, --vpi): TB_VFLAGS; more objects or
 # linker flags: TB_LDFLAGS. Optimisation: OCV_OPT (default -O2), OCV_OPT_SLOW (code run once, default -O1).
 # Output: $OUT (default build/uvm/<name>_board_<target> next to the descriptor)/<tb_top>.
+# A testbench written by the OCV contract (no description file): OCV_CONTRACT=<dir> of uvm/ocv_contract.py, whose
+# desc.json is the descriptor here.
 # Verilator and UVM: tools/get_verilator.sh.
 set -euo pipefail
 OCV=$(cd "$(dirname "$0")/.." && pwd)
@@ -167,6 +169,12 @@ if [ "$TARGET" = pc ] || [ "$TARGET" = wave ]; then VDUT=(${RTL_DEFINES:-} "${RT
 else VDUT=(+define+OCV_BOARD --converge-limit 2000000000); fi
 OCVSV=("$OCV/uvm/ocv_uvm_pkg.sv" "$UVMGEN/${NAME}_ocv_uvm_pkg.sv" "$UVMGEN/${NAME}_ocv_uvm_harness.sv")
 [ "$DESC" = - ] && OCVSV=()
+# OCV_CONTRACT=<dir> (uvm/ocv_contract.py's output): a testbench written by the contract - its own agents and top,
+# OCV's package and the derived packing; the board builds instantiate the DUT's empty stub (the DUT is in the FPGA)
+if [ -n "${OCV_CONTRACT:-}" ]; then
+    OCVSV=("$OCV/uvm/ocv_uvm_pkg.sv" "$OCV_CONTRACT/${NAME}_ocv_contract_pkg.sv")
+    [ "$TARGET" = pc ] || [ "$TARGET" = wave ] || OCVSV+=("$OCV_CONTRACT/${NAME}_ocv_stub.sv")
+fi
 # (main: uvm/vlt/ocv_main.cpp - the exit code says whether UVM reported an error)
 "$VERILATOR" --cc --exe --timing --timescale 1ns/1ps -Wno-fatal -Wno-lint -Wno-style \
     "${VTRACE[@]}" "${VDUT[@]}" +incdir+"$OCV/uvm/vlt" "$OCV/uvm/vlt/ocv_fast_random.cpp" \

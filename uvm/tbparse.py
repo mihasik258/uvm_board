@@ -233,6 +233,65 @@ def analyse_monitor(name, body, reset_sig):
     return {"fields": fields, "valid": sigs[0], "ready": sigs[1] if len(sigs) > 1 else None, "ap": w.group(1)}
 
 
+def task_arg(body, name):
+    """the argument name of task <name>(T t) / (output T t)"""
+    m = re.search(r"\btask\s+(?:automatic\s+)?" + name + r"\s*\(\s*(?:input|output|ref)?\s*\w+\s+(\w+)\s*\)", body)
+    return m.group(1) if m else None
+
+
+def analyse_drive(name, body):
+    """a contract driver (ocv_source_driver): drive(T t) puts t on the pins of a valid/ready transfer and
+    returns when the DUT has taken it -> {fields: {field: sig}, valid, ready}"""
+    b, t = task_body(body, "drive"), task_arg(body, "drive")
+    if b is None or t is None:
+        raise TbError(f"{name}: no task drive(<item> t) - a contract driver puts the item on the pins there")
+    fields = dict((f, sig) for sig, f in re.findall(r"\bvif\.(\w+)\s*<?=\s*" + t + r"\.(\w+)\s*;", b))
+    sets = re.findall(r"\bvif\.(\w+)\s*<?=\s*1'b([01])\s*;", b)
+    ups = [x for x, v in sets if v == "1"]
+    downs = [x for x, v in sets if v == "0"]
+    vs = [x for x in ups if x in downs]
+    if len(vs) != 1:
+        raise TbError(f"{name}: drive() has no single valid (a vif signal set to 1 with the item and back to 0 after it)")
+    w = re.search(r"\bwhile\s*\(\s*!\s*vif\.(\w+)\s*\)", b) or re.search(r"\bwait\s*\(\s*vif\.(\w+)\s*\)", b) \
+        or re.search(r"\biff\s*\(?\s*vif\.(\w+)\s*\)?", b)
+    if not w:
+        raise TbError(f"{name}: drive() does not wait for a ready (do @(posedge vif.clk); while (!vif.ready);)")
+    extra = re.sub(r"\bvif\.\w+\s*<?=\s*(" + t + r"\.\w+|1'b[01])\s*;", "", b)
+    extra = re.sub(r"\bdo\s+@\s*\(\s*posedge\s+vif\.\w+\s*\)\s*;\s*while\s*\([^;]*\)\s*;|"
+                   r"@\s*\(\s*posedge\s+vif\.\w+\s*\)\s*;|\bwait\s*\([^;]*\)\s*;", "", extra)
+    if extra.strip():
+        raise TbError(f"{name}: drive() does more than put the item on the pins: '{extra.strip()[:80]}'")
+    return {"fields": fields, "valid": vs[0], "ready": w.group(1)}
+
+
+def analyse_sample(name, body, reset_sig):
+    """a contract monitor (ocv_monitor): sample(output T t) waits for the next transfer on the pins and
+    copies them into a new item -> {fields: {field: sig}, valid, ready}"""
+    b, t = task_body(body, "sample"), task_arg(body, "sample")
+    if b is None or t is None:
+        raise TbError(f"{name}: no task sample(output <item> t) - a contract monitor takes a transfer off the pins there")
+    m = re.search(r"\bdo\s+@\s*\(\s*posedge\s+vif\.(\w+)\s*\)\s*;\s*while\s*\(\s*!\s*\((.*?)\)\s*\)\s*;", b, re.S) \
+        or re.search(r"\bdo\s+@\s*\(\s*posedge\s+vif\.(\w+)\s*\)\s*;\s*while\s*\(\s*!\s*(vif\.\w+)\s*\)\s*;", b, re.S)
+    if not m:
+        raise TbError(f"{name}: sample() does not wait as 'do @(posedge vif.clk); while (!(<valid> [&& <ready>]));'")
+    sigs = []
+    for x in [y.strip() for y in m.group(2).split("&&")]:
+        mm = re.fullmatch(r"\(?\s*vif\.(\w+)\s*\)?", x)
+        if not mm:
+            raise TbError(f"{name}: condition term '{x}' is not a vif signal")
+        if reset_sig and ("vif." + mm.group(1) == reset_sig or mm.group(1) == reset_sig.split(".")[-1]):
+            continue
+        sigs.append(mm.group(1))
+    if not 1 <= len(sigs) <= 2:
+        raise TbError(f"{name}: sample() must wait for a valid (and a ready), got {sigs}")
+    fields = dict((f, x) for f, x in re.findall(t + r"\.(\w+)\s*=\s*vif\.(\w+)\s*;", b))
+    rest = b[m.end():]
+    rest = re.sub(t + r"\.\w+\s*=\s*vif\.\w+\s*;|" + t + r"\s*=\s*\w+::type_id::create\s*\([^)]*\)\s*;", "", rest)
+    if rest.strip():
+        raise TbError(f"{name}: sample() does more than copy pins into the item: '{rest.strip()[:80]}'")
+    return {"fields": fields, "valid": sigs[0], "ready": sigs[1] if len(sigs) > 1 else None}
+
+
 def signed_signals(text):
     """interface signals declared signed"""
     out = set()
@@ -291,9 +350,9 @@ def parse(texts, top):
     tb_driven = {x for x in re.findall(r"\b\w+\.(\w+)\s*(?:<=|=)(?!=)", text) if x in widths}
     monitors = []
     for name, (base, tparam, body) in cls.items():
-        if base == "uvm_driver" and tparam:
+        if base in ("uvm_driver", "ocv_source_driver") and tparam:
             item = tparam.split(",")[0].strip()
-            d = analyse_driver(name, item, body)
+            d = analyse_driver(name, item, body) if base == "uvm_driver" else analyse_drive(name, body)
             iw = item_fields(cls, item)
             ch = {"name": re.sub(r"_(item|txn|tr|trans|transaction|seq_item)$", "", item), "kind": "source",
                   "depth": DEPTH_SOURCE, "valid": port(name, d["valid"]), "ready": port(name, d["ready"]),
@@ -304,11 +363,17 @@ def parse(texts, top):
             ch["fields"] = fields_of(d["fields"].items(), widths, lambda s_, n=name: port(n, s_), sgn)
             chans.append(ch)
         elif base == "uvm_monitor":
-            monitors.append((name, body))
-    for name, body in monitors:
-        d = analyse_monitor(name, body, rst_sig)
-        mm = re.search(r"uvm_analysis_port\s*#\s*\(\s*(\w+)\s*\)", body)
-        item = mm.group(1) if mm else None
+            monitors.append((name, body, None))
+        elif base == "ocv_monitor" and tparam:
+            monitors.append((name, body, tparam.split(",")[0].strip()))
+    for name, body, citem in monitors:
+        if citem:                                   # a contract monitor: the item is its parameter
+            d = dict(analyse_sample(name, body, rst_sig), ap="ap")
+            item = citem
+        else:
+            d = analyse_monitor(name, body, rst_sig)
+            mm = re.search(r"uvm_analysis_port\s*#\s*\(\s*(\w+)\s*\)", body)
+            item = mm.group(1) if mm else None
         sigs = [d["valid"]] + ([d["ready"]] if d["ready"] else [])
         # a monitor on the DUT's inputs: what a driver gives it (on the board: what the driver sent)
         src = [c for c in chans if c["kind"] == "source" and c["_sigs"]["valid"] in sigs]
@@ -338,7 +403,7 @@ def parse(texts, top):
         ch["fields"] = fields_of(d["fields"].items(), widths, lambda s_, n=name: port(n, s_), sgn)
         chans.append(ch)
     if not chans:
-        raise TbError("no uvm_driver or uvm_monitor found")
+        raise TbError("no uvm_driver / ocv_source_driver or uvm_monitor / ocv_monitor found")
     names = [c["name"] for c in chans]
     if len(set(names)) != len(names):
         raise TbError(f"two channels with one name: {names}")

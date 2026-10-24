@@ -13,7 +13,15 @@
 //     coverage and models work on transactions;
 //  3. no assumption about the cycle a transaction happens in: the board runs the DUT at its own
 //     clock, the testbench at the processor's pace (the DUT waits for it - no loss);
-//  4. the test ends on transactions (expected count received), not on a delay.
+//  4. the test ends on transactions (expected count received), not on a delay;
+//  5. transactions extend ocv_item, one item class per channel, created through the factory
+//     (<item>::type_id::create): their record packing is derived, not written (uvm/ocv_contract.py);
+//  6. a driver extends ocv_source_driver and puts one item on the pins in drive(t): the item's fields to
+//     interface signals, a valid raised with them, `do @(posedge vif.clk); while (!vif.<ready>);`, valid
+//     lowered; a monitor extends ocv_monitor and takes one transfer in sample(t):
+//     `do @(posedge vif.clk); while (!(vif.<valid> [&& vif.<ready>]));`, the item created, its fields from
+//     interface signals. From these shapes and the top's wiring of the DUT to the interface the DUT's
+//     description is derived - there is no description file to write (uvm/ocv_contract.py, uvm/tbparse.py).
 `ifndef OCV_UVM_PKG_SV
 `define OCV_UVM_PKG_SV
 `include "uvm_macros.svh"
@@ -91,8 +99,18 @@ package ocv_uvm_pkg;
     virtual class ocv_item extends uvm_sequence_item;
         ocv_rec_t blk[$];
         function new(string name = "ocv_item"); super.new(name); endfunction
-        pure virtual function ocv_rec_t to_rec();
-        pure virtual function void from_rec(ocv_rec_t r);
+        static function string type_name(); return "ocv_item"; endfunction   // (an item's `uvm_object_utils gives its own)
+        // The packing of the fields into the hub's record. Nobody writes it: ocv_contract.py derives it from
+        // the item class's fields (as the channel's descriptor does) into a subclass <item>__ocv, which the
+        // factory gives for every <item>::type_id::create (so items are created through the factory, rule 5);
+        // the generator of the description-file path (ocv_uvm_gen.py) writes it into the item itself.
+        virtual function ocv_rec_t to_rec();
+            `uvm_fatal("OCV", $sformatf("%s: no record packing - create the item with %s::type_id::create (rule 5), and build with uvm/ocv_contract.py", get_type_name(), get_type_name()))
+            return '0;
+        endfunction
+        virtual function void from_rec(ocv_rec_t r);
+            `uvm_fatal("OCV", $sformatf("%s: no record packing - create the item with %s::type_id::create (rule 5), and build with uvm/ocv_contract.py", get_type_name(), get_type_name()))
+        endfunction
         function void add_record(ocv_item r);
             blk.push_back(r.to_rec());
         endfunction
@@ -102,6 +120,32 @@ package ocv_uvm_pkg;
             if ($cast(o, rhs)) blk = o.blk;
         endfunction
     endclass
+
+    // The channel of each item type (ocv_contract.py: one channel per item class, numbered as the hub's),
+    // filled before any phase by the derived package's static initialisation; agents, drivers, monitors and
+    // checkers whose `ch` nobody set find theirs here
+    int ocv_channel_of[string];
+
+    // What the derived package installs once UVM is up (the record packing's factory overrides): registered at
+    // its static initialisation, run by the first agent's build_phase - the factory itself is made at UVM's own
+    // static initialisation, which may come after the derived package's
+    virtual class ocv_hook;
+        pure virtual function void install();
+    endclass
+    ocv_hook ocv_hooks[$];
+    bit      ocv_hooks_done;
+
+    function automatic void ocv_install_hooks();
+        if (ocv_hooks_done) return;
+        ocv_hooks_done = 1;
+        foreach (ocv_hooks[i]) ocv_hooks[i].install();
+    endfunction
+
+    function automatic int ocv_lookup_channel(string item_type, string who);
+        if (!ocv_channel_of.exists(item_type))
+            `uvm_fatal("OCV", $sformatf("%s: item type '%s' is no channel of this DUT (set ch, or build with uvm/ocv_contract.py)", who, item_type))
+        return ocv_channel_of[item_type];
+    endfunction
 
     // State shared by all agents. Package variables, not static class members: simulators
     // differ on statics (xsim loses their values); a package variable is plain and portable.
@@ -137,6 +181,9 @@ package ocv_uvm_pkg;
         static function void open();
 `ifdef OCV_BOARD
             string s = "";
+`endif
+            ocv_install_hooks();
+`ifdef OCV_BOARD
             if (ocv_opened) return;
             void'($value$plusargs("OCV_BASE=%s", s));   // parsed in C: 64-bit, 0x... or decimal
             if (!ocv_dpi_open(s)) `uvm_fatal("OCV", "cannot open the DUT on the board (see the message above)")
@@ -204,6 +251,7 @@ package ocv_uvm_pkg;
 
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
+            if (ch < 0) ch = ocv_lookup_channel(T::type_name(), get_full_name());
             ap = new("ap", this);
             ocv_board::open();
         endfunction
@@ -226,7 +274,7 @@ package ocv_uvm_pkg;
 `else
                 if (t.blk.size() == 0) drive(t);
                 else foreach (t.blk[i]) begin         // a block on the pins: record by record
-                    T x = new();
+                    T x = T::type_id::create("x");
                     x.from_rec(t.blk[i]);
                     drive(x);
                 end
@@ -266,6 +314,7 @@ package ocv_uvm_pkg;
 
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
+            if (ch < 0) ch = ocv_lookup_channel(T::type_name(), get_full_name());
             ap = new("ap", this);
             ocv_board::open();
         endfunction
@@ -315,7 +364,7 @@ package ocv_uvm_pkg;
 
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
-            if (ch < 0) `uvm_fatal("OCV", "ocv_checker: set ch (the channel number) before build")
+            if (ch < 0) ch = ocv_lookup_channel(T::type_name(), get_full_name());
             if (!ocv_dpi_check_enable(ch))
                 `uvm_fatal("OCV", $sformatf("%s: no C reference function registered for channel %0d (OCV_UVM_CHECKER)", get_name(), ch))
             ocv_board::open();
