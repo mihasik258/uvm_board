@@ -82,6 +82,9 @@ module cva6_64_ocv_core
         c.XFVec       = 1'b0;
         c.RVB         = 1'b0;
         c.RVZCB       = 1'b0;
+        // one commit port (cv64a6 has two): the wrapper reports one retirement per clock (RVFI port 0) - two ports
+        // would need the wrapper to queue the second record (not yet: docs/FOCUS.md 4.11)
+        c.NrCommitPorts = 1;
         // no coprocessor on CV-X-IF (the example one adds custom instructions)
         c.CvxifEn     = 1'b0;
         // no AXI user signals: nothing on the platform uses them

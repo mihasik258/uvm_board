@@ -150,6 +150,7 @@ cpu_model_t *spike_create(const char *isa, const cpu_env_t *env, uint32_t reset_
         }
     }
     m->isa = isa;
+    if (m->isa.find(':') != std::string::npos) m->isa.resize(m->isa.find(':'));   // (":<profile>": the built-in models')
     m->xlen = !strncasecmp(isa, "rv64", 4) ? 64 : 32;
     m->cfg.isa = m->isa.c_str();
     m->cfg.priv = "M";
