@@ -41,6 +41,39 @@ CPU_INLINE void cpu_set_or(uint32_t *rec, const ocv_field_t *f, uint32_t v)
     if (o && o + f->width > 32u) rec[w + 1] |= v >> (32u - o);
 }
 
+/* the same for a field of up to 64 bits (an RV64 core's values: CPU_XLEN 64) */
+CPU_INLINE void cpu_set_or64(uint32_t *rec, const ocv_field_t *f, uint64_t v)
+{
+    if (!f) return;
+    if (f->width < 64) v &= (1ull << f->width) - 1u;
+    const unsigned o = f->lsb & 31u, w = f->lsb >> 5;
+    rec[w] |= (uint32_t)(v << o);
+    if (o + f->width > 32u) rec[w + 1] |= (uint32_t)((o ? v >> (32u - o) : v >> 32));
+    if (o + f->width > 64u) rec[w + 2] |= (uint32_t)(v >> (64u - o));
+}
+
+/* the core's register width (gen/cpu_wrap.py writes ocv_cpu_xlen.h next to ocv_cpu_wrap.h; without it: 32) */
+#if !defined(CPU_XLEN) && defined(__has_include)
+#if __has_include("ocv_cpu_xlen.h")
+#include "ocv_cpu_xlen.h"
+#endif
+#endif
+#ifndef CPU_XLEN
+#define CPU_XLEN 32
+#endif
+#if CPU_XLEN == 64
+#define CPU_SET(rec, f, v) cpu_set_or64(rec, f, (uint64_t)(v))
+#else
+#define CPU_SET(rec, f, v) cpu_set_or(rec, f, (uint32_t)(v))
+#endif
+
+static inline uint64_t cpu_bytes64(uint32_t be)
+{
+    uint64_t m = 0;
+    for (int i = 0; i < 8; i++) if (be >> i & 1) m |= 0xFFull << (8 * i);
+    return m;
+}
+
 static inline uint32_t cpu_bytes(uint32_t be)
 {
     return (be & 1 ? 0xFFu : 0) | (be & 2 ? 0xFF00u : 0) | (be & 4 ? 0xFF0000u : 0) | (be & 8 ? 0xFF000000u : 0);
@@ -56,13 +89,13 @@ CPU_INLINE int cpu_stream_out(const cpu_stream_t *s, const cpu_retire_t *r, int 
     switch (s->kind) {
     case CPU_S_RETIRE:
         memset(rec[0], 0, sizeof rec[0]);
-        cpu_set_or(rec[0], F[0], r->pc); cpu_set_or(rec[0], F[1], r->pc_next); cpu_set_or(rec[0], F[2], r->insn);
-        cpu_set_or(rec[0], F[3], r->rd_addr); cpu_set_or(rec[0], F[4], r->rd_wdata); cpu_set_or(rec[0], F[5], r->trap);
+        CPU_SET(rec[0], F[0], r->pc); CPU_SET(rec[0], F[1], r->pc_next); cpu_set_or(rec[0], F[2], r->insn);
+        cpu_set_or(rec[0], F[3], r->rd_addr); CPU_SET(rec[0], F[4], r->rd_wdata); cpu_set_or(rec[0], F[5], r->trap);
         return 1;
     case CPU_S_ISSUE:
         if (!r->trap || r->insn == 0x00000073u || (r->insn == 0x00100073u && !(s->filter & CPU_I_ECALL))) {
             memset(rec[0], 0, sizeof rec[0]);
-            cpu_set_or(rec[0], F[0], r->pc);
+            CPU_SET(rec[0], F[0], r->pc);
             cpu_set_or(rec[0], F[1], c && (s->filter & CPU_I_RAW) ? raw & 0xFFFFu : r->insn);
             cpu_set_or(rec[0], F[2], (uint32_t)c);
             return 1;
@@ -72,7 +105,7 @@ CPU_INLINE int cpu_stream_out(const cpu_stream_t *s, const cpu_retire_t *r, int 
         const int load = (r->insn & 0x7f) == 0x03;
         if (r->rd_addr && (s->filter == CPU_W_ALL || (s->filter == CPU_W_LOAD) == load)) {
             memset(rec[0], 0, sizeof rec[0]);
-            cpu_set_or(rec[0], F[0], r->rd_addr); cpu_set_or(rec[0], F[1], r->rd_wdata);
+            cpu_set_or(rec[0], F[0], r->rd_addr); CPU_SET(rec[0], F[1], r->rd_wdata);
             return 1;
         }
         return 0;
@@ -83,12 +116,30 @@ CPU_INLINE int cpu_stream_out(const cpu_stream_t *s, const cpu_retire_t *r, int 
         const uint32_t f3 = (r->insn >> 12) & 7;
         if (!r->trap && (r->insn & 0x7f) == 0x73 && f3 != 0 && f3 != 4 && r->rd_addr) {
             memset(rec[0], 0, sizeof rec[0]);
-            cpu_set_or(rec[0], F[0], r->rd_wdata);
+            CPU_SET(rec[0], F[0], r->rd_wdata);
             return 1;
         }
         return 0;
     }
     default:
+#if CPU_XLEN == 64
+        if (r->mem_we) {                             /* (8-byte words: as the core's store stream) */
+            const uint32_t sh = (uint32_t)(r->mem_addr & 7), be = (r->mem_wmask << sh) & 0xFF;
+            const uint64_t w = r->mem_addr & ~7ull;
+            memset(rec[0], 0, sizeof rec[0]);
+            cpu_set_or64(rec[0], F[0], w); cpu_set_or(rec[0], F[1], be);
+            cpu_set_or64(rec[0], F[2], (r->mem_wdata << (8 * sh)) & cpu_bytes64(be));
+            if (sh && r->mem_wmask >> (8 - sh)) {
+                const uint32_t be2 = r->mem_wmask >> (8 - sh);
+                memset(rec[1], 0, sizeof rec[1]);
+                cpu_set_or64(rec[1], F[0], w + 8); cpu_set_or(rec[1], F[1], be2);
+                cpu_set_or64(rec[1], F[2], (r->mem_wdata >> (8 * (8 - sh))) & cpu_bytes64(be2));
+                return 2;
+            }
+            return 1;
+        }
+        return 0;
+#else
         if (r->mem_we) {
             const uint32_t sh = r->mem_addr & 3, w = r->mem_addr & ~3u, be = (r->mem_wmask << sh) & 0xF;
             memset(rec[0], 0, sizeof rec[0]);
@@ -103,6 +154,7 @@ CPU_INLINE int cpu_stream_out(const cpu_stream_t *s, const cpu_retire_t *r, int 
             return 1;
         }
         return 0;
+#endif
     }
 }
 

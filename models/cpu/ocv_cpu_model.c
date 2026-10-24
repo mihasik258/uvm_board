@@ -133,7 +133,9 @@ static int      ckpt_ch = -1;
  * on the PC) - there it beats fast (board 14.10.2026, CVA6 Embench x100: nettle-aes 196 -> 164 s, picojpeg
  * 131 -> 112 s, huffbench 90 -> 82 s). On short generated programs (code run once) fast is quicker, but those
  * take seconds either way. fast on the PC (jit emits AArch64). --model-opt cpu=fast keeps it selectable. */
-#if defined(__aarch64__)
+#if CPU_XLEN == 64
+static char     cpu_name[16] = "spike";       /* an RV64 core: the built-in models (iss, fast, jit) are RV32 */
+#elif defined(__aarch64__)
 static char     cpu_name[16] = "jit";
 #else
 static char     cpu_name[16] = "fast";
@@ -961,6 +963,12 @@ static void run_program(ocv_model_io_t *io)
     cpu_env_t env = { regions, CPU_N_RAMS + CPU_N_REGIONS_EXTRA, mmio_load, mmio_store, timing_csr, NULL,
                       CPU_N_FIXED_CSRS ? cpu_fixed_csrs : NULL, CPU_N_FIXED_CSRS };
     char err[256];
+#if CPU_XLEN == 64
+    if (strcmp(cpu_name, "spike")) {           /* (no silent wrong model: the RV32 ones cannot run it) */
+        fprintf(stderr, "%s model: an RV64 core needs cpu=spike - '%s' is an RV32 model\n", CPU_NAME, cpu_name);
+        exit(1);
+    }
+#endif
     cpu_model_t *cpu = cpu_create(cpu_name, CPU_ISA, &env, CPU_BOOT, err, sizeof err);
     if (!cpu) { fprintf(stderr, "%s model: %s\n", CPU_NAME, err); exit(1); }
     static int told;
