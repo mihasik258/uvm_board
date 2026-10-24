@@ -26,6 +26,7 @@ export RTL_DEFINES OCV_UVM_GEN="$GEN"
 export TB_C="$OCV/models/cpu/ocv_cpu_model.c $MODEL_SRCS"
 # the board builds: the runner checks the core against the model (ocv_model_checker's board side)
 [ "$MODE" = pc ] || TB_C="$TB_C $OCV/sw/lib/ocv_runner.c $OCV/uvm/ocv_uvm_runner.c"
+export OCV_HUB=plain                     # (the hub as the runner drives it: the hw/cpu image's)
 export TB_CFLAGS="$MODEL_CFLAGS -I$OUT/gen"
 # CVA6 in Verilator as hw/cpu/run.sh pc builds it
 export TB_VFLAGS="--x-assign fast --x-initial fast --noassert"

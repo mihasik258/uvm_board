@@ -241,6 +241,58 @@ package cva6_c_pkg;
         endtask
     endclass
     typedef ocv_source_agent #(dev_resp_item, dev_resp_driver) dev_resp_agent;
+    class in_irq_i_item extends ocv_item;
+        `uvm_object_utils(in_irq_i_item)
+        bit [63:0]   until_cycle;   // (the DUT's 'until': a keyword in SystemVerilog)
+        bit [31:0]   value;
+        function new(string name = "in_irq_i_item"); super.new(name); endfunction
+        function string convert2string(); return $sformatf("until=0x%0h value=0x%0h", until_cycle, value); endfunction
+    endclass
+    class in_irq_i_driver extends ocv_source_driver #(in_irq_i_item);
+        `uvm_component_utils(in_irq_i_driver)
+        virtual cva6_if vif;
+        function new(string name, uvm_component parent); super.new(name, parent); endfunction
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            if (!uvm_config_db #(virtual cva6_if)::get(this, "", "vif", vif)) `uvm_fatal("DRV", "no vif")
+        endfunction
+        task drive(in_irq_i_item t);
+            vif.in_irq_i_valid <= 1'b1;
+            vif.in_irq_i_until <= t.until_cycle;
+            vif.in_irq_i_value <= t.value;
+            do @(posedge vif.clk); while (!vif.in_irq_i_ready);
+            vif.in_irq_i_valid <= 1'b0;
+        endtask
+    endclass
+    typedef ocv_source_agent #(in_irq_i_item, in_irq_i_driver) in_irq_i_agent;
+
+    class cfg_lat_item extends ocv_item;
+        `uvm_object_utils(cfg_lat_item)
+        bit [31:0]   seed;
+        bit [7:0]    gnt;
+        bit [7:0]    rsp;
+        function new(string name = "cfg_lat_item"); super.new(name); endfunction
+        function string convert2string(); return $sformatf("seed=0x%0h gnt=0x%0h rsp=0x%0h", seed, gnt, rsp); endfunction
+    endclass
+    class cfg_lat_driver extends ocv_source_driver #(cfg_lat_item);
+        `uvm_component_utils(cfg_lat_driver)
+        virtual cva6_if vif;
+        function new(string name, uvm_component parent); super.new(name, parent); endfunction
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            if (!uvm_config_db #(virtual cva6_if)::get(this, "", "vif", vif)) `uvm_fatal("DRV", "no vif")
+        endfunction
+        task drive(cfg_lat_item t);
+            vif.cfg_lat_valid <= 1'b1;
+            vif.cfg_lat_seed <= t.seed;
+            vif.cfg_lat_gnt <= t.gnt;
+            vif.cfg_lat_rsp <= t.rsp;
+            do @(posedge vif.clk); while (!vif.cfg_lat_ready);
+            vif.cfg_lat_valid <= 1'b0;
+        endtask
+    endclass
+    typedef ocv_source_agent #(cfg_lat_item, cfg_lat_driver) cfg_lat_agent;
+
     // ---------------- the program: the image's non-zero words, `last` on the final one starts the core ----------------
     class load_seq extends uvm_sequence #(program_item);
         `uvm_object_utils(load_seq)
@@ -263,6 +315,30 @@ package cva6_c_pkg;
                 t.last = (i == words.size() - 1);
                 finish_item(t);
             end
+        endtask
+    endclass
+
+    // ---------------- the core's other inputs, set once per program: the interrupt lines' schedule and the memory's
+    // delays (this test: no interrupt, ever; no delays) ----------------
+    class inputs_seq extends uvm_sequence #(in_irq_i_item);
+        `uvm_object_utils(inputs_seq)
+        function new(string name = "inputs_seq"); super.new(name); endfunction
+        task body();
+            in_irq_i_item t = in_irq_i_item::type_id::create("t");
+            start_item(t);
+            t.until_cycle = '1;                        // the lines' value holds until this clock count: forever
+            t.value = 0;
+            finish_item(t);
+        endtask
+    endclass
+    class lat_seq extends uvm_sequence #(cfg_lat_item);
+        `uvm_object_utils(lat_seq)
+        function new(string name = "lat_seq"); super.new(name); endfunction
+        task body();
+            cfg_lat_item t = cfg_lat_item::type_id::create("t");
+            start_item(t);
+            t.seed = 0; t.gnt = 0; t.rsp = 0;      // no random delays
+            finish_item(t);
         endtask
     endclass
 
@@ -290,6 +366,8 @@ package cva6_c_pkg;
         proto_agent   proto;
         dev_req_agent dev_req;
         dev_resp_agent dev_resp;
+        in_irq_i_agent in_irq;
+        cfg_lat_agent  lat;
         ocv_model_checker chk;
         uvm_tlm_analysis_fifo #(dev_req_item) dev_fifo;
         function new(string name, uvm_component parent); super.new(name, parent); endfunction
@@ -303,6 +381,8 @@ package cva6_c_pkg;
             proto    = proto_agent::type_id::create("proto", this);
             dev_req  = dev_req_agent::type_id::create("dev_req", this);
             dev_resp = dev_resp_agent::type_id::create("dev_resp", this);
+            in_irq   = in_irq_i_agent::type_id::create("in_irq", this);
+            lat      = cfg_lat_agent::type_id::create("lat", this);
             chk      = ocv_model_checker::type_id::create("chk", this);
             chk.opts = "irq=0";                     // (+OCV_MODEL=... replaces it)
             dev_fifo = new("dev_fifo", this);
@@ -342,6 +422,17 @@ package cva6_c_pkg;
             if (seq.words.size() == 0) `uvm_fatal("TEST", $sformatf("%s: no program (file missing or empty)", file))
             `uvm_info("TEST", $sformatf("%s: %0d words", file, seq.words.size()), UVM_LOW)
             fork e.respond(); join_none
+            // (alongside the load: the wrapper takes the lines' schedule only while the core runs)
+            fork
+                begin
+                    lat_seq l = lat_seq::type_id::create("l");
+                    l.start(e.lat.sqr);
+                end
+                begin
+                    inputs_seq i = inputs_seq::type_id::create("i");
+                    i.start(e.in_irq.sqr);
+                end
+            join_none
             seq.start(e.prog.sqr);
             wait (e.chk.done || e.chk.n_errors > 10);
             phase.drop_objection(this);

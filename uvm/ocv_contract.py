@@ -46,15 +46,20 @@ def against(derived, given):
         if g is None:
             raise tbparse.TbError(f"{c['_class']}: channel '{c['name']}' (item {c['_item']}) is not one of the DUT's: "
                                   f"{', '.join(by)}")
-        gw = {f["name"]: f["width"] for f in g["fields"]}
-        for f in c["fields"]:
-            if gw.get(f["_of"]) != f["_w"]:
-                raise tbparse.TbError(f"{c['_class']}: field {c['_item']}.{f['_of']} ({f['_w']} bits) is not the DUT's "
-                                      f"'{c['name']}.{f['_of']}' ({gw.get(f['_of'], 'none')})")
+        # the item's fields go with the DUT's by the pin they are driven to / sampled from (drive(), sample()) -
+        # an item's field may have its own name (the DUT's 'until' is a keyword in SystemVerilog)
+        gp = {f.get("port"): f for f in g["fields"]}
         o = oby[c["name"]]
         o["_item"], o["_class"] = c["_item"], c["_class"]
-        for f in o["fields"]:
-            f.update({"_of": f["name"], "_lo": 0, "_w": f["width"]})
+        oport = {f.get("port"): f for f in o["fields"]}
+        for f in c["fields"]:
+            gf = gp.get(f["port"])
+            if gf is None or gf["width"] != f["width"]:
+                raise tbparse.TbError(f"{c['_class']}: {c['_item']}.{f['_of']} ({f['_w']} bits, pin {f['port']}) is no field "
+                                      f"of the DUT's channel '{c['name']}' ({', '.join(x['name'] + ':' + str(x.get('port')) for x in g['fields'])})")
+            oport[f["port"]].update({"_of": f["_of"], "_lo": f["_lo"], "_w": f["_w"]})
+        # fields the test does not take or give: not in its item (a monitor may look at part of a record)
+        o["_unmapped"] = [f["name"] for f in o["fields"] if "_of" not in f]
     out["channels"] = [c for c in out["channels"]]
     for k in ("_top", "_dut_instance", "_clk_sig"):
         out[k] = derived[k]
@@ -88,11 +93,13 @@ def packing_pkg(desc, meta, text):
         def part(f):                    # the item's field, or its 64-bit part (a field wider than the hub's limit)
             return f["_of"] if f["_lo"] == 0 and f["width"] == f["_w"] else f"{f['_of']}[{f['_lo']} +: {f['width']}]"
         for f in c["fields"]:
-            o.append(f"            r[{lsb[f['name']]} +: {f['width']}] = {part(f)};")
+            if "_of" in f:
+                o.append(f"            r[{lsb[f['name']]} +: {f['width']}] = {part(f)};")
         o += ["            return r;", "        endfunction",
               "        virtual function void from_rec(ocv_rec_t r);"]
         for f in c["fields"]:
-            o.append(f"            {part(f)} = r[{lsb[f['name']]} +: {f['width']}];")
+            if "_of" in f:
+                o.append(f"            {part(f)} = r[{lsb[f['name']]} +: {f['width']}];")
         o += ["        endfunction", "    endclass", ""]
     o += ["    // the channels, at static initialisation; the factory overrides once UVM is up (ocv_hook: the first",
           "    // agent's build_phase installs them)",

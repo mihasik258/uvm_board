@@ -102,6 +102,9 @@ static int stim_hook(int ch, uint64_t index, uint32_t *rec)
         got = pop(&stim[ch], rec, c->rec_words);
     }
     pthread_mutex_unlock(&mu);
+    if (getenv("OCV_UVM_MODEL_DEBUG") && (index < 3 || !got))
+        fprintf(stderr, "ocv_uvm_runner: stimulus %s[%llu] %s %08x %08x\n", c->name, (unsigned long long)index,
+                got ? "" : "none", got ? rec[0] : 0, got ? rec[1] : 0);
     return got;
 }
 
@@ -158,6 +161,11 @@ int ocv_dpi_model_board_open(const char *args)
     argbuf = strdup(args ? args : "");
     argv_[argc_++] = (char *)"ocv_uvm_runner";
     for (char *t = strtok(argbuf, " \t"); t && argc_ < 127; t = strtok(NULL, " \t")) argv_[argc_++] = t;
+    /* a batch takes all the stimulus the testbench sends (the runner caps each source at its depth): not the
+     * runner's default, the smallest source's depth */
+    int has_batch = 0;
+    for (int i = 1; i < argc_; i++) if (!strcmp(argv_[i], "--batch")) has_batch = 1;
+    if (!has_batch && argc_ < 125) { argv_[argc_++] = (char *)"--batch"; argv_[argc_++] = (char *)"1048576"; }
     argv_[argc_] = NULL;
     ocv_runner_stimulus_hook = stim_hook;
     if (&ocv_cpu_dev_hook && req_ch >= 0) ocv_cpu_dev_hook = dev_hook;
