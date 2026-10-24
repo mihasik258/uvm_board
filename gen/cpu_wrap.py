@@ -115,6 +115,20 @@ KINDS = {
     "watch": {"value": 32},
     "error": {"value": 32},
 }
+# the fields as wide as the core's registers (XLEN, from the model's ISA: rv32... / rv64...); a store's byte enables:
+# one per byte of XLEN
+XLEN_FIELDS = {("retire", "pc"), ("retire", "pc_next"), ("retire", "rd_wdata"), ("issue", "pc"), ("regw", "data"),
+               ("store", "addr"), ("store", "data"), ("csrr", "data")}
+
+
+def kind_width(xlen, kind, f):
+    if (kind, f) in XLEN_FIELDS:
+        return xlen
+    if (kind, f) == ("store", "be"):
+        return xlen // 8
+    return KINDS[kind][f]
+
+
 EXACT = ("interrupt", "csrr", "watch", "error")  # kinds kept record by record (never squashed)
 OBI = ["req", "gnt", "rvalid", "addr", "we", "be", "wdata", "rdata"]
 AXI = ["awid", "awaddr", "awlen", "awsize", "awburst", "awvalid", "awready", "wdata", "wstrb", "wlast", "wvalid", "wready",
@@ -138,6 +152,11 @@ def num(s):
 
 # ---------------------------------------------------------------- the binding
 class Bind:
+    @property
+    def xlen(self):
+        """the core's register width, from the model's ISA (rv32... / rv64...)"""
+        return 64 if self.model.lower().startswith("rv64") else 32
+
     def __init__(self, path):
         self.path = os.path.abspath(path)
         self.vars = dict(os.environ)
@@ -429,7 +448,7 @@ def generate(b, ports, out):
             L.append(f"    output logic [63:0] {s['name']}_seq,")
         for f in s["exprs"]:
             if f != "valid":
-                L.append(f"    output logic [{KINDS[s['kind']][f] - 1}:0] {s['name']}_{f},")
+                L.append(f"    output logic [{kind_width(b.xlen, s['kind'], f) - 1}:0] {s['name']}_{f},")
         if s["cycle"]:
             L.append(f"    output logic [63:0] {s['name']}_cycle,")
     L[-1] = L[-1].rstrip(",")
@@ -650,12 +669,12 @@ def generate(b, ports, out):
     endf = "pc_next" if end["kind"] == "retire" else "pc"
     if end["kind"] == "issue":
         # the end is a jump to EXIT, not running into it (EXIT may lie inside other programs' code)
-        L += ["    logic [31:0] prev_next_q;           // where the last issued instruction falls through to,",
+        L += [f"    logic [{b.xlen - 1}:0] prev_next_q;           // where the last issued instruction falls through to,",
               "    logic        prev_jump_q;           // and whether it is a jump (even to the next address)",
               "    always_ff @(posedge clk)",
               "        if (!core_rst_n) begin prev_next_q <= '1; prev_jump_q <= 1'b0; end",
               f"        else if ({at(end['exprs']['valid'])}) begin",
-              f"            prev_next_q <= ({at(end['exprs']['pc'])}) + ({at(end['exprs']['c']) if 'c' in end['exprs'] else '0'} ? 32'd2 : 32'd4);",
+              f"            prev_next_q <= ({at(end['exprs']['pc'])}) + ({at(end['exprs']['c']) if 'c' in end['exprs'] else '0'} ? {b.xlen}'d2 : {b.xlen}'d4);",
               f"            prev_jump_q <= ({at(end['exprs']['insn'])}) ==? 32'b????????????????????????_1101111 ||"
               f" ({at(end['exprs']['insn'])}) ==? 32'b????????????????????????_1100111 ||"
               f" ({at(end['exprs']['insn'])}) ==? 32'b????????????????????????_1100011;",
@@ -749,7 +768,7 @@ def descriptor(b, aw, out):
                       "squash": s["kind"] not in EXACT,
                       "valid": f"{s['name']}_valid", "description": f"{s['kind']} stream of {b.core}",
                       "fields": [{"name": f, "port": f"{s['name']}_{f}",
-                                  "width": 64 if f in ("seq", "cycle") else KINDS[s["kind"]][f],
+                                  "width": 64 if f in ("seq", "cycle") else kind_width(b.xlen, s["kind"], f),
                                   **({"compare": "ignore"} if f == "cycle" else {})}
                                  for f in chan_fields(s)]})
     if b.devices:
