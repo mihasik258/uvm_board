@@ -309,6 +309,12 @@
 - Форма платы на ПК (`run.sh host`): `rv64_basic` и `minstret64` — PASS (`minstret64`: issue=200052, regw=100033,
   csrr=15). Исправлено в `gen/cpu_wrap.py`: `stop ... retire` сравнивал адрес потока store (у RV64 он выровнен по
   8 байт) с регистром конца по 4 байта — конец не наступал; теперь слово XLEN/8 и его байты (для RV32 вывод тот же).
+- Сборка для платы: Spike для aarch64 (`tools/get_spike.sh aarch64`, 2,5 мин) и `build/uvm/cva6_64_c_aarch64/tb_top`
+  (статический, 26 мин сборки). **Ждёт:** образ ПЛИС cv64a6 (Vivado, владелец:
+  `hw/cpu/run.sh examples/cva6_64/cva6_64.bind vd100` с `OCV_GEN_FLAGS="--dma 128"`; с ошибкой — `CVA6=build/fault_instret/cva6`),
+  затем на плате: `minstret64`, nettle-aes ×1100 (`build/embench/rv64/nettle-aes_s1100_instret_rv64.hex`) на обоих
+  образах, скорость Spike на A72 (шаг 6).
+- Ограничение: один порт фиксации (у cv64a6 их два).
 
 **OTBN** (OpenTitan, `ext/opentitan/hw/ip/otbn`) — после cv64a6: ускоритель больших чисел со своей программой,
 тысячи и миллионы тактов на операцию (RSA, ECDSA), свой UVM-тестбенч у OpenTitan — ориентир времени на ПК.
