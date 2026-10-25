@@ -692,10 +692,15 @@ def generate(b, ports, out):
             st = next((x for x in b.streams if x["kind"] == "store"), None)
             if st is None or "addr" not in st["exprs"]:
                 raise BindError(f"stop 0x{b.stop:x} retire: needs a store stream with addr")
+            # the stream's address is its store word's (XLEN/8 bytes: an RV64 core's is 8-byte aligned); the
+            # stop register's own bytes, in the word's byte enables
+            sh = (b.xlen // 8).bit_length() - 1
+            lane = "" if "be" not in st["exprs"] or b.xlen == 32 else \
+                f" && (({at(st['exprs']['be'])}) & {b.xlen // 8}'b{(0xF << (b.stop & (b.xlen // 8 - 1) & ~3)):0{b.xlen // 8}b}) != 0"
             L += ["    logic [31:0] stop_st_addr;",
                   f"    assign stop_st_addr = 32'({at(st['exprs']['addr'])});",
                   f"    assign stop_now = state_q == RUN && ({at(st['exprs']['valid'])}) && "
-                  f"stop_st_addr[31:2] == 30'h{b.stop >> 2:08x};   // the store that ends the program retires"]
+                  f"stop_st_addr[31:{sh}] == {32 - sh}'h{b.stop >> sh:08x}{lane};   // the store that ends the program retires"]
         else:
             L.append("    assign stop_now = state_q == RUN && stop_bus;   // the write that ends the program")
         ends.append("stop_now")
