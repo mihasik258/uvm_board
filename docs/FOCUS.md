@@ -319,7 +319,25 @@
 **OTBN** (OpenTitan, `ext/opentitan/hw/ip/otbn`) — после cv64a6: ускоритель больших чисел со своей программой,
 тысячи и миллионы тактов на операцию (RSA, ECDSA), свой UVM-тестбенч у OpenTitan — ориентир времени на ПК.
 
-Скачано 25.10 (с разрешения владельца): `ext/ibex` (Apache 2.0), `ext/opentitan` (Apache 2.0), без истории.
+**OTBN — план (25.10).** Программа — ML-DSA-87 из OpenTitan (`sw/otbn/crypto/mldsa87`): подпись — 1,06 млн тактов,
+648 тыс. команд (`otbnsim`, вектор NIST ACVP #61 — PASS за 57 с на Python); 64 % тактов OTBN ждёт KMAC.
+1. **DUT** — OTBN вместе с KMAC, как в Earl Grey (`examples/otbn/otbn_kmac_ocv.sv`): без KMAC ML-DSA не работает
+   (в `otbn_top_sim` OpenTitan его нет). Наружу — одна шина запрос/ответ (бит 16 адреса выбирает блок, у каждого
+   свой TL-UL host-адаптер); EDN и ключ OTP — детерминированные (от них зависят маскирование и скремблирование,
+   не результаты). Файлы — FuseSoC OpenTitan (`examples/otbn/files.sh`, `build/otbn_venv`). Lint Verilator — чисто.
+2. **Программы** — ассемблер/линкер OpenTitan (`otbn_as.py`, `otbn_ld.py`, xpack `riscv-none-elf`), ELF → слова
+   IMEM/DMEM для теста.
+3. **Тест по контракту:** шина (запись/чтение, ожидание простоя OTBN — запрос, который DUT принимает, когда OTBN
+   свободен), настройка KMAC как `kmac_hwip_default_configure`, загрузка программы, по кругу: keygen из случайного
+   xi → чтение pk; sign случайного μ → чтение подписи.
+4. **Эталон** — mldsa-native (`ext/mldsa-native`, Apache 2.0/MIT/ISC): `keypair_internal(xi)`,
+   `signature_internal(μ, externalmu=1, rnd)`. Модель не разбирает маскированный секретный ключ: keygen OTBN
+   кладёт его прямо туда, откуда читает sign, а модель считает тот же ключ из xi. Проверено: xi = share0 XOR share1,
+   pk_rho и t1 вектора ACVP #51 совпадают.
+5. На ПК для локализации найденной ошибки — `otbnsim` (как у OpenTitan).
+
+Скачано 25.10 (с разрешения владельца): `ext/ibex` (Apache 2.0), `ext/opentitan` (Apache 2.0), `ext/mldsa-native`
+(a7549918, Apache 2.0/MIT/ISC), без истории.
 
 **Порядок:**
 1. 4.1 и 4.7 — вместе (тесту нужна упаковка по умолчанию); 4.2 параллельно. Всё без платы.

@@ -1,0 +1,29 @@
+CAPI=2:
+# otbn_kmac_ocv.core - the DUT otbn_kmac_ocv.sv with OpenTitan's cores it takes (FuseSoC resolves their files:
+# examples/otbn/files.sh); the primitives: generic ones in simulation, Xilinx ones for the FPGA
+name: "ocv:dut:otbn_kmac_ocv:0.1"
+filesets:
+  rtl:
+    depend:
+      - lowrisc:ip:otbn
+      - lowrisc:ip:kmac
+    files:
+      - otbn_kmac_ocv.sv
+    file_type: systemVerilogSource
+  sim:
+    depend:
+      - lowrisc:prim_generic:all
+  fpga:
+    depend:
+      - lowrisc:prim_xilinx_ultrascale:all
+targets:
+  default: &default
+    filesets: [rtl, sim]
+    toplevel: otbn_kmac_ocv
+    default_tool: verilator
+    tools:
+      verilator:
+        mode: lint-only
+  fpga:
+    <<: *default
+    filesets: [rtl, fpga]
