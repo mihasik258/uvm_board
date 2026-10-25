@@ -19,15 +19,22 @@ SCALE=${1:-1}; shift || true
 X=$(ls -d "$OCV"/ext/xpack-riscv-none-elf-gcc-*/bin 2>/dev/null | tail -1)
 P=${RISCV_PREFIX:-${X:+$X/riscv-none-elf-}}
 OUT=$OCV/build/embench; mkdir -p "$OUT/bsp"
-CF=(-std=gnu17 -O2 -g -static -mabi=ilp32 -march=${CV_SW_MARCH:-rv32imc_zicsr_zifencei} -ffunction-sections -fdata-sections)
+# CV_SW_MARCH / CV_SW_MABI: another ISA (e.g. rv64imac_zicsr_zifencei / lp64 for a 64-bit core: programs <name>_s<scale>_rv64)
+CF=(-std=gnu17 -O2 -g -static -mabi=${CV_SW_MABI:-ilp32} -march=${CV_SW_MARCH:-rv32imc_zicsr_zifencei} -ffunction-sections -fdata-sections)
+case ${CV_SW_MARCH:-rv32} in rv64*) SUF=_rv64 ;; *) SUF= ;; esac
+LD=$BSP/link.ld
+if [ -n "$SUF" ]; then                         # the same map, the 64-bit ELF format
+    OUT=$OUT/rv64; mkdir -p "$OUT/bsp"
+    sed 's/elf32-littleriscv/elf64-littleriscv/g' "$BSP/link.ld" > "$OUT/bsp/link.ld"; LD=$OUT/bsp/link.ld
+fi
 for f in crt0.S handlers.S syscalls.c vectors.S; do "${P}gcc" "${CF[@]}" -c "$BSP/$f" -o "$OUT/bsp/${f%.*}.o"; done
 "${P}ar" rcs "$OUT/bsp/libcv-verif.a" "$OUT"/bsp/*.o
 LIST=("$@"); [ ${#LIST[@]} -gt 0 ] || mapfile -t LIST < <(ls "$EB/src")
 for b in "${LIST[@]}"; do
-    n=${b}_s$SCALE${EMBENCH_BOARD:+_${EMBENCH_BOARD#embench_board_}}
+    n=${b}_s$SCALE${EMBENCH_BOARD:+_${EMBENCH_BOARD#embench_board_}}$SUF
     if "${P}gcc" "${CF[@]}" -DGLOBAL_SCALE_FACTOR="$SCALE" -DWARMUP_HEAT=0 -I "$EB/support" -I "$OCV/tools/${EMBENCH_BOARD:-embench_board}" -I "$BSP" \
         "$EB"/src/"$b"/*.c "$EB/support/main.c" "$EB/support/beebsc.c" "$EB/support/board.c" "$EB/support/chip.c" \
-        -nostartfiles -T "$BSP/link.ld" -L "$OUT/bsp" -lcv-verif -lm -Wl,--gc-sections -o "$OUT/$n.elf" 2> "$OUT/$n.log"; then
+        -nostartfiles -T "$LD" -L "$OUT/bsp" -lcv-verif -lm -Wl,--gc-sections -o "$OUT/$n.elf" 2> "$OUT/$n.log"; then
         "${P}objcopy" -O verilog "$OUT/$n.elf" "$OUT/$n.hex"
         printf 'embench: %-16s %s (%s bytes of code+data)\n' "$b" "$OUT/$n.hex" "$("${P}size" "$OUT/$n.elf" | awk 'NR==2{print $1+$2}')"
     else

@@ -7,7 +7,9 @@
 // traps (Spike takes the trap, pc goes to the handler). The written register is read back from the
 // architectural state after the step - no commit log, so Spike keeps its fast execution path.
 // Timing CSRs read by the instruction are replaced by the value the environment supplies (what the
-// DUT read), in the record and in Spike's register file.
+// DUT read), in the record and in Spike's register file - except minstret(h) under the profile ":cva6": CVA6 counts
+// the instructions committed without an exception, as the ISA does, so Spike's count is checked (the 32-bit model's
+// cva6 profile does the same: rv32_fast.c).
 #include "cpu_model.h"
 
 #include <cstdio>
@@ -38,6 +40,7 @@ public:
     std::map<size_t, processor_t *> harts;
     processor_t    *proc = nullptr;
     uint64_t        order = 0;
+    bool            exact_instret = false;   // minstret(h) is Spike's count, not the DUT's
     std::string     isa;
     int             xlen = 32;                      // from the ISA string (rv32... / rv64...)
 
@@ -150,7 +153,10 @@ cpu_model_t *spike_create(const char *isa, const cpu_env_t *env, uint32_t reset_
         }
     }
     m->isa = isa;
-    if (m->isa.find(':') != std::string::npos) m->isa.resize(m->isa.find(':'));   // (":<profile>": the built-in models')
+    if (m->isa.find(':') != std::string::npos) {                 // (":<profile>": the built-in models')
+        m->exact_instret = m->isa.substr(m->isa.find(':') + 1) == "cva6";
+        m->isa.resize(m->isa.find(':'));
+    }
     m->xlen = !strncasecmp(isa, "rv64", 4) ? 64 : 32;
     m->cfg.isa = m->isa.c_str();
     m->cfg.priv = "M";
@@ -214,7 +220,8 @@ void spike_step(cpu_model_t *mm, cpu_retire_t *r)
     if (!trap && rd && writes_rd(insn)) {
         uint64_t v = st->XPR[rd] & xm;
         uint32_t csr = insn >> 20;
-        if ((insn & 0x7F) == 0x73 && cpu_is_timing_csr(csr)) {
+        const bool instret = csr == 0xB02 || csr == 0xB82 || csr == 0xC02 || csr == 0xC82;
+        if ((insn & 0x7F) == 0x73 && cpu_is_timing_csr(csr) && !(m->exact_instret && instret)) {
             r->timing_csr = 1;
             uint64_t dut;
             if (m->env.timing_csr && m->env.timing_csr(m->env.ctx, csr, r->order, &dut)) {

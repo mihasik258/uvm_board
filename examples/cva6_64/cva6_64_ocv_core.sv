@@ -91,6 +91,11 @@ module cva6_64_ocv_core
         c.DataUserEn  = 0;
         c.FetchUserEn = 0;
         // the map: RAM from 0 (cached), the device windows above (not idempotent: no speculative reads)
+        // (cv64a6 executes from its debug window 0-0xfff, a ROM and DRAM from 0x8000_0000: here from all the RAM)
+        c.NrExecuteRegionRules     = 1;
+        c.ExecuteRegionAddrBase    = '0;
+        c.ExecuteRegionLength      = '0;
+        c.ExecuteRegionLength[0]   = RAM_TOP;
         c.NrCachedRegionRules      = 1;
         c.CachedRegionAddrBase     = '0;
         c.CachedRegionLength       = '0;
