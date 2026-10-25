@@ -19,7 +19,16 @@ TB=("$HERE/otbn_if.sv" "$HERE/otbn_c_pkg.sv" "$HERE/tb_top.sv")
 GEN=${OCV_UVM_GEN:---dma 128}
 python3 "$OCV/uvm/ocv_contract.py" "${TB[@]}" --top tb_top --gen-flags "$GEN" -o "$OUT/contract"
 export RTL="$OCV/examples/otbn/otbn_kmac_ocv.sv"
-export RTL_DEFINES="-f $OCV/build/otbn/rtl/default/otbn_kmac_ocv.f" OCV_UVM_GEN="$GEN"
+# OCV_RTL_REPLACE="<file.sv> ...": these files in place of OpenTitan's of the same name (an injected bug)
+F=$OCV/build/otbn/rtl/default/otbn_kmac_ocv.f
+if [ -n "${OCV_RTL_REPLACE:-}" ]; then
+    cp "$F" "$OUT/rtl.f"; F=$OUT/rtl.f
+    for r in $OCV_RTL_REPLACE; do
+        r=$(realpath "$r"); grep -q "/$(basename "$r")\$" "$F" || { echo "run.sh: no $(basename "$r") in the RTL"; exit 1; }
+        sed -i "s#^.*/$(basename "$r")\$#$r#" "$F"
+    done
+fi
+export RTL_DEFINES="-f $F" OCV_UVM_GEN="$GEN"
 # the reference model and ML-DSA-87 of mldsa-native (one compilation unit)
 MLD=$OCV/ext/mldsa-native/mldsa
 export TB_C="$OCV/examples/otbn/otbn_model.c $MLD/mldsa_native.c"

@@ -143,7 +143,7 @@ static uint32_t mmio_load(void *ctx, uint32_t a, int n)
 
 static void mmio_store(void *ctx, uint32_t a, int n, uint32_t v) { (void)ctx; (void)a; (void)n; (void)v; }
 
-static int timing_csr(void *ctx, uint32_t csr, uint64_t order, uint32_t *value)
+static int timing_csr(void *ctx, uint32_t csr, uint64_t order, uint64_t *value)
 {
     (void)ctx; (void)csr;
     int ok;

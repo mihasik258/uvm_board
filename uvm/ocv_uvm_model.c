@@ -406,6 +406,14 @@ void ocv_dpi_model_close(void)
     pthread_mutex_unlock(&m.mu);
 }
 
+/* the board side of ocv_model_checker (uvm/ocv_uvm_runner.c, linked with the runner): a board build without a model
+ * checker still links the package's imports - these stand in, never called (ocv_model_on is 0 there) */
+__attribute__((weak)) int  ocv_dpi_model_board_open(const char *args) { (void)args; return 0; }
+__attribute__((weak)) void ocv_dpi_model_send(int ch, const uint32_t *rec) { (void)ch; (void)rec; }
+__attribute__((weak)) int  ocv_dpi_model_recv(int ch, uint32_t *rec) { (void)ch; (void)rec; return 0; }
+__attribute__((weak)) void ocv_dpi_model_wait(void) {}
+__attribute__((weak)) int  ocv_dpi_model_board_done(int *rc) { *rc = 0; return 1; }
+
 /* a record as "field=value ..." (reports) */
 const char *ocv_dpi_model_format(int ch, const uint32_t *rec)
 {

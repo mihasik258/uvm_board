@@ -25,7 +25,7 @@ static uint32_t timer_val;
 
 /* a timer / counter CSR (cycle, time, instret, their M- and high forms) reads what the core read:
  * the testbench hands it over before the step (scr1_ref_timer); without one, the model's own value */
-static int timing_csr(void *ctx, uint32_t csr, uint64_t order, uint32_t *value)
+static int timing_csr(void *ctx, uint32_t csr, uint64_t order, uint64_t *value)
 {
     (void)ctx; (void)csr; (void)order;
     if (!timer_set) return 0;
