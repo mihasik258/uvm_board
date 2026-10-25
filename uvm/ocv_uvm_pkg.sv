@@ -69,6 +69,7 @@ package ocv_uvm_pkg;
     import "DPI-C" function void   ocv_dpi_model_in(int ch, input ocv_rec_t rec);
     import "DPI-C" function void   ocv_dpi_model_out(int ch, input ocv_rec_t rec);
     import "DPI-C" function void   ocv_dpi_model_status(output longint checked, output longint errors, output int done);
+    import "DPI-C" function void   ocv_dpi_model_in_done();
     import "DPI-C" function int    ocv_dpi_model_mismatch(output int ch, output ocv_rec_t dut, output ocv_rec_t exp,
                                                           output int field, output longint index);
     import "DPI-C" function string ocv_dpi_model_channel(int ch);
@@ -173,6 +174,7 @@ package ocv_uvm_pkg;
     string ocv_model_run_args;
     bit    ocv_model_ended;
     int    ocv_model_rc;
+    int    ocv_driving;                  // source drivers in drive() now: transfers the DUT has not taken yet
 
     // State shared by all agents. Package variables, not static class members: simulators
     // differ on statics (xsim loses their values); a package variable is plain and portable.
@@ -322,6 +324,7 @@ package ocv_uvm_pkg;
                     end
                 end
 `else
+                ocv_driving++;                        // (a transfer the DUT has not taken yet: it is not quiet)
                 if (t.blk.size() == 0) begin
                     drive(t);
                     if (ocv_model_on) ocv_dpi_model_in(ch, t.to_rec());
@@ -331,6 +334,7 @@ package ocv_uvm_pkg;
                     drive(x);
                     if (ocv_model_on) ocv_dpi_model_in(ch, t.blk[i]);
                 end
+                ocv_driving--;
 `endif
                 ap.write(t);
                 seq_item_port.item_done();
@@ -528,7 +532,22 @@ package ocv_uvm_pkg;
             end
         endfunction
 
-        int quiet_us = 100;              // no record of the DUT for this long (once it has made one): it is done
+        // the test's stimulus is all sent: wait until the model has checked the DUT's records for all of it (a
+        // test that knows its end calls this rather than waiting for `done`, which is also set whenever the model
+        // has caught up with the stimulus so far - between two transfers, too)
+        task finish();
+`ifdef OCV_BOARD
+            wait (ocv_model_ended);
+`else
+            ocv_dpi_model_in_done();
+            do begin #1us; collect(); end while (!done);
+`endif
+        endtask
+
+        int quiet_us = 100;              // no record of the DUT for this long (once it has made one), and no driver
+                                         // waiting for the DUT to take a transfer: it is done (a DUT that works
+                                         // long without output - an accelerator's operation - holds a transfer:
+                                         // the next command, a wait for its end)
 
         task run_phase(uvm_phase phase);
             longint last = -1, n;
@@ -550,7 +569,7 @@ package ocv_uvm_pkg;
                 collect();
                 // the DUT is quiet - it makes no more records: the model goes on to the end without waiting for it
                 n = ocv_dpi_model_records();
-                if (n > 0 && n == last) still++; else still = 0;
+                if (n > 0 && n == last && ocv_driving == 0) still++; else still = 0;
                 last = n;
                 if (!told && still >= quiet_us) begin
                     ocv_dpi_model_quiet();

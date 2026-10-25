@@ -3,7 +3,9 @@
 // rest of the chip replaced by what the pair needs of it:
 //   - the bus: one request/response port; the address's bit 16 picks the block (0: OTBN's registers, IMEM and
 //     DMEM; 1: KMAC's registers), each behind its own TL-UL host adapter (the command integrity covers the
-//     address, so the split is before the adapters); one request at a time
+//     address, so the split is before the adapters); one request at a time. A request with req_wait_i set is
+//     no bus access: it is taken when OTBN is idle (its idle_o) and has no response - how a test waits for the end
+//     of OTBN's initial secure wipe or of a program without polling (the number of polls would be the DUT's timing)
 //   - entropy (EDN for OTBN's RND/URND and KMAC's masking) and OTBN's scrambling key (OTP): deterministic -
 //     masking and scrambling, not results, depend on them (the same program gives the same results)
 //   - life cycle: not escalated, no RMA; alerts: not acknowledged (an alert is a DUT output, alert_o)
@@ -16,6 +18,7 @@ module otbn_kmac_ocv (
     input  logic        req_valid_i,
     output logic        req_ready_o,
     input  logic        req_we_i,
+    input  logic        req_wait_i,
     input  logic [31:0] req_addr_i,
     input  logic [31:0] req_wdata_i,
     input  logic [3:0]  req_be_i,
@@ -44,7 +47,7 @@ module otbn_kmac_ocv (
             .EnableDataIntgGen(1)
         ) u_host (
             .clk_i, .rst_ni,
-            .req_i        (req_valid_i && !busy_q && sel == i[0]),
+            .req_i        (req_valid_i && !req_wait_i && !busy_q && sel == i[0]),
             .gnt_o        (gnt[i]),
             .addr_i       ({16'b0, req_addr_i[15:0]}),
             .we_i         (req_we_i),
@@ -62,10 +65,11 @@ module otbn_kmac_ocv (
             .tl_i         (tl_d2h[i])
         );
     end
-    assign req_ready_o = !busy_q && (sel ? gnt[1] : gnt[0]);
+    prim_mubi_pkg::mubi4_t otbn_idle;
+    assign req_ready_o = !busy_q && (req_wait_i ? otbn_idle == prim_mubi_pkg::MuBi4True : sel ? gnt[1] : gnt[0]);
     always_ff @(posedge clk_i or negedge rst_ni)
         if (!rst_ni) busy_q <= 1'b0;
-        else if (req_valid_i && req_ready_o) busy_q <= 1'b1;
+        else if (req_valid_i && req_ready_o && !req_wait_i) busy_q <= 1'b1;
         else if (|valid) busy_q <= 1'b0;
     assign rsp_valid_o = |valid;
     assign rsp_rdata_o = valid[1] ? rdata[1] : rdata[0];
@@ -104,7 +108,7 @@ module otbn_kmac_ocv (
         .clk_i, .rst_ni,
         .tl_i              (tl_h2d[0]),
         .tl_o              (tl_d2h[0]),
-        .idle_o            (),
+        .idle_o            (otbn_idle),
         .intr_done_o       (intr_otbn_done_o),
         .alert_rx_i        ({2{prim_alert_pkg::ALERT_RX_DEFAULT}}),
         .alert_tx_o        (otbn_alert),

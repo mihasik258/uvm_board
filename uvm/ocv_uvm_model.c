@@ -322,7 +322,8 @@ void ocv_dpi_model_out(int ch, const uint32_t *rec)
     ring_t *r = &m.out[ch];
     if (!r->w) return;
     pthread_mutex_lock(&m.mu);
-    while (r->n - r->next >= RING && !m.stop) pthread_cond_wait(&m.cv, &m.mu);   /* the model is far behind */
+    /* the model is far behind (r->next may pass r->n: records it took as missing once the DUT was quiet) */
+    while (r->n >= r->next + RING && !m.stop) pthread_cond_wait(&m.cv, &m.mu);
     memcpy(r->w + (size_t)(r->n % RING) * c->rec_words, rec, (size_t)c->rec_words * 4);
     r->n++;
     m.total++;
