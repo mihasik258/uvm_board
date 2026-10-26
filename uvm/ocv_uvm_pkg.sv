@@ -490,13 +490,17 @@ package ocv_uvm_pkg;
             ocv_model_on = 1;                // (before any agent's build_phase: on the board they then leave the hub to the runner)
         endfunction
 
+        // the runner's options on the board (+OCV_RUN replaces them): windows of 4096 records; a DUT that works long
+        // between its outputs (an accelerator) adds e.g. "--stall-polls 0 --max-polls 0"
+        string run_args = "--squash 4096";
+
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
             void'($value$plusargs("OCV_MODEL=%s", opts));   // (or what the env set before this phase)
 `ifdef OCV_BOARD
-            // the runner's options (+OCV_RUN, default: windows of 4096 records) and the model's
+            // the runner's options (+OCV_RUN, or what the env set in run_args) and the model's
             begin
-                string run = "--squash 4096", t;
+                string run = run_args, t;
                 int i0 = 0;
                 void'($value$plusargs("OCV_RUN=%s", run));
                 ocv_model_run_args = run;

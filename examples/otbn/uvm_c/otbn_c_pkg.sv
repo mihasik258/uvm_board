@@ -201,6 +201,9 @@ package otbn_c_pkg;
             bus = bus_agent::type_id::create("bus", this);
             rsp = rsp_agent::type_id::create("rsp", this);
             chk = ocv_model_checker::type_id::create("chk", this);
+            // (board: OTBN works ~1 million clocks between two responses - the runner neither takes that for a
+            // stall nor bounds the polls of a run)
+            chk.run_args = "--squash 4096 --stall-polls 0 --max-polls 0";
             if ($value$plusargs("PROG=%s", prog)) chk.opts = {"syms=", prog, ".sym"};   // (+OCV_MODEL=... replaces it)
         endfunction
     endclass

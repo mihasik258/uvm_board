@@ -23,6 +23,9 @@ extern "C" int ocv_uvm_bus_open(ocv_bus_t *bus, uint64_t, char *, size_t)
     g_tb = Verilated::threadContextp();
     KeepTb k;
     g_sim = new OcvVltSim;
+    // (its own context: RTL that reads plusargs - OpenTitan's - finds none, as on the board, rather than abort)
+    static const char *no_args[] = {"fpga"};
+    g_sim->ctx->commandArgs(1, no_args);
     if (const char *f = getenv("OCV_UVM_TRACE")) {
         g_sim->ctx->traceEverOn(true);
         g_sim->vcd = new VerilatedVcdC;

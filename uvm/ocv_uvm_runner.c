@@ -163,9 +163,15 @@ int ocv_dpi_model_board_open(const char *args)
     for (char *t = strtok(argbuf, " \t"); t && argc_ < 127; t = strtok(NULL, " \t")) argv_[argc_++] = t;
     /* a batch takes all the stimulus the testbench sends (the runner caps each source at its depth): not the
      * runner's default, the smallest source's depth */
-    int has_batch = 0;
-    for (int i = 1; i < argc_; i++) if (!strcmp(argv_[i], "--batch")) has_batch = 1;
+    int has_batch = 0, has_batches = 0;
+    for (int i = 1; i < argc_; i++) {
+        if (!strcmp(argv_[i], "--batch")) has_batch = 1;
+        if (!strcmp(argv_[i], "--batches")) has_batches = 1;
+    }
     if (!has_batch && argc_ < 125) { argv_[argc_++] = (char *)"--batch"; argv_[argc_++] = (char *)"1048576"; }
+    /* as many batches as the testbench sends stimulus for (a batch holds at most a source's depth): the run ends
+     * at the first batch with none - the testbench's end, not the runner's default of one batch */
+    if (!has_batches && argc_ < 125) { argv_[argc_++] = (char *)"--batches"; argv_[argc_++] = (char *)"1000000000000"; }
     argv_[argc_] = NULL;
     ocv_runner_stimulus_hook = stim_hook;
     if (&ocv_cpu_dev_hook && req_ch >= 0) ocv_cpu_dev_hook = dev_hook;

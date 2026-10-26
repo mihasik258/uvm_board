@@ -343,7 +343,7 @@ static void il_poll(run_t *r)
         r->il_prev[ch] = n;
     }
     r->il_settled = quiet ? r->il_settled + 1 : 0;
-    if (r->il_settled >= r->settle || ++r->il_polls >= r->max_polls) r->il_quiet = 1;
+    if (r->il_settled >= r->settle || (++r->il_polls >= r->max_polls && r->max_polls)) r->il_quiet = 1;
     stream_compare(r);
 }
 
@@ -579,7 +579,7 @@ static void collect(run_t *r, int ch, int restart)
 static int ring_finish(run_t *r, int ch, uint64_t max_polls)
 {
     for (uint64_t polls = 0; ocv_ring_pending(&r->env, ch); polls++) {
-        if (polls >= max_polls) {
+        if (max_polls && polls >= max_polls) {
             printf("FAIL channel '%s': DMA stuck - %u records captured but not in PS memory\n",
                    r->env.dut->channels[ch].name, ocv_ring_pending(&r->env, ch));
             return -1;
@@ -616,7 +616,7 @@ static void send_rec(ocv_model_io_t *io, int ch, const uint32_t *rec)
     uint32_t k = r->stream_n[ch];
     for (uint64_t polls = 0; k >= ocv_ep_rd(&r->env, ch, OCV_EP_REG_COUNT) + c->depth; polls++) {
         flush_streams(r);                        /* the DUT can only drain what is published */
-        if (polls >= r->max_polls) {
+        if (r->max_polls && polls >= r->max_polls) {
             printf("FAIL channel '%s': the DUT does not take the answers it asked for - %u sent, %u taken"
                    " (it asked for more than it consumes, or consumed data that was not there)\n",
                    c->name, k, ocv_ep_rd(&r->env, ch, OCV_EP_REG_COUNT));
@@ -698,8 +698,8 @@ static void usage(const char *prog)
             "  --model-opt K=V     option for the reference model (repeatable)\n"
             "  --settle N          outputs must stay unchanged for N status polls (default 32)\n"
             "  --context K         records of context printed on a mismatch (default 3)\n"
-            "  --max-polls N       give up waiting for the DUT after N status polls (default 10000000)\n"
-            "  --stall-polls N     fail when no channel moves for N polls while stimulus is pending (default 100000)\n"
+            "  --max-polls N       give up waiting for the DUT after N status polls (default 10000000; 0: never)\n"
+            "  --stall-polls N     fail when no channel moves for N polls while stimulus is pending (default 100000; 0: never)\n"
             "  --max-cycles N      fail when a batch runs more than N DUT clocks (a DUT that never ends: e.g. a\n"
             "                      core looping in its trap handler; channels keep moving, so not a stall) - 0: no limit\n"
             "  --quiet             only the final line\n"
@@ -1132,7 +1132,7 @@ int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus)
                 ocv_dut_reset(&r.env, 1);           /* held: its records stop where they are */
                 break;
             }
-            if (polls >= max_polls) {
+            if (max_polls && polls >= max_polls) {
                 printf("FAIL: DUT did not go quiet within %llu status polls (batch %llu)\n",
                        (unsigned long long)max_polls, (unsigned long long)b);
                 RUN_END(2);
