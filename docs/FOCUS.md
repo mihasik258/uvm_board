@@ -314,6 +314,9 @@
   `hw/cpu/run.sh examples/cva6_64/cva6_64.bind vd100` с `OCV_GEN_FLAGS="--dma 128"`; с ошибкой — `CVA6=build/fault_instret/cva6`),
   затем на плате: `minstret64`, nettle-aes ×1100 (`build/embench/rv64/nettle-aes_s1100_instret_rv64.hex`) на обоих
   образах, скорость Spike на A72 (шаг 6).
+- **Образ ПЛИС cv64a6 (26.10, 37 мин):** 50 МГц, WNS +2,697 нс; DUT 40 339 LUT, 22 497 регистров, 40 BRAM, 9 DSP
+  (cv32a60x — 10,5 тыс. LUT); образ 53 644 LUT. `build/cva6_64/vd100/sdcard` (программа PS в нём — без Spike,
+  для RV64 не годится; тест по контракту — свой `tb_top`). С ошибкой — `build/cva6_64_fault/vd100`.
 - Ограничение: один порт фиксации (у cv64a6 их два).
 
 **OTBN** (OpenTitan, `ext/opentitan/hw/ip/otbn`) — после cv64a6: ускоритель больших чисел со своей программой,
