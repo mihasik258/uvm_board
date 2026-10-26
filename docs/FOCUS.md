@@ -358,8 +358,9 @@
   Y < q < 2^23: K ≥ 23 — это Y = 0 (вдвое реже K = 22); для ошибки «на часы» нужно условие реже.
 - Сборка для A72: `build/uvm/otbn_c_aarch64/tb_top` (статический). На плату ещё нужны
   `build/otbn/prog/run_mldsa87.{load,sym}` (тест и модель читают их по +PROG).
-- **Ждёт:** образ ПЛИС OTBN+KMAC (Vivado, владелец; сначала синтез — влезет ли в VE2302; примитивы
-  `prim_xilinx_ultrascale`, `examples/otbn/files.sh fpga`), исправный и с ошибкой.
+- **Ждёт:** образ ПЛИС OTBN+KMAC (Vivado, владелец) — `examples/otbn/fpga.sh` (примитивы
+  `prim_xilinx_ultrascale`, 50 МГц, `--dma 128`): сначала `OCV_STOP=synth examples/otbn/fpga.sh` — влезет ли в
+  VE2302; затем исправный и `OCV_OTBN_FAULT_BITS=22 examples/otbn/fpga.sh`.
 
 Скачано 25.10 (с разрешения владельца): `ext/ibex` (Apache 2.0), `ext/opentitan` (Apache 2.0), `ext/mldsa-native`
 (a7549918, Apache 2.0/MIT/ISC), без истории.
