@@ -28,7 +28,7 @@ if [ -n "${OCV_RTL_REPLACE:-}" ]; then
         sed -i "s#^.*/$(basename "$r")\$#$r#" "$F"
     done
 fi
-# OCV_RTL_DEFINES: more defines of the RTL (e.g. +define+OCV_OTBN_FAULT_BITS=22 for the injected bug)
+# OCV_RTL_DEFINES: more defines of the RTL (e.g. +define+OCV_OTBN_FAULT_BITS=22 for the injected bug of examples/otbn/fault/)
 export RTL_DEFINES="-f $F ${OCV_RTL_DEFINES:-}" OCV_UVM_GEN="$GEN"
 # the reference model and ML-DSA-87 of mldsa-native (one compilation unit)
 MLD=$OCV/ext/mldsa-native/mldsa
