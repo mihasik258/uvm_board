@@ -29,6 +29,7 @@ if [ -n "${OCV_OTBN_FAULT_BITS:-}" ]; then
 fi
 NAME=otbn${OCV_OTBN_FAULT_BITS:+_fault$OCV_OTBN_FAULT_BITS}
 export RTL_DEFINES="${INC[*]} ${DEF[*]:-}"
-export OCV_GEN_FLAGS="${OCV_GEN_FLAGS:---dma 128}" OCV_CLK_MHZ="${OCV_CLK_MHZ:-50}"
+# 45 MHz: OTBN closes timing there (at 50 MHz: WNS -0.001 ns inside OTBN - its 256-bit adder path)
+export OCV_GEN_FLAGS="${OCV_GEN_FLAGS:---dma 128}" OCV_CLK_MHZ="${OCV_CLK_MHZ:-45}"
 export OUT="${OUT:-$OCV/build/vd100/$NAME}"
 exec "$OCV/platforms/vd100/build.sh" "$DESC" - "${SV[@]}" "$HERE/otbn_kmac_ocv.sv"
