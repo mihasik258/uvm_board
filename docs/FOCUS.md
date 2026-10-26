@@ -358,7 +358,10 @@
   Y < q < 2^23: K ≥ 23 — это Y = 0 (вдвое реже K = 22); для ошибки «на часы» нужно условие реже.
 - Сборка для A72: `build/uvm/otbn_c_aarch64/tb_top` (статический). На плату ещё нужны
   `build/otbn/prog/run_mldsa87.{load,sym}` (тест и модель читают их по +PROG).
-- **Ждёт:** образ ПЛИС OTBN+KMAC (Vivado, владелец) — `examples/otbn/fpga.sh` (примитивы
+- **Синтез (26.10, `OCV_STOP=synth examples/otbn/fpga.sh`, 91 мин):** влезает. DUT — 112 852 LUT (OTBN 84 360,
+  KMAC 28 489), 31 810 регистров, 13 RAMB36 + 8 RAMB18, 16 DSP; весь образ — 116 183 из 150 272 LUT (77 %).
+  Втрое больше CVA6 (10,5 тыс. LUT). 0 ошибок, 0 критических предупреждений.
+- **Ждёт:** образ ПЛИС OTBN+KMAC — `examples/otbn/fpga.sh` (примитивы
   `prim_xilinx_ultrascale`, 50 МГц, `--dma 128`): сначала `OCV_STOP=synth examples/otbn/fpga.sh` — влезет ли в
   VE2302; затем исправный и `OCV_OTBN_FAULT_BITS=22 examples/otbn/fpga.sh`.
 
