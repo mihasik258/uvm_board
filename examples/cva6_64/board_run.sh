@@ -15,7 +15,9 @@ for p in "$@"; do
     echo "board_run: cva6_64, image $IMG, $p -> $L"
     # (run where CVA6's RVFI tracer file, if anything writes it, goes nowhere: a FAT card has no links)
     mkdir -p /tmp/cva6_64 && ln -sf /dev/null /tmp/cva6_64/trace_hart_0.dasm
-    ( cd /tmp/cva6_64 && time OCV_BASE=0x80000000 "$D/tb_top" +PROG="$D/progs/$p.hex" +UVM_NO_RELNOTES ) > "$L" 2>&1
+    # (the model stops after max= instructions, by default 1e8: nettle-aes x1100 has ~5e9)
+    ( cd /tmp/cva6_64 && time OCV_BASE=0x80000000 "$D/tb_top" +PROG="$D/progs/$p.hex" +OCV_MODEL="irq=0 max=20000000000" \
+        +UVM_NO_RELNOTES ) > "$L" 2>&1
     grep -E "^OCV: .*(PASS|FAIL)|MISMATCH|UVM_ERROR :|^real" "$L" | head -6
     sync
 done
