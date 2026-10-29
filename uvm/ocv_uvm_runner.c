@@ -7,7 +7,9 @@
  *   - the core's device accesses go to the testbench: the record reaches its dev_req monitor, and a read's answer
  *     is what its dev_resp driver sends (ocv_cpu_dev_hook);
  *   - every other output record is checked in C as it leaves the FPGA, none becomes a UVM object; the verdict and
- *     the mismatch come to the checker.
+ *     the mismatch come to the checker;
+ *   - a channel with coverage subscribers in the testbench (ocv_uvm_pkg.sv, rule 7) is tapped: the model's records of
+ *     it, thinned to those that can change the coverage (uvm/ocv_uvm_tap.h), reach its monitor.
  * The runner works in a thread of its own, but the two never run at once: control passes like a token (as in
  * uvm/cpu/ocv_uvm_cpu.c) - the testbench's wait for progress hands it to the runner, which hands it back when it
  * needs the testbench: more stimulus, a device access, or the end.
@@ -15,7 +17,9 @@
  * DPI (the base classes, in a board build with an ocv_model_checker):
  *   int  ocv_dpi_model_board_open(string runner_args)   start: the runner's options ("--squash 4096 --model-opt ...")
  *   void ocv_dpi_model_send(int ch, rec)   a source driver's record: stimulus, or the answer to a device read
- *   int  ocv_dpi_model_recv(int ch, rec)   a record for a monitor (the core's device access): 1 if there is one
+ *   int  ocv_dpi_model_tap(int ch, string spec)   before the start: tap channel ch ("<field>,... <history>" or "all")
+ *   int  ocv_dpi_model_recv(int ch, rec)   a record for a monitor (the core's device access, a tapped channel's
+ *                                          record): 1 if there is one, 2 if it is a context record (ocv_uvm_tap.h)
  *   void ocv_dpi_model_wait()              the testbench has nothing to do: the runner goes on
  *   int  ocv_dpi_model_board_done(output int rc)   1 when the run is over (rc: the runner's exit status)
  */
@@ -30,6 +34,7 @@
 
 #include "ocv.h"
 #include "ocv_model.h"
+#include "ocv_uvm_tap.h"
 
 #define REC_WORDS 32
 #define MAX_CH    64
@@ -37,6 +42,8 @@
 int ocv_runner_main(int argc, char **argv, ocv_bus_t *bus);
 int ocv_uvm_bus_open(ocv_bus_t *bus, uint64_t base, char *err, size_t errlen);
 extern int (*ocv_runner_stimulus_hook)(int ch, uint64_t index, uint32_t *rec);
+extern void (*ocv_runner_expect_hook)(int ch, const uint32_t *rec);
+extern const unsigned char *ocv_runner_expect_tap;
 extern uint32_t (*ocv_cpu_dev_hook)(int dev, uint32_t addr, int we, uint32_t be, uint32_t wdata, uint64_t cycle)
     __attribute__((weak));
 
@@ -54,6 +61,13 @@ static int             req_ch = -1, resp_ch = -1;
 static int             answered;
 static uint32_t        answer;
 static ocv_bus_t       bus;
+/* the tapped channels: their selection, and the records for their monitors (ctx: a context record) */
+typedef struct { uint32_t w[REC_WORDS]; int ctx; } trec_t;
+typedef struct { trec_t *v; size_t head, n, cap; } tapq_t;
+static ocv_tap_t       tap[MAX_CH];
+static tapq_t          tap_q[MAX_CH];
+static unsigned char   tapped[MAX_CH];
+static int             tap_told;
 static int             argc_;
 static char           *argv_[128], *argbuf;
 
@@ -128,6 +142,77 @@ static uint32_t dev_hook(int dev, uint32_t addr, int we, uint32_t be, uint32_t w
     return v;
 }
 
+/* (the runner's thread) a tapped channel's record that the selection keeps: to its monitor */
+static void tap_send(void *arg, const uint32_t *rec, int context)
+{
+    const int ch = *(const int *)arg;
+    tapq_t *f = &tap_q[ch];
+    pthread_mutex_lock(&mu);
+    if (f->n == f->cap) {
+        const size_t cap = f->cap ? 2 * f->cap : 1024;
+        trec_t *v = malloc(cap * sizeof *v);
+        if (!v) { perror("ocv_uvm_runner"); exit(1); }
+        for (size_t i = 0; i < f->n; i++) v[i] = f->v[(f->head + i) % f->cap];
+        free(f->v);
+        f->v = v; f->cap = cap; f->head = 0;
+    }
+    trec_t *r = &f->v[(f->head + f->n) % f->cap];
+    memset(r, 0, sizeof *r);
+    memcpy(r->w, rec, (size_t)ocv_model_dut->channels[ch].rec_words * 4);
+    r->ctx = context;
+    f->n++;
+    pthread_mutex_unlock(&mu);
+}
+static void tap_hook(int ch, const uint32_t *rec)
+{
+    ocv_tap_record(&tap[ch], rec, tap_send, &ch);
+}
+
+int ocv_dpi_model_tap(int ch, const char *spec)
+{
+    if (started || !ocv_model_dut || ch < 0 || ch >= ocv_model_dut->n_channels || ch >= MAX_CH) return 0;
+    const ocv_channel_t *c = &ocv_model_dut->channels[ch];
+    if (c->kind == OCV_CH_SOURCE || !strcmp(c->name, "dev_req")) return 0;   /* (given to the testbench anyway) */
+    ocv_tap_t *t = &tap[ch];
+    memset(t->mask, 0, sizeof t->mask);
+    t->words = c->rec_words; t->all = 0; t->hist = 0;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s", spec ? spec : "");
+    char *fl = strtok(buf, " \t"), *hs = strtok(NULL, " \t");
+    if (!fl || !strcmp(fl, "all")) t->all = 1;
+    else {
+        t->hist = hs ? atoi(hs) : 0;
+        if (t->hist < 0 || t->hist > OCV_TAP_HIST) {
+            fprintf(stderr, "ocv_uvm_runner: channel '%s': coverage history %d (at most %d): every record\n", c->name,
+                    t->hist, OCV_TAP_HIST);
+            t->all = 1; t->hist = 0;
+        }
+        /* "<field>" (all of it) or "<field>[hi:lo]" (those bits of it) */
+        for (char *f = strtok(fl, ","); f && !t->all; f = strtok(NULL, ",")) {
+            char *br = strchr(f, '[');
+            unsigned hi = 0, lo = 0;
+            const int part = br != NULL;
+            if (part) {
+                *br = 0;
+                if (sscanf(br + 1, "%u:%u", &hi, &lo) != 2) lo = hi;
+            }
+            const ocv_field_t *F = ocv_field(c, f);
+            if (!F || (part && (hi < lo || hi >= F->width))) {
+                fprintf(stderr, "ocv_uvm_runner: channel '%s' has no field '%s' (coverage): every record\n", c->name, f);
+                t->all = 1;
+                break;
+            }
+            const uint32_t b0 = F->lsb + (part ? lo : 0), b1 = F->lsb + (part ? hi + 1 : F->width);
+            for (uint32_t b = b0; b < b1; b++) t->mask[b / 32] |= 1u << (b % 32);
+        }
+    }
+    t->on = 1;
+    tapped[ch] = 1;
+    ocv_runner_expect_tap = tapped;
+    ocv_runner_expect_hook = tap_hook;
+    return 1;
+}
+
 static void *runner(void *arg)
 {
     (void)arg;
@@ -195,10 +280,22 @@ void ocv_dpi_model_send(int ch, const uint32_t *rec)
 
 int ocv_dpi_model_recv(int ch, uint32_t *rec)
 {
-    if (!started || ch != req_ch) return 0;
+    if (!started || ch < 0 || ch >= MAX_CH || (ch != req_ch && !tapped[ch])) return 0;
     memset(rec, 0, REC_WORDS * 4);
     pthread_mutex_lock(&mu);
-    const int got = pop(&to_tb, rec, ocv_model_dut->channels[ch].rec_words);
+    int got;
+    if (ch == req_ch) got = pop(&to_tb, rec, ocv_model_dut->channels[ch].rec_words);
+    else {
+        tapq_t *f = &tap_q[ch];
+        got = 0;
+        if (f->n) {
+            const trec_t *r = &f->v[f->head];
+            memcpy(rec, r->w, (size_t)ocv_model_dut->channels[ch].rec_words * 4);
+            got = r->ctx ? 2 : 1;
+            f->head = (f->head + 1) % f->cap;
+            f->n--;
+        }
+    }
     pthread_mutex_unlock(&mu);
     return got;
 }
@@ -221,5 +318,12 @@ int ocv_dpi_model_board_done(int *rc)
     const int d = done;
     *rc = result;
     pthread_mutex_unlock(&mu);
+    if (d && !tap_told++)
+        for (int ch = 0; ch < MAX_CH && ocv_model_dut && ch < ocv_model_dut->n_channels; ch++)
+            if (tapped[ch])
+                printf("ocv_uvm_runner: coverage of '%s' (%s): %llu records, %llu to the testbench + %llu context\n",
+                       ocv_model_dut->channels[ch].name, tap[ch].all ? "every record" : "new projections",
+                       (unsigned long long)tap[ch].n, (unsigned long long)tap[ch].passed,
+                       (unsigned long long)tap[ch].context);
     return d;
 }

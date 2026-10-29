@@ -4,6 +4,7 @@
 // the program, a responder answers the core's device reads as the test's devices; the scoreboard is an
 // ocv_model_checker - every record of every channel against the reference model of the core
 // (models/cpu/ocv_cpu_model.c). The same files run in simulation (the RTL) and on the board (the core in the FPGA).
+// Functional coverage: core-v-verif's isacov on the issue transactions (isacov_cov; rule 7 of the contract).
 //   +PROG=<file.hex>              program image ($readmemh bytes, "@addr" sections)
 //   +OCV_MODEL="key=value ..."    model options (default "irq=0": the test drives no interrupts)
 `include "uvm_macros.svh"
@@ -355,6 +356,49 @@ package cva6_c_pkg;
         endtask
     endclass
 
+    // ---------------- functional coverage: core-v-verif's isacov on the issue transactions (rule 7) ----------------
+    // isacov's covergroups (uvma_isacov_cov_model) with the configuration core-v-verif's CVA6 environment gives them
+    // (uvme_cva6_cfg_c: the core's from cva6pkg_to_core_cntrl_cfg, cv32a60x; the sequence and hazard bins as there).
+    // An issue transaction is RVFI's instruction word (a compressed one: its 16 bits) - what isacov decodes; the
+    // values (rs1/rs2/rd), the trap and the memory address are not in it, so those bins stay empty, in both forms.
+    class cva6_core_cfg extends uvma_core_cntrl_pkg::uvma_core_cntrl_cfg_c;
+        `uvm_object_utils(cva6_core_cfg)
+        function new(string name = "cva6_core_cfg"); super.new(name); endfunction
+        virtual function void sample_parameters(uvma_core_cntrl_pkg::uvma_core_cntrl_cntxt_c cntxt); endfunction
+    endclass
+    class isacov_cov extends uvm_subscriber #(issue_item);
+        `uvm_component_utils(isacov_cov)
+        localparam int ocv_cov_history = 3;       // isacov's state: the last three instructions (cg_sequential)
+        uvma_isacov_pkg::uvma_isacov_agent_c #(32, 32) isacov;
+        cva6_core_cfg                         core_cfg;
+        uvma_isacov_pkg::uvma_isacov_cfg_c    cfg;
+        function new(string name, uvm_component parent); super.new(name, parent); endfunction
+        function void build_phase(uvm_phase phase);
+            uvma_core_cntrl_pkg::st_core_cntrl_cfg st;
+            super.build_phase(phase);
+            core_cfg = cva6_core_cfg::type_id::create("core_cfg");
+            st = core_cfg.to_struct();
+            st = uvma_cva6pkg_utils_pkg::cva6pkg_to_core_cntrl_cfg(st);
+            core_cfg.from_struct(st);
+            cfg = uvma_isacov_pkg::uvma_isacov_cfg_c::type_id::create("cfg");
+            cfg.enabled = 1; cfg.is_active = UVM_PASSIVE; cfg.cov_model_enabled = 1; cfg.trn_log_enabled = 0;
+            cfg.seq_instr_group_x2_enabled = 1; cfg.seq_instr_group_x3_enabled = 0; cfg.seq_instr_group_x4_enabled = 0;
+            cfg.seq_instr_x2_enabled = 1; cfg.reg_crosses_enabled = 0; cfg.reg_hazards_enabled = 1;
+            cfg.core_cfg = core_cfg;
+            uvm_config_db #(uvma_isacov_pkg::uvma_isacov_cfg_c)::set(this, "isacov", "cfg", cfg);
+            isacov = uvma_isacov_pkg::uvma_isacov_agent_c #(32, 32)::type_id::create("isacov", this);
+        endfunction
+        function void write(issue_item t);
+            uvma_rvfi_pkg::uvma_rvfi_instr_seq_item_c #(32, 32) it = new("rvfi");
+            it.insn = t.insn;
+            it.mode = uvma_rvfi_pkg::UVMA_RVFI_M_MODE;
+            // ECALL / EBREAK trap in machine mode (RVFI: trap[0], the cause above it - 11, 3), as isacov expects them
+            if (t.insn == 32'h0000_0073) it.trap = (11 << 1) | 1;
+            else if (t.insn == 32'h0010_0073 || t.insn == 32'h0000_9002) it.trap = (3 << 1) | 1;
+            isacov.monitor.write_rvfi_instr(it);
+        endfunction
+    endclass
+
     class cva6_env extends uvm_env;
         `uvm_component_utils(cva6_env)
         program_agent prog;
@@ -369,9 +413,11 @@ package cva6_c_pkg;
         in_irq_i_agent in_irq;
         cfg_lat_agent  lat;
         ocv_model_checker chk;
+        isacov_cov    cov;
         uvm_tlm_analysis_fifo #(dev_req_item) dev_fifo;
         function new(string name, uvm_component parent); super.new(name, parent); endfunction
         function void build_phase(uvm_phase phase);
+            uvml_hrtbt_pkg::uvml_default_hrtbt.enabled = 0;   // (core-v-verif's watchdog, with isacov: off, as its CVA6 base test does)
             prog     = program_agent::type_id::create("prog", this);
             issue    = issue_agent::type_id::create("issue", this);
             regw     = regw_agent::type_id::create("regw", this);
@@ -386,9 +432,11 @@ package cva6_c_pkg;
             chk      = ocv_model_checker::type_id::create("chk", this);
             chk.opts = "irq=0";                     // (+OCV_MODEL=... replaces it)
             dev_fifo = new("dev_fifo", this);
+            if (!$test$plusargs("NO_COV")) cov = isacov_cov::type_id::create("cov", this);   // (+NO_COV: none, to compare)
         endfunction
         function void connect_phase(uvm_phase phase);
             dev_req.ap.connect(dev_fifo.analysis_export);
+            if (cov != null) issue.ap.connect(cov.analysis_export);
         endfunction
         // answer the core's device requests: a write is posted, a read gets the test's value
         task respond();

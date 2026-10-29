@@ -67,7 +67,101 @@ def against(derived, given):
     return out
 
 
-def packing_pkg(desc, meta, text):
+def _strip_blocks(body):
+    """the class body without its covergroups, functions, tasks and constraints: what is left declares its members"""
+    for a, b in (("covergroup", "endgroup"), ("function", "endfunction"), ("task", "endtask")):
+        body = re.sub(r"\b" + a + r"\b.*?\b" + b + r"\b(\s*:\s*\w+)?", ";", body, flags=re.S)
+    body = re.sub(r"\bconstraint\s+\w+\s*\{.*?\}", ";", body, flags=re.S)
+    return re.sub(r"`\w+(\s*\([^;]*?\))?", ";", body)
+
+
+def coverage_specs(desc, text):
+    """rule 7 of ocv_uvm_pkg.sv: per item type, what its coverage subscribers read (the DUT's fields), the history
+    they keep - "<field>,... <history>", or "all" when a subscriber keeps a state it does not declare. A coverage
+    subscriber: a uvm_subscriber #(<item>) with a covergroup, or one that declares ocv_cov_history (a coverage model it
+    feeds: core-v-verif's isacov). Fields: those named as <handle>.<field> in it; the item handed on whole (a function
+    call, a method of it) - all of them. Its own state: a member that is not an item handle or a covergroup."""
+    chans = {c["_item"]: c for c in desc["channels"] if c.get("_item")}
+    specs, notes = {}, []
+    for m in re.finditer(r"\bclass\s+(\w+)\s+extends\s+uvm_subscriber\s*#\s*\(\s*(\w+)\s*\)\s*;(.*?)\bendclass\b", text, re.S):
+        cls, item, body = m.groups()
+        if item not in chans:
+            continue
+        hm = re.search(r"\bocv_cov_history\s*=\s*(\d+)", body)
+        if not hm and not re.search(r"\bcovergroup\b", body):
+            continue                                    # (a scoreboard, not coverage)
+        c = chans[item]
+        dut_of = {}                                     # item field -> the DUT's fields (a wide one: its parts)
+        for f in c["fields"]:
+            if "_of" in f:
+                dut_of.setdefault(f["_of"], []).append(f["name"])
+        handles = set(re.findall(r"\b" + item + r"\s+(\w+)", body))
+        read, whole, bits, full = set(), False, {}, set()
+        for h in handles:
+            for u in re.finditer(r"\b" + h + r"\b", body):
+                after, before = body[u.end():u.end() + 80], body[max(0, u.start() - 40):u.start()]
+                if re.search(r"\b" + item + r"\s+$", before):
+                    continue                            # (its declaration)
+                fm = re.match(r"\s*\.\s*(\w+)\s*(\()?(\s*\[\s*(\d+)\s*(?::\s*(\d+)\s*)?\])?", after)
+                if fm:
+                    f = fm.group(1)
+                    if f in dut_of and not fm.group(2):
+                        if fm.group(3) and len(dut_of[f]) == 1:   # a constant part select: those bits alone
+                            hi = int(fm.group(4)); lo = int(fm.group(5)) if fm.group(5) else hi
+                            bits.setdefault(f, set()).update(range(min(lo, hi), max(lo, hi) + 1))
+                        else:
+                            full.add(f)
+                        read.add(f)
+                    elif f not in dut_of:
+                        whole = True                    # a method of the item, or a field the DUT has not
+                    continue
+                if re.match(r"\s*[,)]", after) and not re.search(r"\.\s*sample\s*\(\s*([^()]*,\s*)?$", before):
+                    whole = True                        # handed to a function: it may read anything
+        state = []
+        for st in _strip_blocks(body).split(";"):
+            st = " ".join(st.split())
+            if not st or re.match(r"(typedef|localparam|parameter|import|static\s+bit\s+done)\b", st):
+                continue
+            dm = re.match(r"(?:rand\s+|protected\s+|local\s+|static\s+)*([\w:]+)(\s*#\s*\(.*?\))?\s+(\w+)", st)
+            if dm and dm.group(1) == item:
+                continue                                # an item handle (the one it samples)
+            state.append(st)
+        hist = int(hm.group(1)) if hm else 0
+        if whole:
+            read, full = set(dut_of), set(dut_of)
+        sp = specs.setdefault(item, {"fields": {}, "hist": 0, "all": False})
+        for f in read:                                  # a DUT field: None (all of it) or the bits read
+            for d in dut_of[f]:
+                if f in full or d in sp["fields"] and sp["fields"][d] is None:
+                    sp["fields"][d] = None
+                else:
+                    sp["fields"][d] = (sp["fields"].get(d) or set()) | bits[f]
+        sp["hist"] = max(sp["hist"], hist)
+        if state and not hm:
+            sp["all"] = True
+            notes.append(f"{cls}: a state of its own ({state[0]}) and no ocv_cov_history - on the board it gets every "
+                         f"record of '{c['name']}'")
+        notes.append(f"{cls}: coverage of '{c['name']}' reads {', '.join(sorted(read)) or 'nothing'}"
+                     f"{', history ' + str(hist) if hist else ''}")
+    def name(d, b):                                     # "field", or "field[hi:lo]" per run of bits read
+        if b is None:
+            return [d]
+        b, runs = sorted(b), []
+        for x in b:
+            if runs and x == runs[-1][1] + 1:
+                runs[-1][1] = x
+            else:
+                runs.append([x, x])
+        return [f"{d}[{h}:{lo}]" for lo, h in runs]
+    out = {}
+    for item, sp in specs.items():
+        out[item] = "all" if sp["all"] or not sp["fields"] else ",".join(
+            n for f in chans[item]["fields"] if f["name"] in sp["fields"] for n in name(f["name"], sp["fields"][f["name"]])) \
+            + f" {sp['hist']}"
+    return out, notes
+
+
+def packing_pkg(desc, meta, text, cov=None):
     """the package with the packing subclasses and the channel numbers"""
     name = desc["name"]
     pkgs = sorted({package_of(text, c["_item"]) for c in desc["channels"] if c.get("_item")})
@@ -110,6 +204,8 @@ def packing_pkg(desc, meta, text):
     for k, c in enumerate(desc["channels"]):
         if c.get("_item"):
             o.append(f"            ocv_channel_of[\"{c['_item']}\"] = {k};")
+    for item, sp in sorted((cov or {}).items()):        # rule 7: what the coverage subscribers need on the board
+        o.append(f"            ocv_cov_spec[\"{item}\"] = \"{sp}\";")
     o += ["            ocv_hooks.push_back(h);", "            return 1;", "        endfunction",
           "        virtual function void install();"]
     for c in desc["channels"]:
@@ -168,7 +264,10 @@ def main():
     meta = json.load(open(os.path.join(g, f"{desc['name']}_ocv_meta.json")))
     name = desc["name"]
     try:
-        open(os.path.join(a.out, f"{name}_ocv_contract_pkg.sv"), "w").write(packing_pkg(desc, meta, text))
+        cov, notes = coverage_specs(desc, text)
+        for n in notes:
+            print(f"ocv_contract: {n}")
+        open(os.path.join(a.out, f"{name}_ocv_contract_pkg.sv"), "w").write(packing_pkg(desc, meta, text, cov))
         open(os.path.join(a.out, f"{name}_ocv_stub.sv"), "w").write(stub(desc, text))
     except tbparse.TbError as e:
         print(f"ocv_contract: {e}", file=sys.stderr)

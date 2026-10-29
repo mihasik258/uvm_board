@@ -199,6 +199,15 @@ static void sq_dump(int ch, const uint32_t *rec, uint32_t words)
     uint32_t c = (uint32_t)ch; fwrite(&c, 4, 1, f); fwrite(rec, 4, words, f);
 }
 #endif
+/* Set by an environment that looks at the model's expected records of some output channels (a UVM testbench's
+ * coverage on the board: uvm/ocv_uvm_runner.c): every record of a channel with ocv_runner_expect_tap[ch] set goes to
+ * ocv_runner_expect_hook, in order, as the model emits it. Such a channel is neither folded nor squashed by the model
+ * itself (fold_make, squash: not offered), so that each of its records comes through emit / emit_n; the comparison
+ * with the DUT is unchanged. NULL (the default): nothing is looked at, nothing changes. */
+void (*ocv_runner_expect_hook)(int ch, const uint32_t *rec);
+const unsigned char *ocv_runner_expect_tap;
+#define TAPPED(ch) (ocv_runner_expect_tap && ocv_runner_expect_tap[ch])
+
 static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
 {
     run_t *r = io->priv;
@@ -207,6 +216,7 @@ static void emit(ocv_model_io_t *io, int ch, const uint32_t *rec)
         fprintf(stderr, "ocv: model emitted on source channel '%s'\n", c->name);
         exit(1);
     }
+    if (TAPPED(ch)) ocv_runner_expect_hook(ch, rec);
     queue_t *q = &r->q[ch];
     uint32_t fused[259];
     if (c->squash) {                             /* fold into the window, as the endpoint does */
@@ -249,8 +259,10 @@ static void emit_n(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t n,
     queue_t *q = &r->q[ch];
     const uint32_t W = c->rec_words, win = r->window, *mask = r->mask[ch];
     uint32_t a = q->sq.c, z = q->sq.z, k = q->sq.n;
+    const int tap = TAPPED(ch);
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t *rec = recs + (size_t)i * stride;
+        if (tap) ocv_runner_expect_hook(ch, rec);
 #if defined(OCV_SQ_DUMP)
         sq_dump(ch, rec, W);
 #endif
@@ -273,7 +285,7 @@ static int fold_make(ocv_model_io_t *io, int ch, const uint32_t *recs, uint32_t 
 {
     run_t *r = io->priv;
     const ocv_channel_t *c = &r->env.dut->channels[ch];
-    if (!c->squash || r->overlap || c->kind == OCV_CH_SOURCE) return 0;
+    if (!c->squash || r->overlap || c->kind == OCV_CH_SOURCE || TAPPED(ch)) return 0;
     return ocv_fold_make(f, recs, n, stride, r->mask[ch], c->rec_words);
 }
 static int emit_fold(ocv_model_io_t *io, int ch, const ocv_fold_t *f)
@@ -293,7 +305,7 @@ static ocv_squash_t *squash(ocv_model_io_t *io, int ch)
 {
     run_t *r = io->priv;
     const ocv_channel_t *c = &r->env.dut->channels[ch];
-    if (!c->squash || r->overlap || c->kind == OCV_CH_SOURCE || c->rec_words > 256) return NULL;
+    if (!c->squash || r->overlap || c->kind == OCV_CH_SOURCE || c->rec_words > 256 || TAPPED(ch)) return NULL;
     return &r->q[ch].sq;
 }
 static void squash_close(ocv_model_io_t *io, int ch)

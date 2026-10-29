@@ -190,21 +190,70 @@ package otbn_c_pkg;
         endtask
     endclass
 
+    // ---------------- functional coverage (rule 7 of the contract) ----------------
+    // what software did on the bus: the access (read, write, wait for idle) by address region (OTBN's registers,
+    // IMEM, DMEM, KMAC's registers), the operations started (keygen, sign: the mode word written), the command
+    class bus_cov extends uvm_subscriber #(bus_item);
+        `uvm_component_utils(bus_cov)
+        covergroup cg with function sample(bus_item t);
+            option.per_instance = 1;
+            cp_op: coverpoint {t.wait_idle, t.we} { bins read = {2'b00}; bins write = {2'b01}; bins wait_idle = {2'b10}; }
+            cp_region: coverpoint t.addr iff (!t.wait_idle) {
+                bins otbn_regs = {[OTBN : IMEM - 1]};
+                bins imem      = {[IMEM : DMEM - 1]};
+                bins dmem      = {[DMEM : KMAC - 1]};
+                bins kmac_regs = {[KMAC : KMAC + 'hffff]};
+            }
+            x_op_region: cross cp_op, cp_region { ignore_bins w = binsof (cp_op.wait_idle); }
+            cp_mode: coverpoint t.wdata iff (t.we && !t.wait_idle && t.addr >= DMEM && t.addr < KMAC) {
+                bins keygen = {MODE_KEYGEN_DET};
+                bins sign   = {MODE_SIGN_DET};
+            }
+            cp_cmd: coverpoint t.wdata iff (t.we && t.addr == OTBN_CMD) { bins execute = {CMD_EXECUTE}; }
+        endgroup
+        function new(string name, uvm_component parent); super.new(name, parent); cg = new(); endfunction
+        function void write(bus_item t); cg.sample(t); endfunction
+    endclass
+    // the responses: an error response or not, by the top bits of the data read (a register's flags; the ML-DSA
+    // buffers' coefficients - random)
+    class rsp_cov extends uvm_subscriber #(rsp_item);
+        `uvm_component_utils(rsp_cov)
+        covergroup cg with function sample(rsp_item t);
+            option.per_instance = 1;
+            cp_err: coverpoint t.err { bins ok = {0}; bins error = {1}; }
+            cp_top: coverpoint t.rdata[31:28];
+            cp_low: coverpoint t.rdata[1:0];
+            x_err_top: cross cp_err, cp_top;
+        endgroup
+        function new(string name, uvm_component parent); super.new(name, parent); cg = new(); endfunction
+        function void write(rsp_item t); cg.sample(t); endfunction
+    endclass
+
     class otbn_env extends uvm_env;
         `uvm_component_utils(otbn_env)
         bus_agent bus;
         rsp_agent rsp;
         ocv_model_checker chk;
+        bus_cov   bcov;
+        rsp_cov   rcov;
         function new(string name, uvm_component parent); super.new(name, parent); endfunction
         function void build_phase(uvm_phase phase);
             string prog;
             bus = bus_agent::type_id::create("bus", this);
             rsp = rsp_agent::type_id::create("rsp", this);
             chk = ocv_model_checker::type_id::create("chk", this);
+            if (!$test$plusargs("NO_COV")) begin       // (+NO_COV: no coverage, to compare)
+                bcov = bus_cov::type_id::create("bcov", this);
+                rcov = rsp_cov::type_id::create("rcov", this);
+            end
             // (board: OTBN works ~1 million clocks between two responses - the runner neither takes that for a
             // stall nor bounds the polls of a run)
             chk.run_args = "--squash 4096 --stall-polls 0 --max-polls 0";
             if ($value$plusargs("PROG=%s", prog)) chk.opts = {"syms=", prog, ".sym"};   // (+OCV_MODEL=... replaces it)
+        endfunction
+        function void connect_phase(uvm_phase phase);
+            if (bcov != null) bus.ap.connect(bcov.analysis_export);
+            if (rcov != null) rsp.ap.connect(rcov.analysis_export);
         endfunction
     endclass
 

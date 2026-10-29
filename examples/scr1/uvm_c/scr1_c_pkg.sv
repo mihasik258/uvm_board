@@ -193,19 +193,44 @@ package scr1_c_pkg;
         endfunction
     endclass
 
+    // functional coverage of the retirements (rule 7 of the contract): the register written, a trap, how control
+    // went on (the next pc: +2, +4, elsewhere), stores by byte lanes, CSR writes by command and CSR
+    class retire_cov extends uvm_subscriber #(retire_item);
+        `uvm_component_utils(retire_cov)
+        covergroup cg with function sample(retire_item t);
+            option.per_instance = 1;
+            cp_rd: coverpoint t.rd_addr;
+            cp_trap: coverpoint t.trap;
+            cp_flow: coverpoint t.pc_next - t.pc { bins next2 = {2}; bins next4 = {4}; bins jump = default; }
+            cp_store: coverpoint t.mem_wmask iff (t.mem_we) { bins b[] = {4'b0001, 4'b0010, 4'b0100, 4'b1000};
+                                                               bins h[] = {4'b0011, 4'b1100}; bins w = {4'b1111}; }
+            cp_csr_cmd: coverpoint t.csrw_cmd iff (t.csrw_we) { bins write = {0}; bins set = {1}; bins clear = {2}; }
+            cp_csr: coverpoint t.csrw_addr iff (t.csrw_we) {
+                bins mstatus = {'h300}; bins mie = {'h304}; bins mtvec = {'h305}; bins mscratch = {'h340};
+                bins mepc = {'h341}; bins mcause = {'h342}; bins other = default;
+            }
+            x_csr: cross cp_csr_cmd, cp_csr;
+        endgroup
+        function new(string name, uvm_component parent); super.new(name, parent); cg = new(); endfunction
+        function void write(retire_item t); cg.sample(t); endfunction
+    endclass
+
     class env extends uvm_env;
         `uvm_component_utils(env)
         prog_agent   prog;
         retire_agent retire;
         scoreboard   sb;
+        retire_cov   cov;
         function new(string name, uvm_component parent); super.new(name, parent); endfunction
         function void build_phase(uvm_phase phase);
             prog   = prog_agent::type_id::create("prog", this);
             retire = retire_agent::type_id::create("retire", this);
             sb     = scoreboard::type_id::create("sb", this);
+            if (!$test$plusargs("NO_COV")) cov = retire_cov::type_id::create("cov", this);   // (+NO_COV: none)
         endfunction
         function void connect_phase(uvm_phase phase);
             retire.ap.connect(sb.analysis_export);
+            if (cov != null) retire.ap.connect(cov.analysis_export);
         endfunction
     endclass
 

@@ -413,6 +413,9 @@ __attribute__((weak)) void ocv_dpi_model_send(int ch, const uint32_t *rec) { (vo
 __attribute__((weak)) int  ocv_dpi_model_recv(int ch, uint32_t *rec) { (void)ch; (void)rec; return 0; }
 __attribute__((weak)) void ocv_dpi_model_wait(void) {}
 __attribute__((weak)) int  ocv_dpi_model_board_done(int *rc) { *rc = 0; return 1; }
+__attribute__((weak)) int  ocv_dpi_model_tap(int ch, const char *spec) { (void)ch; (void)spec; return 0; }
+/* (OCV's Verilator runtime has it where the testbench has covergroups; a build without any: nothing to switch) */
+__attribute__((weak)) void vl_covergroup_enable(int on) { (void)on; }
 
 /* a record as "field=value ..." (reports) */
 const char *ocv_dpi_model_format(int ch, const uint32_t *rec)

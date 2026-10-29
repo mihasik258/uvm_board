@@ -21,7 +21,15 @@
 //     lowered; a monitor extends ocv_monitor and takes one transfer in sample(t):
 //     `do @(posedge vif.clk); while (!(vif.<valid> [&& vif.<ready>]));`, the item created, its fields from
 //     interface signals. From these shapes and the top's wiring of the DUT to the interface the DUT's
-//     description is derived - there is no description file to write (uvm/ocv_contract.py, uvm/tbparse.py).
+//     description is derived - there is no description file to write (uvm/ocv_contract.py, uvm/tbparse.py);
+//  7. functional coverage: a uvm_subscriber #(<item>) with the covergroups, connected to the agent's `ap` (a source
+//     agent's: the items given to the DUT; an output agent's: what its monitor took). On the board a channel the
+//     model checker checks makes no UVM object per record: its monitor's `ap` then gets the model's records (the
+//     DUT's, in a passing run) thinned to those that can change the coverage - a record whose projection on the
+//     item's fields the subscribers read (with the history they keep) is new (uvm/ocv_uvm_tap.h). The bins come out
+//     as in simulation, not how often each was hit. A subscriber with a state of its own (other than covergroups and
+//     items) declares its depth - `localparam int ocv_cov_history = K;`: its state is the last K transactions it
+//     got - or it gets every record (exact, slower). Derived by uvm/ocv_contract.py; nothing to write for the board.
 `ifndef OCV_UVM_PKG_SV
 `define OCV_UVM_PKG_SV
 `include "uvm_macros.svh"
@@ -62,6 +70,10 @@ package ocv_uvm_pkg;
                                                         output int done);
     import "DPI-C" function int    ocv_dpi_check_mismatch(int ch, output ocv_rec_t dut, output ocv_rec_t exp,
                                                           output int field, output longint index);
+    // coverage on the board (rule 7): a channel's records for its coverage subscribers; the covergroups off while
+    // context records go by (OCV's Verilator runtime; a stand-in in ocv_uvm_model.c for a build without covergroups)
+    import "DPI-C" function int    ocv_dpi_model_tap(int ch, string spec);
+    import "DPI-C" function void   vl_covergroup_enable(int on);
 `endif
 
     // the whole-DUT reference model (ocv_uvm_model.c, ocv_model_checker): in every build
@@ -175,6 +187,12 @@ package ocv_uvm_pkg;
     bit    ocv_model_ended;
     int    ocv_model_rc;
     int    ocv_driving;                  // source drivers in drive() now: transfers the DUT has not taken yet
+
+    // The coverage subscribers' needs per item type (rule 7, ocv_contract.py): "<field>,... <history>" (the DUT
+    // fields they read, the history they keep) or "all"
+    string ocv_cov_spec[string];
+    int    ocv_cov_busy;                 // monitors handing tapped records to their subscribers now
+    semaphore ocv_cov_lock = new(1);     // (one at a time: the covergroups' switch is global)
 
     // State shared by all agents. Package variables, not static class members: simulators
     // differ on statics (xsim loses their values); a package variable is plain and portable.
@@ -376,12 +394,56 @@ package ocv_uvm_pkg;
             ocv_board::open();
         endfunction
 
+        bit tapped;                                  // board, a model checker: the channel's records for its coverage
+
+`ifdef OCV_BOARD
+        // the connections are made: a channel the model checks, with coverage subscribers (rule 7), gets the model's
+        // records the subscribers need (before the runner starts). +OCV_NO_TAP: none (the runner at its full speed -
+        // a processor model folds the records of such a channel one by one, not per translated block)
+        function void start_of_simulation_phase(uvm_phase phase);
+            super.start_of_simulation_phase(phase);
+            if (ocv_model_on && ap.size() > 0 && ocv_cov_spec.exists(T::type_name()) && !$test$plusargs("OCV_NO_TAP"))
+                tapped = ocv_dpi_model_tap(ch, ocv_cov_spec[T::type_name()]) != 0;
+        endfunction
+
+        // a tapped channel: what has come, to the subscribers - a context record with the covergroups off
+        // (#1ns around a switch: subscribers that sample from a fifo take what came before it first)
+        task drain();
+            T t;
+            ocv_rec_t r;
+            int k;
+            bit off;
+            ocv_cov_busy++;
+            ocv_cov_lock.get();
+            forever begin
+                k = ocv_dpi_model_recv(ch, r);
+                if (k == 0) break;
+                if ((k == 2) != off) begin
+                    #1ns;
+                    off = k == 2;
+                    vl_covergroup_enable(!off);
+                end
+                t = T::type_id::create("t");
+                t.from_rec(r);
+                ap.write(t);
+            end
+            if (off) begin #1ns; vl_covergroup_enable(1); end
+            ocv_cov_lock.put();
+            ocv_cov_busy--;
+        endtask
+`endif
+
         task run_phase(uvm_phase phase);
             T t;
             if (ocv_board::is_board()) ocv_board::start();
             forever begin
 `ifdef OCV_BOARD
                 ocv_rec_t r;
+                if (tapped) begin
+                    drain();
+                    ocv_board::wait_progress();
+                    continue;
+                end
                 if (!(ocv_model_on ? ocv_dpi_model_recv(ch, r) : ocv_dpi_recv(ch, r))) begin
                     ocv_board::wait_progress();
                     continue;
@@ -542,6 +604,8 @@ package ocv_uvm_pkg;
         task finish();
 `ifdef OCV_BOARD
             wait (ocv_model_ended);
+            #1ns;                              // (and the coverage subscribers have the tapped records: rule 7)
+            wait (ocv_cov_busy == 0);
 `else
             ocv_dpi_model_in_done();
             do begin #1us; collect(); end while (!done);
@@ -561,6 +625,8 @@ package ocv_uvm_pkg;
             // the runner checks; its verdict comes at the end (a mismatch: its line with the exact record above)
             ocv_board::start();
             wait (ocv_model_ended);
+            #1ns;                              // the tapped channels' last records to their coverage subscribers (rule 7)
+            wait (ocv_cov_busy == 0);
             if (ocv_model_rc != 0) begin
                 n_errors++;
                 `uvm_error("OCV_MODEL", $sformatf("the runner found the DUT and the model apart (exit %0d): see its MISMATCH line", ocv_model_rc))

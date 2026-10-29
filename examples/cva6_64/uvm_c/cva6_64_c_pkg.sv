@@ -356,6 +356,29 @@ package cva6_64_c_pkg;
         endtask
     endclass
 
+    // functional coverage of the instructions issued (rule 7 of the contract): the major opcode of a 32-bit one
+    // (RV64: the *W forms are their own), a compressed one's quadrant and funct3, the register fields rd and rs1 of a
+    // 32-bit one - read straight from the instruction word (compressed: its 16 bits)
+    class issue_cov extends uvm_subscriber #(issue_item);
+        `uvm_component_utils(issue_cov)
+        covergroup cg with function sample(issue_item t);
+            option.per_instance = 1;
+            cp_op: coverpoint t.insn[6:2] iff (t.insn[1:0] == 2'b11) {
+                bins load = {5'h00}; bins misc_mem = {5'h03}; bins op_imm = {5'h04}; bins auipc = {5'h05};
+                bins op_imm_32 = {5'h06}; bins store = {5'h08}; bins amo = {5'h0b}; bins op = {5'h0c}; bins lui = {5'h0d};
+                bins op_32 = {5'h0e}; bins branch = {5'h18}; bins jalr = {5'h19}; bins jal = {5'h1b}; bins system = {5'h1c};
+            }
+            cp_cq: coverpoint {t.insn[1:0], t.insn[15:13]} iff (t.insn[1:0] != 2'b11) {
+                bins q[] = {[5'b00000 : 5'b10111]};
+            }
+            cp_rd: coverpoint t.insn[11:7] iff (t.insn[1:0] == 2'b11);
+            cp_rs1: coverpoint t.insn[19:15] iff (t.insn[1:0] == 2'b11);
+            x_op_rd: cross cp_op, cp_rd;
+        endgroup
+        function new(string name, uvm_component parent); super.new(name, parent); cg = new(); endfunction
+        function void write(issue_item t); cg.sample(t); endfunction
+    endclass
+
     class cva6_env extends uvm_env;
         `uvm_component_utils(cva6_env)
         program_agent prog;
@@ -370,6 +393,7 @@ package cva6_64_c_pkg;
         in_irq_i_agent in_irq;
         cfg_lat_agent  lat;
         ocv_model_checker chk;
+        issue_cov     cov;
         uvm_tlm_analysis_fifo #(dev_req_item) dev_fifo;
         function new(string name, uvm_component parent); super.new(name, parent); endfunction
         function void build_phase(uvm_phase phase);
@@ -387,9 +411,11 @@ package cva6_64_c_pkg;
             chk      = ocv_model_checker::type_id::create("chk", this);
             chk.opts = "irq=0";                     // (+OCV_MODEL=... replaces it)
             dev_fifo = new("dev_fifo", this);
+            if (!$test$plusargs("NO_COV")) cov = issue_cov::type_id::create("cov", this);   // (+NO_COV: none, to compare)
         endfunction
         function void connect_phase(uvm_phase phase);
             dev_req.ap.connect(dev_fifo.analysis_export);
+            if (cov != null) issue.ap.connect(cov.analysis_export);
         endfunction
         // answer the core's device requests: a write is posted, a read gets the test's value
         task respond();

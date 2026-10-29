@@ -67,6 +67,10 @@ if [ -x "$QEMU" ] && command -v aarch64-linux-gnu-gcc > /dev/null; then
 else
     echo "jit model: SKIPPED (no build/qemu/qemu-aarch64 or aarch64-linux-gnu-gcc)"
 fi
+# the coverage selection on the board (rule 7 of ocv_uvm_pkg.sv: uvm/ocv_uvm_tap.h) gives the same projections
+cc -std=c99 -O2 -I"$OCV/uvm" "$OCV/uvm/test/t_tap.c" -o t_tap
+./t_tap > ttap.log || { cat ttap.log; echo "uvm tests: coverage selection FAILED"; exit 1; }
+echo "coverage selection: $(cat ttap.log)"
 bash "$OCV/uvm/test/t_board_ref.sh" > bref.log 2>&1 || { cat bref.log; echo "uvm tests: board_ref layout FAILED"; exit 1; }
 tail -1 bref.log
 python3 "$OCV/uvm/test/t_tbwave.py" "$V" "$OUT/tbwave" > tbw.log 2>&1 || { cat tbw.log; echo "uvm tests: tbwave FAILED"; exit 1; }
