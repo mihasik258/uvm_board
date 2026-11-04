@@ -92,10 +92,10 @@ typedef struct {
     fregion_t   reg[8];
     int         hint[2];                 /* the region of the last fetch [0] and data access [1] (indexes: jit
                                           * copies this struct); one hint flipped between code and stack */
-    /* core profile ":cv32e40p" / ":cva6": machine-mode state (cva6: the profile is CVA6's) */
-    int         cv32, cva6;
-    uint32_t    mie_b, mpie_b, mie, mtvec, mtvec_mode, mscratch, mepc, mcause;
-    uint32_t    mpp;                     /* cva6: mstatus.MPP (M: no U mode) */
+    /* core profile ":cv32e40p" / ":cva6" / ":ibex": machine-mode state */
+    int         cv32, cva6, ibex;
+    uint32_t    mie_b, mpie_b, mie, mtvec, mtvec_mode, mscratch, mepc, mcause, mtval;
+    uint32_t    mpp, mprv, tw;           /* mstatus fields */
     /* cva6: known erratum openhwfoundation/cva6#3175 - a write to mie does not flush the pipeline, so
      * an interrupt may still be taken a few instructions after it was disabled: the mie before the last
      * write and where that write was */
@@ -274,18 +274,21 @@ static int cv32_csr_read(fast_t *m, uint32_t c, int write, uint32_t *value, int 
 {
     *timing = 0;
     switch (c) {
-    case 0x300: *value = 0x1800u | m->mpie_b << 7 | m->mie_b << 3; return 1;
-    case 0x301: *value = 0x40001104u; return 1;                   /* misa: RV32 I M C */
+    case 0x300: *value = (m->ibex ? (m->mpp << 11 | m->mprv << 17 | m->tw << 21) : 0x1800u) | m->mpie_b << 7 | m->mie_b << 3; return 1;
+    case 0x301: *value = m->ibex ? 0x40101104u : 0x40001104u; return 1;                   /* misa: RV32 I M C */
     case 0x304: *value = m->mie; return 1;
     case 0x305: *value = m->mtvec << 8 | m->mtvec_mode; return 1;
+    case 0x306: if (m->ibex) { *value = 0; return 1; } break;                    /* mcounteren */
+    case 0x30A: case 0x310: case 0x31A: if (m->ibex) { *value = 0; return 1; } break; /* menvcfg, mstatush, menvcfgh */
     case 0x340: *value = m->mscratch; return 1;
     case 0x341: *value = m->mepc; return 1;
     case 0x342: *value = (m->mcause >> 5) << 31 | (m->mcause & 0x1f); return 1;
-    case 0x343: *value = 0; return 1;                             /* mtval */
+    case 0x343: *value = m->ibex ? m->mtval : 0; return 1;        /* mtval */
     case 0x344: *value = 0; *timing = 1; return 1;                /* mip: the lines as the core saw them */
-    case 0xF11: *value = 0x602; return !write;                    /* mvendorid */
-    case 0xF12: *value = 4; return !write;                        /* marchid */
+    case 0xF11: *value = m->ibex ? 0 : 0x602; return !write;                    /* mvendorid */
+    case 0xF12: *value = m->ibex ? 22 : 4; return !write;                        /* marchid */
     case 0xF13: case 0xF14: *value = 0; return !write;            /* mimpid, mhartid */
+    case 0xF15: if (m->ibex) { *value = 0; return !write; } break;              /* mconfigptr */
     case 0x7A0: case 0x7A1: case 0x7A2: case 0x7A3: case 0x7A4: case 0x7A8: case 0x5A8:
         *value = 0; return 1;                                     /* trigger registers (read 0 here) */
     default: break;
@@ -300,12 +303,22 @@ static int cv32_csr_read(fast_t *m, uint32_t c, int write, uint32_t *value, int 
 static void cv32_csr_write(fast_t *m, uint32_t c, uint32_t v)
 {
     switch (c) {
-    case 0x300: m->mie_b = (v >> 3) & 1; m->mpie_b = (v >> 7) & 1; break;
-    case 0x304: m->mie = v & 0xFFFF0888u; break;
-    case 0x305: m->mtvec = v >> 8; m->mtvec_mode = v & 1; break;
+    case 0x300:
+        m->mie_b = (v >> 3) & 1;
+        m->mpie_b = (v >> 7) & 1;
+        if (m->ibex) {
+            uint32_t mpp = (v >> 11) & 3;
+            m->mpp = (mpp == 3) ? 3 : 0;
+            m->mprv = (v >> 17) & 1;
+            m->tw = (v >> 21) & 1;
+        }
+        break;
+    case 0x304: m->mie = v & (m->ibex ? 0x7FFF0888u : 0xFFFF0888u); break;
+    case 0x305: m->mtvec = v >> 8; m->mtvec_mode = m->ibex ? 1 : (v & 1); break;
     case 0x340: m->mscratch = v; break;
     case 0x341: m->mepc = v & ~1u; break;
     case 0x342: m->mcause = (v >> 31) << 5 | (v & 0x1f); break;
+    case 0x343: if (m->ibex) m->mtval = v; break;
     default: break;                                               /* read-only bits, counters */
     }
 }
@@ -314,10 +327,11 @@ static void cv32_csr_write(fast_t *m, uint32_t c, uint32_t v)
 static inline uint32_t tvec_base(const fast_t *m) { return m->cva6 ? m->mtvec << 2 : m->mtvec << 8; }
 
 /* take an exception: the next pc */
-static uint32_t cv32_trap(fast_t *m, uint32_t pc, uint32_t cause)
+static uint32_t cv32_trap(fast_t *m, uint32_t pc, uint32_t cause, uint32_t tval)
 {
     m->mpie_b = m->mie_b; m->mie_b = 0;
     m->mepc = pc; m->mcause = cause;
+    m->mtval = tval;
     m->mpp = 3;
     return tvec_base(m);                                          /* exceptions: the base, also vectored */
 }
@@ -420,7 +434,7 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
     case OP_BGEU:  if (a >= b) next = pc + (uint32_t)d->imm; break;
     case OP_LH: case OP_LHU: case OP_LW:
         if (m->cva6 && ((a + (uint32_t)d->imm) & (d->op == OP_LW ? 3u : 1u))) {   /* CVA6: not split */
-            next = cv32_trap(m, pc, CVA6_LD_MISALIGNED); trap = 1; break;
+            next = cv32_trap(m, pc, CVA6_LD_MISALIGNED, a + (uint32_t)d->imm); trap = 1; break;
         }
         wen = 1;
         wv = d->op == OP_LW ? load(m, a + (uint32_t)d->imm, 4)
@@ -431,7 +445,7 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
     case OP_LNONE: wen = 1; break;                                   /* as the ISS: rd gets 0 */
     case OP_SB: case OP_SH: case OP_SW: {
         const uint32_t ad = a + (uint32_t)d->imm, f3 = d->f3;
-        if (m->cva6 && (ad & ((1u << f3) - 1))) { next = cv32_trap(m, pc, CVA6_ST_MISALIGNED); trap = 1; break; }
+        if (m->cva6 && (ad & ((1u << f3) - 1))) { next = cv32_trap(m, pc, CVA6_ST_MISALIGNED, ad); trap = 1; break; }
         store(m, ad, 1 << f3, b);
         mwe = 1; mmask = (1u << (1u << f3)) - 1; maddr = ad;
         mdata = b & (f3 == 2 ? 0xffffffffu : (1u << (8u << f3)) - 1);
@@ -473,12 +487,15 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
     case OP_SYSTEM_TRAP:
         if (m->cv32) {
             const uint32_t f = d->insn >> 20;
-            if ((d->insn & 0x000FFF80u) != 0) next = cv32_trap(m, pc, CV32_ILLEGAL), trap = 1;
-            else if (f == 0x000) next = cv32_trap(m, pc, CV32_ECALL), trap = 1;
-            else if (f == 0x001) next = cv32_trap(m, pc, CV32_BREAKPOINT), trap = 1;
-            else if (f == 0x302) { next = m->mepc; m->mie_b = m->mpie_b; m->mpie_b = 1; m->mpp = 3; }   /* mret */
+            if ((d->insn & 0x000FFF80u) != 0) next = cv32_trap(m, pc, CV32_ILLEGAL, raw), trap = 1;
+            else if (f == 0x000) next = cv32_trap(m, pc, CV32_ECALL, 0), trap = 1;
+            else if (f == 0x001) next = cv32_trap(m, pc, CV32_BREAKPOINT, 0), trap = 1;
+            else if (f == 0x302) {
+                next = m->mepc; m->mie_b = m->mpie_b; m->mpie_b = 1;
+                if (m->ibex) { if (m->mpp != 3) m->mprv = 0; m->mpp = 0; } else m->mpp = 3;
+            }   /* mret */
             else if (f == 0x105) { }                                 /* wfi: no interrupts here - a nop */
-            else next = cv32_trap(m, pc, CV32_ILLEGAL), trap = 1;
+            else next = cv32_trap(m, pc, CV32_ILLEGAL, raw), trap = 1;
             break;
         }
         trap = 1;
@@ -490,7 +507,7 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
             uint32_t old;
             int timing;
             if (!(m->cva6 ? cva6_csr_read(m, csr, write, &old, &timing) : cv32_csr_read(m, csr, write, &old, &timing))) {
-                next = cv32_trap(m, pc, CV32_ILLEGAL); trap = 1; break;
+                next = cv32_trap(m, pc, CV32_ILLEGAL, raw); trap = 1; break;
             }
             if (timing) {
                 mask_rdd = 1;
@@ -523,7 +540,7 @@ static void fast_step(cpu_model_t *mm, cpu_retire_t *r)
         break;
     default:                                                         /* illegal */
         trap = 1;
-        if (m->cv32) next = cv32_trap(m, pc, CV32_ILLEGAL);
+        if (m->cv32) next = cv32_trap(m, pc, CV32_ILLEGAL, raw);
         break;
     }
     if (d->rd == 0) wen = 0;
@@ -558,6 +575,7 @@ static cpu_model_t *fast_create(const char *isa, const cpu_env_t *env, uint32_t 
     m->pc = reset_pc;
     const char *prof = isa ? strchr(isa, ':') : NULL;
     if (prof && !strcmp(prof + 1, "cv32e40p")) { m->cv32 = 1; m->mtvec_mode = 1; }
+    else if (prof && !strcmp(prof + 1, "ibex")) { m->cv32 = m->ibex = 1; m->mtvec_mode = 1; m->mtvec = reset_pc >> 8; m->mpie_b = 1; }
     else if (prof && !strcmp(prof + 1, "cva6")) { m->cv32 = m->cva6 = 1; m->mtvec = (reset_pc + 0x40) >> 2; m->mpp = 3; m->errata_mie = 1; }
     else if (prof) { snprintf(err, n, "fast: unknown core profile '%s'", prof + 1); free(m); return NULL; }
     for (int i = 0; i < env->n_regions && m->nreg < 8; i++) {
@@ -579,10 +597,11 @@ static int fast_arch_csrs(cpu_model_t *mm, uint32_t *csr, uint32_t *val, int max
 {
     fast_t *m = (fast_t *)mm;
     static const uint32_t cv32[] = { 0x305, 0x340, 0x341, 0x342, 0x304, 0x300 };
+    static const uint32_t ibex[] = { 0x305, 0x340, 0x341, 0x342, 0x343, 0x304, 0x300 };
     static const uint32_t cva6[] = { 0x305, 0x340, 0x341, 0x342, 0x304, 0x300, 0xB82, 0xB02 };
     if (!m->cv32) return 0;
-    const uint32_t *l = m->cva6 ? cva6 : cv32;
-    const int n = m->cva6 ? (int)(sizeof cva6 / sizeof *cva6) : (int)(sizeof cv32 / sizeof *cv32);
+    const uint32_t *l = m->cva6 ? cva6 : m->ibex ? ibex : cv32;
+    const int n = m->cva6 ? (int)(sizeof cva6 / sizeof *cva6) : m->ibex ? (int)(sizeof ibex / sizeof *ibex) : (int)(sizeof cv32 / sizeof *cv32);
     int k = 0;
     for (int i = 0; i < n && k < max; i++) {
         uint32_t v; int timing;

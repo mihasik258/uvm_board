@@ -1,0 +1,54 @@
+# ibex.bind - Ibex (lowRISC; RV32IMC, OBI, RVFI) under OCV (gen/cpu_wrap.py).
+name     ibex
+core     ibex_ocv_core
+files    ${EXT}/ibex/dv/uvm/core_ibex/ibex_dv.f  base=/  PRJ_DIR=${EXT}/ibex  LOWRISC_IP_DIR=${EXT}/ibex/vendor/lowrisc_ip  exclude=/dv/  exclude=ibex_top_tracing.sv  exclude=ibex_register_file_fpga.sv  exclude=ibex_register_file_latch.sv  exclude=riscv_signature_pkg.sv
+rtl      ${BIND}/ibex_ocv_core.sv
+incdir   ${EXT}/ibex/rtl  ${EXT}/ibex/vendor/lowrisc_ip/ip/prim/rtl
+define   RVFI
+
+clock    clk_i
+reset    rst_ni low
+tie      boot_addr_i = 32'h80
+bus      obi A instr_ ro
+bus      obi B data_ dev
+
+# devices as core-v-verif's virtual peripherals (printer, timers/random, status flags)
+device   printer 0x10000000 0x10
+device   vp      0x15000000 0x2000
+device   status  0x20000000 0x10
+
+memory   256K uram                  # code and data
+memory   16K at 0x3FC000            # the stack
+latency                             # random memory delays (--model-opt lat=G,R)
+boot     0x80
+exit     none
+stop     0x20000004 retire          # the end: write to exit register
+
+model    rv32imc_zicsr_zifencei:ibex
+gen      cv32
+
+logic
+    logic stop_seen_q;
+    always_ff @(posedge clk)
+        if (!core_rst_n) stop_seen_q <= 1'b0;
+        else if (@data_req_o && @data_gnt_i && @data_we_o && {@data_addr_o[31:2], 2'b00} == 32'h20000004)
+            stop_seen_q <= 1'b1;
+
+# What the core does, from RVFI and OBI
+stream issue issue ecall raw
+    valid = @rvfi_valid && (!@rvfi_trap || @rvfi_insn == 32'h00000073)
+    pc    = @rvfi_pc_rdata
+    insn  = @rvfi_insn
+    c     = @rvfi_insn[1:0] != 2'b11
+stream regw regw
+    valid = @rvfi_valid && @rvfi_rd_addr != 5'd0 && !@rvfi_trap
+    rd    = @rvfi_rd_addr
+    data  = @rvfi_rd_wdata
+stream store store
+    valid = (@data_req_o && @data_gnt_i && @data_we_o && {@data_addr_o[31:2], 2'b00} != 32'h20000004) || (@rvfi_valid && stop_seen_q)
+    addr  = stop_seen_q ? 32'h20000004 : {@data_addr_o[31:2], 2'b00}
+    be    = stop_seen_q ? 4'b1111 : @data_be_o
+    data  = stop_seen_q ? 32'h0 : (@data_wdata_o & {{8{@data_be_o[3]}}, {8{@data_be_o[2]}}, {8{@data_be_o[1]}}, {8{@data_be_o[0]}}})
+stream csrr csrr
+    valid = @rvfi_valid && @rvfi_insn[6:0] == 7'h73 && @rvfi_insn[13:12] != 2'b00 && @rvfi_rd_addr != 5'd0 && !@rvfi_trap
+    data  = @rvfi_rd_wdata
